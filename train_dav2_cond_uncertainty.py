@@ -391,10 +391,11 @@ def validate(
             **ause_metrics,
         }
 
+        prefix_head = "metric_depth" if model_id.startswith("metric") else "relative_depth"
         running_loss += loss.item()
-        running_abs_rel += metrics["abs_rel"]
-        running_rmse += metrics["rmse"]
-        running_a1 += metrics["a1"]
+        running_abs_rel += metrics[f"{prefix_head}_abs_rel"]
+        running_rmse += metrics[f"{prefix_head}_rmse"]
+        running_a1 += metrics[f"{prefix_head}_a1"]
         running_corr_samples += correlations["loss_uncertainty_samples"]
         running_ause_samples += ause_metrics["ause_samples"]
         _accumulate_finite_metrics(corr_sums, corr_counts, epoch_mean_metrics)
