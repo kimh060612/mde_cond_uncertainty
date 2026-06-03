@@ -19,7 +19,12 @@ from correlation_utils import (
     compute_sparsification_ause_metrics,
 )
 from dav2_ati_model import ConditionedGaussianDepthAnythingV2, MODEL_IDS
-from eval_utils import compute_metrics, _accumulate_finite_metrics, _mean_finite_metrics
+from eval_utils import (
+    compute_metrics,
+    compute_relative_depth_metrics,
+    _accumulate_finite_metrics,
+    _mean_finite_metrics,
+)
 from loss_fn import gaussian_nll_depth_loss, image_level_listnet_loss
 
 
@@ -60,6 +65,8 @@ def _compute_global_image_correlations(accumulator):
         }
     )
 
+def _prefix_metrics(prefix, metrics):
+    return {f"{prefix}_{key}": value for key, value in metrics.items()}
 
 def _optimizer_lr(optimizer, group_name):
     for group in optimizer.param_groups:
@@ -79,6 +86,7 @@ def _condition_batch_metrics(batch):
 
 
 def train_one_epoch(
+    model_id: str,
     model,
     loader,
     optimizer,
@@ -91,6 +99,9 @@ def train_one_epoch(
     listnet_temperature: float,
     uncertainty_mode: str,
     grad_clip: float,
+    min_depth: float = 1e-3,
+    max_depth: float = 80.0,
+    relative_align_mode: str = "scale_shift",
     wandb_run=None,
     global_step: int = 0,
     log_interval: int = 20,
@@ -157,7 +168,24 @@ def train_one_epoch(
         scaler.step(optimizer)
         scaler.update()
 
-        metrics = compute_metrics(out["mu"].detach(), depth, valid_mask)
+        if model_id.startswith("metric"):
+            metrics = _prefix_metrics(
+                "metric_depth",
+                compute_metrics(out["mu"].detach(), depth, valid_mask)
+            )
+        else:
+            metrics = _prefix_metrics(
+                "relative_depth",
+                compute_relative_depth_metrics(
+                    out["mu"].detach(),
+                    depth,
+                    valid_mask,
+                    min_depth=min_depth,
+                    max_depth=max_depth,
+                    align_mode=relative_align_mode,
+                ),
+            )
+            
         correlations = compute_loss_uncertainty_correlations(
             out["mu"].detach(),
             out["log_var"].detach(),
@@ -192,12 +220,13 @@ def train_one_epoch(
             **ause_metrics,
         }
 
+        prefix_head = "metric_depth" if model_id.startswith("metric") else "relative_depth"
         running_loss += loss.item()
         running_nll_loss += nll_loss.item()
         running_list_loss += list_loss.item()
-        running_abs_rel += metrics["abs_rel"]
-        running_rmse += metrics["rmse"]
-        running_a1 += metrics["a1"]
+        running_abs_rel += metrics[f"{prefix_head}_abs_rel"]
+        running_rmse += metrics[f"{prefix_head}_rmse"]
+        running_a1 += metrics[f"{prefix_head}_a1"]
         running_corr_samples += correlations["loss_uncertainty_samples"]
         running_ause_samples += ause_metrics["ause_samples"]
         _accumulate_finite_metrics(corr_sums, corr_counts, epoch_mean_metrics)
@@ -211,8 +240,8 @@ def train_one_epoch(
             print(
                 f"[train] epoch={epoch} step={step}/{len(loader)} "
                 f"loss={loss.item():.4f} "
-                f"abs_rel={metrics['abs_rel']:.4f} "
-                f"a1={metrics['a1']:.4f} "
+                f"abs_rel={metrics[f'{prefix_head}_abs_rel']:.4f} "
+                f"a1={metrics[f'{prefix_head}_a1']:.4f} "
                 f"exposure={batch_condition_metrics['exposure_mean']:.1f} "
                 f"gain={batch_condition_metrics['gain_mean']:.1f} "
                 f"valid_ratio={batch_condition_metrics['valid_pixel_ratio_mean']:.3f} "
@@ -222,9 +251,9 @@ def train_one_epoch(
                 "loss_step": loss.item(),
                 "nll_loss_step": nll_loss.item(),
                 "list_loss_step": list_loss.item(),
-                "abs_rel_step": metrics["abs_rel"],
-                "rmse_step": metrics["rmse"],
-                "a1_step": metrics["a1"],
+                "abs_rel_step": metrics[f"{prefix_head}_abs_rel"],
+                "rmse_step": metrics[f"{prefix_head}_rmse"],
+                "a1_step": metrics[f"{prefix_head}_a1"],
                 "epoch": epoch,
                 "lr_backbone": _optimizer_lr(optimizer, "backbone"),
                 "lr_uncertainty": _optimizer_lr(optimizer, "uncertainty"),
@@ -255,12 +284,19 @@ def train_one_epoch(
 
 @torch.no_grad()
 def validate(
+    model_id: str,
     model,
     loader,
     device,
     amp: bool,
     lambda_smooth_logvar: float,
+    listnet_temperature: float,
+    uncertainty_mode: str,
+    list_loss_weight: float,
     correlation_max_samples: int = 100_000,
+    min_depth: float = 1e-3,
+    max_depth: float = 80.0,
+    relative_align_mode: str = "scale_shift",
 ):
     model.eval()
 
@@ -293,15 +329,41 @@ def validate(
                 condition=condition,
                 target_size=target_size,
             )
-            loss = gaussian_nll_depth_loss(
+            nll_loss = gaussian_nll_depth_loss(
                 out["mu"],
                 out["log_var"],
                 depth,
                 valid_mask,
                 lambda_smooth_logvar=lambda_smooth_logvar,
             )
+            list_loss = image_level_listnet_loss(
+                out["mu"],
+                out["std"],
+                depth,
+                valid_mask,
+                temperature=listnet_temperature,
+                uncertainty_mode=uncertainty_mode,
+            )
+            loss = nll_loss + list_loss_weight * list_loss
 
-        metrics = compute_metrics(out["mu"], depth, valid_mask)
+        if model_id.startswith("metric"):
+            metrics = _prefix_metrics(
+                "metric_depth",
+                compute_metrics(out["mu"].detach(), depth, valid_mask)
+            )
+        else:
+            metrics = _prefix_metrics(
+                "relative_depth",
+                compute_relative_depth_metrics(
+                    out["mu"].detach(),
+                    depth,
+                    valid_mask,
+                    min_depth=min_depth,
+                    max_depth=max_depth,
+                    align_mode=relative_align_mode,
+                ),
+            )
+            
         correlations = compute_loss_uncertainty_correlations(
             out["mu"],
             out["log_var"],
@@ -422,6 +484,7 @@ def parse_args():
     parser.add_argument("--hf_cache_dir", type=str, default=None)
     parser.add_argument("--log_interval", type=int, default=20)
     parser.add_argument("--correlation_max_samples", type=int, default=100_000)
+    parser.add_argument("--relative_align_mode", type=str, default="scale_shift", choices=["median", "scale_shift"])
     parser.add_argument("--wandb_entity", type=str, default="artificial_tripartite_intelligence_team")
     parser.add_argument("--wandb_project", type=str, default="mde_uncertainty_measure")
     parser.add_argument("--wandb_name", type=str, default=None)
@@ -559,6 +622,7 @@ def main():
 
     for epoch in range(1, args.epochs + 1):
         train_metrics, global_step = train_one_epoch(
+            model_id=model_id,
             model=model,
             loader=train_loader,
             optimizer=optimizer,
@@ -571,6 +635,9 @@ def main():
             listnet_temperature=args.listnet_temperature,
             uncertainty_mode=args.uncertainty_mode,
             grad_clip=args.grad_clip,
+            min_depth=args.min_depth,
+            max_depth=args.max_depth,
+            relative_align_mode=args.relative_align_mode,
             wandb_run=wandb_run,
             global_step=global_step,
             log_interval=args.log_interval,
@@ -578,12 +645,19 @@ def main():
         )
 
         val_metrics = validate(
+            model_id=model_id,
             model=model,
             loader=val_loader,
             device=device,
             amp=amp,
             lambda_smooth_logvar=args.lambda_smooth_logvar,
+            list_loss_weight=args.list_loss_weight,
+            listnet_temperature=args.listnet_temperature,
+            uncertainty_mode=args.uncertainty_mode,
             correlation_max_samples=args.correlation_max_samples,
+            min_depth=args.min_depth,
+            max_depth=args.max_depth,
+            relative_align_mode=args.relative_align_mode,
         )
 
         print(f"[epoch {epoch}] train={train_metrics}")

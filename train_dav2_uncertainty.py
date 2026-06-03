@@ -19,7 +19,12 @@ from correlation_utils import (
     compute_sparsification_ause_metrics,
 )
 from loss_fn import gaussian_nll_depth_loss, image_level_listnet_loss
-from eval_utils import compute_metrics, _accumulate_finite_metrics, _mean_finite_metrics
+from eval_utils import (
+    compute_metrics,
+    compute_relative_depth_metrics,
+    _accumulate_finite_metrics,
+    _mean_finite_metrics,
+)
 
 def _wandb_log_prefixed(wandb_run, prefix, metrics, step):
     if wandb_run is None:
@@ -58,6 +63,11 @@ def _compute_global_image_correlations(accumulator):
         }
     )
 
+
+def _prefix_metrics(prefix, metrics):
+    return {f"{prefix}_{key}": value for key, value in metrics.items()}
+
+
 def train_one_epoch(
     model,
     loader,
@@ -68,6 +78,9 @@ def train_one_epoch(
     amp: bool,
     lambda_smooth_logvar: float,
     grad_clip: float,
+    min_depth: float = 1e-3,
+    max_depth: float = 80.0,
+    relative_align_mode: str = "scale_shift",
     wandb_run=None,
     global_step: int = 0,
     log_interval: int = 20,
@@ -123,6 +136,17 @@ def train_one_epoch(
         scaler.update()
 
         metrics = compute_metrics(out["mu"].detach(), depth, valid_mask)
+        relative_metrics = _prefix_metrics(
+            "relative",
+            compute_relative_depth_metrics(
+                out["mu"].detach(),
+                depth,
+                valid_mask,
+                min_depth=min_depth,
+                max_depth=max_depth,
+                align_mode=relative_align_mode,
+            ),
+        )
         correlations = compute_loss_uncertainty_correlations(
             out["mu"].detach(),
             out["log_var"].detach(),
@@ -151,6 +175,7 @@ def train_one_epoch(
             **batch_image_correlations,
         }
         epoch_mean_metrics = {
+            **relative_metrics,
             **correlations,
             **ause_metrics,
         }
@@ -170,6 +195,7 @@ def train_one_epoch(
                 f"loss={loss.item():.4f} "
                 f"abs_rel={metrics['abs_rel']:.4f} "
                 f"a1={metrics['a1']:.4f} "
+                f"relative_abs_rel={relative_metrics['relative_abs_rel']:.4f} "
                 f"loss_uncertainty_pearson={correlations['loss_uncertainty_pearson']:.4f} "
                 f"ause_abs_rel={ause_metrics['ause_abs_rel']:.4f}"
             )
@@ -181,6 +207,7 @@ def train_one_epoch(
                 "epoch": epoch,
                 "lr_backbone": optimizer.param_groups[0]["lr"],
                 "lr_uncertainty": optimizer.param_groups[1]["lr"],
+                **{f"{key}_step": value for key, value in relative_metrics.items()},
                 **{f"{key}_step": value for key, value in uncertainty_metrics.items()},
             }
             _wandb_log_prefixed(wandb_run, "train", train_step_metrics, global_step)
@@ -203,7 +230,16 @@ def train_one_epoch(
 
 
 @torch.no_grad()
-def validate(model, loader, device, amp: bool, correlation_max_samples: int = 100_000):
+def validate(
+    model,
+    loader,
+    device,
+    amp: bool,
+    correlation_max_samples: int = 100_000,
+    min_depth: float = 1e-3,
+    max_depth: float = 80.0,
+    relative_align_mode: str = "scale_shift",
+):
     model.eval()
 
     running_loss = 0.0
@@ -233,6 +269,17 @@ def validate(model, loader, device, amp: bool, correlation_max_samples: int = 10
             )
 
         metrics = compute_metrics(out["mu"], depth, valid_mask)
+        relative_metrics = _prefix_metrics(
+            "relative",
+            compute_relative_depth_metrics(
+                out["mu"],
+                depth,
+                valid_mask,
+                min_depth=min_depth,
+                max_depth=max_depth,
+                align_mode=relative_align_mode,
+            ),
+        )
         correlations = compute_loss_uncertainty_correlations(
             out["mu"],
             out["log_var"],
@@ -255,6 +302,7 @@ def validate(model, loader, device, amp: bool, correlation_max_samples: int = 10
             uncertainty=out["std"],
         )
         epoch_mean_metrics = {
+            **relative_metrics,
             **correlations,
             **ause_metrics,
         }
@@ -331,6 +379,7 @@ def parse_args():
     parser.add_argument("--hf_cache_dir", type=str, default=None)
     parser.add_argument("--log_interval", type=int, default=20)
     parser.add_argument("--correlation_max_samples", type=int, default=100_000)
+    parser.add_argument("--relative_align_mode", type=str, default="scale_shift", choices=["median", "scale_shift"])
     parser.add_argument("--wandb_entity", type=str, default="artificial_tripartite_intelligence_team")
     parser.add_argument("--wandb_project", type=str, default="mde_uncertainty_measure")
     parser.add_argument("--wandb_name", type=str, default=None)
@@ -448,6 +497,9 @@ def main():
             amp=amp,
             lambda_smooth_logvar=args.lambda_smooth_logvar,
             grad_clip=args.grad_clip,
+            min_depth=args.min_depth,
+            max_depth=args.max_depth,
+            relative_align_mode=args.relative_align_mode,
             wandb_run=wandb_run,
             global_step=global_step,
             log_interval=args.log_interval,
@@ -460,6 +512,9 @@ def main():
             device=device,
             amp=amp,
             correlation_max_samples=args.correlation_max_samples,
+            min_depth=args.min_depth,
+            max_depth=args.max_depth,
+            relative_align_mode=args.relative_align_mode,
         )
 
         print(f"[epoch {epoch}] train={train_metrics}")
