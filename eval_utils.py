@@ -144,8 +144,8 @@ def compute_relative_depth_metrics(
             continue
 
         image_metrics = __compute_errors_numpy(
-            gt=gt[batch_idx][mask].cpu(),
-            pred=pred[batch_idx][mask].cpu(),
+            gt=gt[batch_idx][mask],
+            pred=pred[batch_idx][mask],
             min_depth=min_depth,
             max_depth=max_depth,
             align_mode=align_mode,
