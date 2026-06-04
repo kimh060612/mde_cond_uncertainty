@@ -199,7 +199,7 @@ class ConditionedGaussianDepthAnythingV2(nn.Module):
         min_log_var: float = -5.0,
         max_log_var: float = 3.0,
         uncertainty_width: int = 64,
-        uncertainty_blocks: int = 6,
+        uncertainty_blocks: int = 3,
         uncertainty_dropout: float = 0.05,
     ):
         super().__init__()
