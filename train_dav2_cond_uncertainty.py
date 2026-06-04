@@ -11,7 +11,15 @@ except ImportError:
 
 from transformers import AutoImageProcessor
 
-from ati_dataset import ATIRealWorldDepthDataset, ati_collate_fn
+from ati_dataset import (
+    ATI_STATS_EXPOSURE_IDX,
+    ATI_STATS_GAIN_IDX,
+    ATI_STATS_LIGHT_LABEL_IDX,
+    ATI_STATS_SPEED_LABEL_IDX,
+    ATI_STATS_VALID_PIXEL_RATIO_IDX,
+    ATIRealWorldDepthDataset,
+    ati_collate_fn,
+)
 from correlation_utils import (
     compute_image_uncertainty_metric_correlations,
     compute_image_uncertainty_metric_values,
@@ -75,13 +83,37 @@ def _optimizer_lr(optimizer, group_name):
     return 0.0
 
 
-def _condition_batch_metrics(batch):
+def _unpack_ati_batch(batch, device):
+    (
+        pixel_values,
+        depth,
+        valid_mask,
+        condition,
+        condition_stats,
+    ) = batch
+
+    return (
+        pixel_values.to(device),
+        depth.to(device),
+        valid_mask.to(device),
+        condition.to(device),
+        condition_stats,
+    )
+
+
+def _condition_batch_metrics(condition_stats):
     return {
-        "exposure_mean": float(batch["exposure"].float().mean().item()),
-        "gain_mean": float(batch["gain"].float().mean().item()),
-        "valid_pixel_ratio_mean": float(batch["valid_pixel_ratio"].float().mean().item()),
-        "light_label_mean": float(batch["light_label"].float().mean().item()),
-        "speed_label_mean": float(batch["speed_label"].float().mean().item()),
+        "exposure_mean": float(condition_stats[:, ATI_STATS_EXPOSURE_IDX].mean().item()),
+        "gain_mean": float(condition_stats[:, ATI_STATS_GAIN_IDX].mean().item()),
+        "valid_pixel_ratio_mean": float(
+            condition_stats[:, ATI_STATS_VALID_PIXEL_RATIO_IDX].mean().item()
+        ),
+        "light_label_mean": float(
+            condition_stats[:, ATI_STATS_LIGHT_LABEL_IDX].mean().item()
+        ),
+        "speed_label_mean": float(
+            condition_stats[:, ATI_STATS_SPEED_LABEL_IDX].mean().item()
+        ),
     }
 
 
@@ -127,10 +159,13 @@ def train_one_epoch(
         if batch is None:
             continue
 
-        pixel_values = batch["pixel_values"].to(device)
-        depth = batch["depth"].to(device)
-        valid_mask = batch["valid_mask"].to(device)
-        condition = batch["condition"].to(device)
+        (
+            pixel_values,
+            depth,
+            valid_mask,
+            condition,
+            condition_stats,
+        ) = _unpack_ati_batch(batch, device)
 
         target_size = depth.shape[-2:]
 
@@ -208,7 +243,7 @@ def train_one_epoch(
             uncertainty=out["std"].detach(),
         )
         batch_image_correlations = compute_image_uncertainty_metric_correlations(batch_image_values)
-        batch_condition_metrics = _condition_batch_metrics(batch)
+        batch_condition_metrics = _condition_batch_metrics(condition_stats)
 
         uncertainty_metrics = {
             **correlations,
@@ -316,10 +351,13 @@ def validate(
         if batch is None:
             continue
 
-        pixel_values = batch["pixel_values"].to(device)
-        depth = batch["depth"].to(device)
-        valid_mask = batch["valid_mask"].to(device)
-        condition = batch["condition"].to(device)
+        (
+            pixel_values,
+            depth,
+            valid_mask,
+            condition,
+            condition_stats,
+        ) = _unpack_ati_batch(batch, device)
 
         target_size = depth.shape[-2:]
 
@@ -385,7 +423,7 @@ def validate(
             valid_mask,
             uncertainty=out["std"],
         )
-        batch_condition_metrics = _condition_batch_metrics(batch)
+        batch_condition_metrics = _condition_batch_metrics(condition_stats)
         epoch_mean_metrics = {
             **correlations,
             **ause_metrics,

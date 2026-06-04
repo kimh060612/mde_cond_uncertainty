@@ -16,6 +16,32 @@ SPEED_LEVELS = ("slow", "fast")
 SCENE_PREFIXES = ("comlab_scene2", "realsense_scene")
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp")
 DEPTH_EXTENSIONS = (".npy", ".png", ".tif", ".tiff", ".exr")
+ATI_PIXEL_VALUES_IDX = 0
+ATI_DEPTH_IDX = 1
+ATI_VALID_MASK_IDX = 2
+ATI_CONDITION_IDX = 3
+ATI_CONDITION_STATS_IDX = 4
+ATI_STATS_VALID_PIXEL_RATIO_IDX = 0
+ATI_STATS_MIN_VALID_DEPTH_RATIO_IDX = 1
+ATI_STATS_LIGHT_LABEL_IDX = 2
+ATI_STATS_SPEED_LABEL_IDX = 3
+ATI_STATS_EXPOSURE_IDX = 4
+ATI_STATS_GAIN_IDX = 5
+
+ATISample = Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]
+ATIBatch = Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]
 
 
 @dataclass(frozen=True)
@@ -264,7 +290,7 @@ class ATIRealWorldDepthDataset(Dataset):
 
         return torch.tensor(values, dtype=torch.float32)
 
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+    def __getitem__(self, idx: int) -> ATISample:
         item = self.items[idx]
 
         image = Image.open(item.rgb_path).convert("RGB")
@@ -288,52 +314,45 @@ class ATIRealWorldDepthDataset(Dataset):
         valid_pixel_ratio = valid_mask.float().mean()
         depth = torch.nan_to_num(depth, nan=0.0, posinf=0.0, neginf=0.0)
 
-        return {
-            "pixel_values": pixel_values,
-            "depth": depth,
-            "valid_mask": valid_mask.float(),
-            "valid_pixel_ratio": valid_pixel_ratio,
-            "min_valid_depth_ratio": torch.tensor(self.min_valid_depth_ratio, dtype=torch.float32),
-            "condition": self._make_condition(item),
-            "light_label": torch.tensor(self.light_to_idx[item.light], dtype=torch.long),
-            "speed_label": torch.tensor(self.speed_to_idx[item.speed], dtype=torch.long),
-            "exposure": torch.tensor(item.exposure, dtype=torch.float32),
-            "gain": torch.tensor(item.gain, dtype=torch.float32),
-            "rgb_path": str(item.rgb_path),
-            "depth_path": str(item.depth_path),
-            "scene_name": item.scene_name,
-            "frame_id": item.frame_id,
-        }
+        return (
+            pixel_values,
+            depth,
+            valid_mask.float(),
+            self._make_condition(item),
+            torch.tensor(
+                [
+                    float(valid_pixel_ratio.item()),
+                    self.min_valid_depth_ratio,
+                    float(self.light_to_idx[item.light]),
+                    float(self.speed_to_idx[item.speed]),
+                    item.exposure,
+                    item.gain,
+                ],
+                dtype=torch.float32,
+            ),
+        )
 
 
-def ati_collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Optional[Dict[str, torch.Tensor]]:
+def ati_collate_fn(batch: List[ATISample]) -> Optional[ATIBatch]:
     batch = [
         sample
         for sample in batch
-        if sample["valid_pixel_ratio"].item() >= sample["min_valid_depth_ratio"].item()
+        if (
+            sample[ATI_CONDITION_STATS_IDX][ATI_STATS_VALID_PIXEL_RATIO_IDX].item()
+            >= sample[ATI_CONDITION_STATS_IDX][ATI_STATS_MIN_VALID_DEPTH_RATIO_IDX].item()
+        )
     ]
 
     if not batch:
         return None
 
-    tensor_keys = (
-        "pixel_values",
-        "depth",
-        "valid_mask",
-        "valid_pixel_ratio",
-        "min_valid_depth_ratio",
-        "condition",
-        "light_label",
-        "speed_label",
-        "exposure",
-        "gain",
+    return (
+        torch.stack([sample[ATI_PIXEL_VALUES_IDX] for sample in batch], dim=0),
+        torch.stack([sample[ATI_DEPTH_IDX] for sample in batch], dim=0),
+        torch.stack([sample[ATI_VALID_MASK_IDX] for sample in batch], dim=0),
+        torch.stack([sample[ATI_CONDITION_IDX] for sample in batch], dim=0),
+        torch.stack([sample[ATI_CONDITION_STATS_IDX] for sample in batch], dim=0),
     )
-    collated = {key: torch.stack([sample[key] for sample in batch], dim=0) for key in tensor_keys}
-
-    for key in ("rgb_path", "depth_path", "scene_name", "frame_id"):
-        collated[key] = [sample[key] for sample in batch]
-
-    return collated
 
 
 class RGBDepthDataset(Dataset):
