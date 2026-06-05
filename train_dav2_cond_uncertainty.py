@@ -657,6 +657,7 @@ def main():
     scaler = torch.amp.GradScaler("cuda", enabled=amp)
 
     best_abs_rel = float("inf")
+    best_abs_rel_correlation = float("-inf")
     global_step = 0
 
     for epoch in range(1, args.epochs + 1):
@@ -702,9 +703,10 @@ def main():
         print(f"[epoch {epoch}] train={train_metrics}")
         print(f"[epoch {epoch}] val={val_metrics}")
 
-        is_best = val_metrics["abs_rel"] < best_abs_rel
+        # is_best = val_metrics["abs_rel"] < best_abs_rel
+        is_best = val_metrics["image_mean_uncertainty_abs_rel_pearson"] > best_abs_rel_correlation
         if is_best:
-            best_abs_rel = val_metrics["abs_rel"]
+            best_abs_rel_correlation = val_metrics["image_mean_uncertainty_abs_rel_pearson"]
             save_checkpoint(
                 model,
                 image_processor,
@@ -714,13 +716,13 @@ def main():
                 dataset_metadata,
             )
             if wandb_run is not None:
-                wandb_run.summary["best_abs_rel"] = best_abs_rel
+                wandb_run.summary["best_abs_rel_correlation"] = best_abs_rel_correlation
                 wandb_run.summary["best_epoch"] = epoch
 
         if wandb_run is not None:
             epoch_log = {
                 "epoch": epoch,
-                "best/abs_rel": best_abs_rel,
+                "best/abs_rel_correlation": best_abs_rel_correlation,
                 "best/is_best": int(is_best),
             }
             epoch_log.update({f"train/{key}": value for key, value in train_metrics.items()})
