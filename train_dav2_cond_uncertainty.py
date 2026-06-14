@@ -11,13 +11,15 @@ except ImportError:
 
 from transformers import AutoImageProcessor
 
-from ati_dataset import (
+from ati_motion_dataset import (
     ATI_STATS_EXPOSURE_IDX,
     ATI_STATS_GAIN_IDX,
     ATI_STATS_LIGHT_LABEL_IDX,
     ATI_STATS_SPEED_LABEL_IDX,
     ATI_STATS_VALID_PIXEL_RATIO_IDX,
-    ATIRealWorldDepthDataset,
+    ATIRealWorldDepthMotionDataset,
+    ATIRealWorldDepthMotionValidationDataset,
+    W_SPIN,
     ati_collate_fn,
 )
 from correlation_utils import (
@@ -510,13 +512,20 @@ def parse_args():
     parser.add_argument("--uncertainty_mode", type=str, default="top20", choices=["mean", "top10", "top20"])
     parser.add_argument("--grad_clip", type=float, default=1.0)
 
-    parser.add_argument("--val_ratio", type=float, default=0.2)
-    parser.add_argument("--split_seed", type=int, default=42)
     parser.add_argument("--max_train_samples", type=int, default=None)
     parser.add_argument("--max_val_samples", type=int, default=None)
     parser.add_argument("--light_levels", nargs="*", default=["dark", "dim", "normal"])
-    parser.add_argument("--speed_levels", nargs="*", default=["slow", "fast"])
-    parser.add_argument("--scene_prefixes", nargs="*", default=["comlab_scene2", "realsense_scene"])
+    parser.add_argument(
+        "--speed_levels",
+        nargs="*",
+        default=["slow", "normal", "fast", "rotate", "spin"],
+    )
+    parser.add_argument(
+        "--spin_threshold",
+        type=float,
+        default=W_SPIN,
+        help="Minimum absolute yaw rate for the spin class.",
+    )
 
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--no_amp", action="store_true")
@@ -563,38 +572,51 @@ def main():
         "root_dir": args.dataset_root,
         "image_processor": image_processor,
         "image_size": (args.image_height, args.image_width),
-        "val_ratio": args.val_ratio,
-        "split_seed": args.split_seed,
         "min_depth": args.min_depth,
         "max_depth": args.max_depth,
         "min_valid_depth_ratio": args.min_valid_depth_ratio,
         "light_levels": args.light_levels,
         "speed_levels": args.speed_levels,
-        "scene_prefixes": args.scene_prefixes,
+        "spin_threshold": args.spin_threshold,
     }
-    train_set = ATIRealWorldDepthDataset(
-        split="train",
+    train_set = ATIRealWorldDepthMotionDataset(
         max_samples=args.max_train_samples,
         **dataset_kwargs,
     )
-    val_set = ATIRealWorldDepthDataset(
-        split="validation",
+    val_set = ATIRealWorldDepthMotionValidationDataset(
         max_samples=args.max_val_samples,
         **dataset_kwargs,
     )
+
+    if train_set.condition_names != val_set.condition_names:
+        raise ValueError(
+            "Training and validation condition layouts do not match: "
+            f"{train_set.condition_names} != {val_set.condition_names}"
+        )
+
+    # Validation must use the normalization learned from the training dataset.
+    val_set.exposure_min = train_set.exposure_min
+    val_set.exposure_max = train_set.exposure_max
+    val_set.gain_min = train_set.gain_min
+    val_set.gain_max = train_set.gain_max
 
     dataset_metadata = {
         "condition_names": list(train_set.condition_names),
         "light_levels": list(train_set.light_levels),
         "speed_levels": list(train_set.speed_levels),
+        "spin_threshold": args.spin_threshold,
         "exposure_min": train_set.exposure_min,
         "exposure_max": train_set.exposure_max,
         "gain_min": train_set.gain_min,
         "gain_max": train_set.gain_max,
         "min_valid_depth_ratio": args.min_valid_depth_ratio,
+        "train_scan_stats": dict(train_set.scan_stats),
+        "validation_scan_stats": dict(val_set.scan_stats),
     }
     print(f"train samples: {len(train_set):,}, val samples: {len(val_set):,}")
     print(f"condition dim: {train_set.condition_dim}, names={list(train_set.condition_names)}")
+    print(f"train scan stats: {train_set.scan_stats}")
+    print(f"validation scan stats: {val_set.scan_stats}")
 
     if wandb_run is not None:
         wandb_run.config.update(dataset_metadata, allow_val_change=True)

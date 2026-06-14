@@ -2,3 +2,4 @@ ckpt/
 wandb/
 __pycache__/
 .vscode/
+eval_results*/
