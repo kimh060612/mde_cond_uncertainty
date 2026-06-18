@@ -43,6 +43,7 @@ ATI_STATS_LIGHT_LABEL_IDX = 2
 ATI_STATS_SPEED_LABEL_IDX = 3
 ATI_STATS_EXPOSURE_IDX = 4
 ATI_STATS_GAIN_IDX = 5
+ATI_STATS_TOPOLOGY_IDX = 6
 
 ATISample = Tuple[
     torch.Tensor,
@@ -108,6 +109,21 @@ def _parse_exposure_dir_name(name: str):
     if match is None:
         return None
     return float(match.group(1)), float(match.group(2))
+
+
+def _normalize_topology_name(topology: str) -> str:
+    topology = str(topology).strip()
+    if not topology:
+        raise ValueError("topology names must be non-empty")
+    return topology if topology.startswith("topology") else f"topology{topology}"
+
+
+def _topology_number(topology: str) -> int:
+    topology = _normalize_topology_name(topology)
+    topology_suffix = topology[len("topology"):]
+    if not topology_suffix.isdigit():
+        raise ValueError(f"Expected numeric topology name, got {topology}")
+    return int(topology_suffix)
 
 
 def _index_files_by_stem(directory: Path, extensions: Sequence[str]) -> Dict[str, Path]:
@@ -239,6 +255,7 @@ class _ATIRealWorldDepthMotionBase(Dataset):
         speed_levels: Sequence[str] = SPEED_LEVELS,
         spin_threshold: float = W_SPIN,
         max_samples: Optional[int] = None,
+        topologies: Optional[Sequence[str]] = None,
     ):
         if not self.scene_prefix or not self.split_name:
             raise TypeError("Use a concrete training or validation dataset class")
@@ -253,6 +270,11 @@ class _ATIRealWorldDepthMotionBase(Dataset):
         self.light_levels = tuple(light_levels)
         self.speed_levels = tuple(speed_levels)
         self.spin_threshold = float(spin_threshold)
+        self.topologies = (
+            tuple(dict.fromkeys(_normalize_topology_name(name) for name in topologies))
+            if topologies is not None
+            else None
+        )
 
         if len(set(self.light_levels)) != len(self.light_levels):
             raise ValueError(f"light_levels contains duplicates: {self.light_levels}")
@@ -278,7 +300,15 @@ class _ATIRealWorldDepthMotionBase(Dataset):
 
         all_items = self._scan_items()
         if not all_items:
-            raise FileNotFoundError(f"No ATI RGB/depth pairs found under {self.root_dir}")
+            topology_msg = (
+                f" for topologies {list(self.topologies)}"
+                if self.topologies is not None
+                else ""
+            )
+            raise FileNotFoundError(
+                f"No ATI RGB/depth pairs found in {self.split_name}{topology_msg} "
+                f"under {self.root_dir}"
+            )
 
         exposures = [item.exposure for item in all_items]
         gains = [item.gain for item in all_items]
@@ -322,6 +352,8 @@ class _ATIRealWorldDepthMotionBase(Dataset):
                 continue
 
             scene_prefix, light, collection_speed, topology = parsed_scene
+            if self.topologies is not None and topology not in self.topologies:
+                continue
 
             for exposure_dir in sorted(scene_dir.iterdir()):
                 if not exposure_dir.is_dir():
@@ -480,6 +512,7 @@ class _ATIRealWorldDepthMotionBase(Dataset):
                     float(self.speed_to_idx[item.speed]),
                     item.exposure,
                     item.gain,
+                    float(_topology_number(item.topology)),
                 ],
                 dtype=torch.float32,
             ),

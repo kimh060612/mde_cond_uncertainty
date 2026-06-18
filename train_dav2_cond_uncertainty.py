@@ -16,6 +16,7 @@ from ati_motion_dataset import (
     ATI_STATS_GAIN_IDX,
     ATI_STATS_LIGHT_LABEL_IDX,
     ATI_STATS_SPEED_LABEL_IDX,
+    ATI_STATS_TOPOLOGY_IDX,
     ATI_STATS_VALID_PIXEL_RATIO_IDX,
     ATIRealWorldDepthMotionDataset,
     ATIRealWorldDepthMotionValidationDataset,
@@ -78,6 +79,28 @@ def _compute_global_image_correlations(accumulator):
 def _prefix_metrics(prefix, metrics):
     return {f"{prefix}_{key}": value for key, value in metrics.items()}
 
+def _normalize_topology_name(topology: str) -> str:
+    topology = str(topology).strip()
+    if not topology:
+        raise ValueError("topology names must be non-empty")
+    return topology if topology.startswith("topology") else f"topology{topology}"
+
+def _topology_id(topology: str) -> int:
+    topology = _normalize_topology_name(topology)
+    topology_suffix = topology[len("topology"):]
+    if not topology_suffix.isdigit():
+        raise ValueError(f"Expected numeric topology name, got {topology}")
+    return int(topology_suffix)
+
+def _topology_id_set(topologies):
+    return {_topology_id(topology) for topology in topologies}
+
+def _count_items_by_topology(dataset):
+    counts = {}
+    for item in dataset.items:
+        counts[item.topology] = counts.get(item.topology, 0) + 1
+    return counts
+
 def _optimizer_lr(optimizer, group_name):
     for group in optimizer.param_groups:
         if group.get("name") == group_name:
@@ -117,6 +140,13 @@ def _condition_batch_metrics(condition_stats):
             condition_stats[:, ATI_STATS_SPEED_LABEL_IDX].mean().item()
         ),
     }
+
+
+def _copy_condition_normalization(target_dataset, source_dataset):
+    target_dataset.exposure_min = source_dataset.exposure_min
+    target_dataset.exposure_max = source_dataset.exposure_max
+    target_dataset.gain_min = source_dataset.gain_min
+    target_dataset.gain_max = source_dataset.gain_max
 
 
 def train_one_epoch(
@@ -319,6 +349,197 @@ def train_one_epoch(
     return epoch_metrics, global_step
 
 
+def _new_validation_accumulator():
+    return {
+        "running_loss": 0.0,
+        "running_abs_rel": 0.0,
+        "running_rmse": 0.0,
+        "running_a1": 0.0,
+        "running_corr_samples": 0,
+        "running_ause_samples": 0,
+        "corr_sums": {},
+        "corr_counts": {},
+        "condition_sums": {},
+        "image_metric_values": {},
+        "processed_batches": 0,
+    }
+
+
+def _validation_batch_result(
+    model_id: str,
+    out,
+    depth,
+    valid_mask,
+    condition_stats,
+    device,
+    amp: bool,
+    lambda_smooth_logvar: float,
+    listnet_temperature: float,
+    uncertainty_mode: str,
+    list_loss_weight: float,
+    correlation_max_samples: int,
+    min_depth: float,
+    max_depth: float,
+    relative_align_mode: str,
+):
+    if depth.shape[0] == 0:
+        return None
+
+    with torch.autocast(device_type=device.type, enabled=amp):
+        nll_loss = gaussian_nll_depth_loss(
+            out["mu"],
+            out["log_var"],
+            depth,
+            valid_mask,
+            lambda_smooth_logvar=lambda_smooth_logvar,
+        )
+        list_loss = image_level_listnet_loss(
+            out["mu"],
+            out["std"],
+            depth,
+            valid_mask,
+            temperature=listnet_temperature,
+            uncertainty_mode=uncertainty_mode,
+        )
+        loss = nll_loss + list_loss_weight * list_loss
+
+    if model_id.startswith("metric"):
+        metrics = _prefix_metrics(
+            "metric_depth",
+            compute_metrics(out["mu"].detach(), depth, valid_mask)
+        )
+    else:
+        metrics = _prefix_metrics(
+            "relative_depth",
+            compute_relative_depth_metrics(
+                out["mu"].detach(),
+                depth,
+                valid_mask,
+                min_depth=min_depth,
+                max_depth=max_depth,
+                align_mode=relative_align_mode,
+            ),
+        )
+
+    correlations = compute_loss_uncertainty_correlations(
+        out["mu"].detach(),
+        out["log_var"].detach(),
+        depth,
+        valid_mask,
+        uncertainty=out["std"].detach(),
+        max_samples=correlation_max_samples,
+    )
+    ause_metrics = compute_sparsification_ause_metrics(
+        out["mu"].detach(),
+        depth,
+        valid_mask,
+        uncertainty=out["std"].detach(),
+        max_samples=correlation_max_samples,
+    )
+    batch_image_values = compute_image_uncertainty_metric_values(
+        out["mu"].detach(),
+        depth,
+        valid_mask,
+        uncertainty=out["std"].detach(),
+    )
+    batch_condition_metrics = _condition_batch_metrics(condition_stats)
+    prefix_head = "metric_depth" if model_id.startswith("metric") else "relative_depth"
+
+    return {
+        "loss": loss.item(),
+        "abs_rel": metrics[f"{prefix_head}_abs_rel"],
+        "rmse": metrics[f"{prefix_head}_rmse"],
+        "a1": metrics[f"{prefix_head}_a1"],
+        "correlations": correlations,
+        "ause_metrics": ause_metrics,
+        "image_values": batch_image_values,
+        "condition_metrics": batch_condition_metrics,
+        "epoch_mean_metrics": {
+            **correlations,
+            **ause_metrics,
+        },
+    }
+
+
+def _accumulate_validation_result(accumulator, result):
+    if result is None:
+        return
+
+    accumulator["running_loss"] += result["loss"]
+    accumulator["running_abs_rel"] += result["abs_rel"]
+    accumulator["running_rmse"] += result["rmse"]
+    accumulator["running_a1"] += result["a1"]
+    accumulator["running_corr_samples"] += result["correlations"]["loss_uncertainty_samples"]
+    accumulator["running_ause_samples"] += result["ause_metrics"]["ause_samples"]
+    _accumulate_finite_metrics(
+        accumulator["corr_sums"],
+        accumulator["corr_counts"],
+        result["epoch_mean_metrics"],
+    )
+    _extend_image_metric_values(
+        accumulator["image_metric_values"],
+        result["image_values"],
+    )
+    accumulator["processed_batches"] += 1
+
+    for key, value in result["condition_metrics"].items():
+        accumulator["condition_sums"][key] = (
+            accumulator["condition_sums"].get(key, 0.0) + value
+        )
+
+
+def _finalize_validation_accumulator(accumulator):
+    n = accumulator["processed_batches"]
+    if n == 0:
+        val_metrics = {
+            "loss": float("nan"),
+            "abs_rel": float("nan"),
+            "rmse": float("nan"),
+            "a1": float("nan"),
+            "loss_uncertainty_samples": 0,
+            "ause_samples": 0,
+        }
+    else:
+        val_metrics = {
+            "loss": accumulator["running_loss"] / n,
+            "abs_rel": accumulator["running_abs_rel"] / n,
+            "rmse": accumulator["running_rmse"] / n,
+            "a1": accumulator["running_a1"] / n,
+            "loss_uncertainty_samples": accumulator["running_corr_samples"],
+            "ause_samples": accumulator["running_ause_samples"],
+        }
+        val_metrics.update(
+            {
+                key: value / n
+                for key, value in accumulator["condition_sums"].items()
+            }
+        )
+    val_metrics.update(
+        _mean_finite_metrics(accumulator["corr_sums"], accumulator["corr_counts"])
+    )
+    val_metrics.update(
+        _compute_global_image_correlations(accumulator["image_metric_values"])
+    )
+
+    return val_metrics
+
+
+def _model_output_subset(out, indices):
+    return {
+        "mu": out["mu"][indices],
+        "log_var": out["log_var"][indices],
+        "std": out["std"][indices],
+    }
+
+
+def _topology_split_indices(condition_stats, topology_ids):
+    batch_topology_ids = condition_stats[:, ATI_STATS_TOPOLOGY_IDX].round().long()
+    split_mask = torch.zeros_like(batch_topology_ids, dtype=torch.bool)
+    for topology_id in topology_ids:
+        split_mask |= batch_topology_ids == int(topology_id)
+    return split_mask.nonzero(as_tuple=False).flatten()
+
+
 @torch.no_grad()
 def validate(
     model_id: str,
@@ -334,20 +555,19 @@ def validate(
     min_depth: float = 1e-3,
     max_depth: float = 80.0,
     relative_align_mode: str = "scale_shift",
+    topology_splits=None,
 ):
     model.eval()
 
-    running_loss = 0.0
-    running_abs_rel = 0.0
-    running_rmse = 0.0
-    running_a1 = 0.0
-    running_corr_samples = 0
-    running_ause_samples = 0
-    corr_sums = {}
-    corr_counts = {}
-    condition_sums = {}
-    image_metric_values = {}
-    processed_batches = 0
+    total_accumulator = _new_validation_accumulator()
+    topology_split_ids = {
+        split_name: _topology_id_set(topologies)
+        for split_name, topologies in (topology_splits or {}).items()
+    }
+    split_accumulators = {
+        split_name: _new_validation_accumulator()
+        for split_name in topology_split_ids
+    }
 
     for batch in loader:
         if batch is None:
@@ -369,96 +589,62 @@ def validate(
                 condition=condition,
                 target_size=target_size,
             )
-            nll_loss = gaussian_nll_depth_loss(
-                out["mu"],
-                out["log_var"],
-                depth,
-                valid_mask,
-                lambda_smooth_logvar=lambda_smooth_logvar,
-            )
-            list_loss = image_level_listnet_loss(
-                out["mu"],
-                out["std"],
-                depth,
-                valid_mask,
-                temperature=listnet_temperature,
-                uncertainty_mode=uncertainty_mode,
-            )
-            loss = nll_loss + list_loss_weight * list_loss
 
-        if model_id.startswith("metric"):
-            metrics = _prefix_metrics(
-                "metric_depth",
-                compute_metrics(out["mu"].detach(), depth, valid_mask)
-            )
-        else:
-            metrics = _prefix_metrics(
-                "relative_depth",
-                compute_relative_depth_metrics(
-                    out["mu"].detach(),
-                    depth,
-                    valid_mask,
-                    min_depth=min_depth,
-                    max_depth=max_depth,
-                    align_mode=relative_align_mode,
-                ),
-            )
-            
-        correlations = compute_loss_uncertainty_correlations(
-            out["mu"],
-            out["log_var"],
+        batch_result = _validation_batch_result(
+            model_id,
+            out,
             depth,
             valid_mask,
-            uncertainty=out["std"],
-            max_samples=correlation_max_samples,
+            condition_stats,
+            device,
+            amp,
+            lambda_smooth_logvar,
+            listnet_temperature,
+            uncertainty_mode,
+            list_loss_weight,
+            correlation_max_samples,
+            min_depth,
+            max_depth,
+            relative_align_mode,
         )
-        ause_metrics = compute_sparsification_ause_metrics(
-            out["mu"],
-            depth,
-            valid_mask,
-            uncertainty=out["std"],
-            max_samples=correlation_max_samples,
-        )
-        batch_image_values = compute_image_uncertainty_metric_values(
-            out["mu"],
-            depth,
-            valid_mask,
-            uncertainty=out["std"],
-        )
-        batch_condition_metrics = _condition_batch_metrics(condition_stats)
-        epoch_mean_metrics = {
-            **correlations,
-            **ause_metrics,
-        }
+        _accumulate_validation_result(total_accumulator, batch_result)
 
-        prefix_head = "metric_depth" if model_id.startswith("metric") else "relative_depth"
-        running_loss += loss.item()
-        running_abs_rel += metrics[f"{prefix_head}_abs_rel"]
-        running_rmse += metrics[f"{prefix_head}_rmse"]
-        running_a1 += metrics[f"{prefix_head}_a1"]
-        running_corr_samples += correlations["loss_uncertainty_samples"]
-        running_ause_samples += ause_metrics["ause_samples"]
-        _accumulate_finite_metrics(corr_sums, corr_counts, epoch_mean_metrics)
-        _extend_image_metric_values(image_metric_values, batch_image_values)
-        processed_batches += 1
+        for split_name, split_topology_ids in topology_split_ids.items():
+            cpu_indices = _topology_split_indices(condition_stats, split_topology_ids)
+            if cpu_indices.numel() == 0:
+                continue
 
-        for key, value in batch_condition_metrics.items():
-            condition_sums[key] = condition_sums.get(key, 0.0) + value
+            device_indices = cpu_indices.to(depth.device)
+            split_result = _validation_batch_result(
+                model_id,
+                _model_output_subset(out, device_indices),
+                depth[device_indices],
+                valid_mask[device_indices],
+                condition_stats[cpu_indices],
+                device,
+                amp,
+                lambda_smooth_logvar,
+                listnet_temperature,
+                uncertainty_mode,
+                list_loss_weight,
+                correlation_max_samples,
+                min_depth,
+                max_depth,
+                relative_align_mode,
+            )
+            _accumulate_validation_result(
+                split_accumulators[split_name],
+                split_result,
+            )
 
-    n = max(processed_batches, 1)
-    val_metrics = {
-        "loss": running_loss / n,
-        "abs_rel": running_abs_rel / n,
-        "rmse": running_rmse / n,
-        "a1": running_a1 / n,
-        "loss_uncertainty_samples": running_corr_samples,
-        "ause_samples": running_ause_samples,
+    val_metrics = _finalize_validation_accumulator(total_accumulator)
+    if topology_splits is None:
+        return val_metrics
+
+    return val_metrics, {
+        split_name: _finalize_validation_accumulator(accumulator)
+        for split_name, accumulator in split_accumulators.items()
     }
-    val_metrics.update({key: value / n for key, value in condition_sums.items()})
-    val_metrics.update(_mean_finite_metrics(corr_sums, corr_counts))
-    val_metrics.update(_compute_global_image_correlations(image_metric_values))
-
-    return val_metrics
 
 
 def save_checkpoint(model, image_processor, output_dir, epoch, val_metrics, dataset_metadata):
@@ -514,6 +700,18 @@ def parse_args():
 
     parser.add_argument("--max_train_samples", type=int, default=None)
     parser.add_argument("--max_val_samples", type=int, default=None)
+    parser.add_argument(
+        "--seen_val_topologies",
+        nargs="+",
+        default=["topology2", "topology4"],
+        help="Validation topologies that are also present in the training set.",
+    )
+    parser.add_argument(
+        "--unseen_val_topologies",
+        nargs="+",
+        default=["topology3", "topology5"],
+        help="Validation topologies that are not present in the training set.",
+    )
     parser.add_argument("--light_levels", nargs="*", default=["dark", "dim", "normal"])
     parser.add_argument(
         "--speed_levels",
@@ -595,10 +793,33 @@ def main():
         )
 
     # Validation must use the normalization learned from the training dataset.
-    val_set.exposure_min = train_set.exposure_min
-    val_set.exposure_max = train_set.exposure_max
-    val_set.gain_min = train_set.gain_min
-    val_set.gain_max = train_set.gain_max
+    _copy_condition_normalization(val_set, train_set)
+
+    seen_val_topologies = [
+        _normalize_topology_name(topology)
+        for topology in args.seen_val_topologies
+    ]
+    unseen_val_topologies = [
+        _normalize_topology_name(topology)
+        for topology in args.unseen_val_topologies
+    ]
+    validation_topology_counts = _count_items_by_topology(val_set)
+    seen_val_topology_ids = _topology_id_set(seen_val_topologies)
+    unseen_val_topology_ids = _topology_id_set(unseen_val_topologies)
+    seen_val_count = sum(
+        count
+        for topology, count in validation_topology_counts.items()
+        if _topology_id(topology) in seen_val_topology_ids
+    )
+    unseen_val_count = sum(
+        count
+        for topology, count in validation_topology_counts.items()
+        if _topology_id(topology) in unseen_val_topology_ids
+    )
+    validation_topology_splits = {
+        "seen": seen_val_topologies,
+        "unseen": unseen_val_topologies,
+    }
 
     dataset_metadata = {
         "condition_names": list(train_set.condition_names),
@@ -612,11 +833,22 @@ def main():
         "min_valid_depth_ratio": args.min_valid_depth_ratio,
         "train_scan_stats": dict(train_set.scan_stats),
         "validation_scan_stats": dict(val_set.scan_stats),
+        "validation_topology_counts": dict(validation_topology_counts),
+        "seen_validation_topologies": list(seen_val_topologies),
+        "seen_validation_samples": seen_val_count,
+        "unseen_validation_topologies": list(unseen_val_topologies),
+        "unseen_validation_samples": unseen_val_count,
     }
-    print(f"train samples: {len(train_set):,}, val samples: {len(val_set):,}")
+    print(
+        f"train samples: {len(train_set):,}, "
+        f"val samples: {len(val_set):,}, "
+        f"seen val samples: {seen_val_count:,}, "
+        f"unseen val samples: {unseen_val_count:,}"
+    )
     print(f"condition dim: {train_set.condition_dim}, names={list(train_set.condition_names)}")
     print(f"train scan stats: {train_set.scan_stats}")
     print(f"validation scan stats: {val_set.scan_stats}")
+    print(f"validation topology counts: {validation_topology_counts}")
 
     if wandb_run is not None:
         wandb_run.config.update(dataset_metadata, allow_val_change=True)
@@ -706,7 +938,7 @@ def main():
             correlation_max_samples=args.correlation_max_samples,
         )
 
-        val_metrics = validate(
+        val_metrics, split_val_metrics = validate(
             model_id=model_id,
             model=model,
             loader=val_loader,
@@ -720,21 +952,31 @@ def main():
             min_depth=args.min_depth,
             max_depth=args.max_depth,
             relative_align_mode=args.relative_align_mode,
+            topology_splits=validation_topology_splits,
         )
+        seen_val_metrics = split_val_metrics["seen"]
+        unseen_val_metrics = split_val_metrics["unseen"]
 
         print(f"[epoch {epoch}] train={train_metrics}")
         print(f"[epoch {epoch}] val={val_metrics}")
+        print(f"[epoch {epoch}] seen_val={seen_val_metrics}")
+        print(f"[epoch {epoch}] unseen_val={unseen_val_metrics}")
 
         # is_best = val_metrics["abs_rel"] < best_abs_rel
         is_best = val_metrics["image_mean_uncertainty_abs_rel_pearson"] > best_abs_rel_correlation
         if is_best:
             best_abs_rel_correlation = val_metrics["image_mean_uncertainty_abs_rel_pearson"]
+            checkpoint_val_metrics = {
+                **val_metrics,
+                **_prefix_metrics("seen", seen_val_metrics),
+                **_prefix_metrics("unseen", unseen_val_metrics),
+            }
             save_checkpoint(
                 model,
                 image_processor,
                 args.output_dir,
                 epoch,
-                val_metrics,
+                checkpoint_val_metrics,
                 dataset_metadata,
             )
             if wandb_run is not None:
@@ -749,6 +991,12 @@ def main():
             }
             epoch_log.update({f"train/{key}": value for key, value in train_metrics.items()})
             epoch_log.update({f"val/{key}": value for key, value in val_metrics.items()})
+            epoch_log.update(
+                {f"val/seen_{key}": value for key, value in seen_val_metrics.items()}
+            )
+            epoch_log.update(
+                {f"val/unseen_{key}": value for key, value in unseen_val_metrics.items()}
+            )
             wandb_run.log(epoch_log, step=global_step)
 
     if wandb_run is not None:
