@@ -11,6 +11,14 @@ def _ensure_bchw(x: torch.Tensor) -> torch.Tensor:
     raise ValueError(f"Expected tensor with shape [B, H, W] or [B, 1, H, W], got {tuple(x.shape)}")
 
 
+def _cpu_float_bchw(x: torch.Tensor) -> torch.Tensor:
+    return _ensure_bchw(x.detach()).float().cpu()
+
+
+def _cpu_bool_bchw(x: torch.Tensor) -> torch.Tensor:
+    return _ensure_bchw(x.detach()).bool().cpu()
+
+
 def _prepare_bchw_mask(valid_mask: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
     if valid_mask.ndim == 3:
         valid_mask = valid_mask.unsqueeze(1)
@@ -33,12 +41,11 @@ def _deterministic_subsample(
     if max_samples is None or max_samples <= 0 or numel <= max_samples:
         return vectors
 
-    idx = torch.linspace(
-        0,
-        numel - 1,
-        steps=max_samples,
-        device=vectors[0].device,
-    ).long()
+    if max_samples == 1:
+        idx = torch.zeros(1, device=vectors[0].device, dtype=torch.long)
+    else:
+        idx = torch.arange(max_samples, device=vectors[0].device, dtype=torch.long)
+        idx = idx * (numel - 1) // (max_samples - 1)
     return tuple(v[idx] for v in vectors)
 
 
@@ -137,6 +144,13 @@ def compute_masked_correlations(
     The valid pixels are optionally sub-sampled with deterministic uniform
     indexing so this metric does not perturb the training RNG state.
     """
+    x = _cpu_float_bchw(x)
+    y = _cpu_float_bchw(y)
+    valid_mask = _cpu_bool_bchw(valid_mask)
+
+    if x.shape != y.shape:
+        raise ValueError(f"Shape mismatch: x {tuple(x.shape)} != y {tuple(y.shape)}")
+
     x_flat, y_flat = _prepare_masked_vectors(x, y, valid_mask, max_samples=max_samples)
 
     if x_flat.numel() < 2:
@@ -174,7 +188,11 @@ def compute_loss_uncertainty_correlations(
             Used only when ``uncertainty`` is None. One of "std", "var", or
             "log_var".
     """
-    loss_map = gaussian_nll_loss_map(mu.detach(), log_var.detach(), target.detach())
+    mu = _cpu_float_bchw(mu)
+    log_var = _cpu_float_bchw(log_var)
+    target = _cpu_float_bchw(target)
+    valid_mask = _cpu_bool_bchw(valid_mask)
+    loss_map = gaussian_nll_loss_map(mu, log_var, target)
 
     if uncertainty is None:
         if uncertainty_kind == "std":
@@ -185,10 +203,12 @@ def compute_loss_uncertainty_correlations(
             uncertainty = log_var
         else:
             raise ValueError(f"Unsupported uncertainty_kind: {uncertainty_kind}")
+    else:
+        uncertainty = _cpu_float_bchw(uncertainty)
 
     return compute_masked_correlations(
         loss_map,
-        uncertainty.detach(),
+        uncertainty,
         valid_mask,
         max_samples=max_samples,
         prefix="loss_uncertainty",
@@ -249,10 +269,10 @@ def compute_sparsification_ause_metrics(
     ``ause_abs_rel`` uses per-pixel AbsRel error. ``ause_a1`` uses the a1
     failure indicator, so lower AUSE is better for both metrics.
     """
-    mu = _ensure_bchw(mu.detach())
-    target = _ensure_bchw(target.detach())
-    uncertainty = _ensure_bchw(uncertainty.detach())
-    mask = _prepare_bchw_mask(valid_mask, mu)
+    mu = _cpu_float_bchw(mu)
+    target = _cpu_float_bchw(target)
+    uncertainty = _cpu_float_bchw(uncertainty)
+    mask = _prepare_bchw_mask(_cpu_bool_bchw(valid_mask), mu)
 
     abs_rel_error, a1_error = _depth_error_maps(mu, target)
     per_image_max_samples = max_samples
@@ -313,10 +333,10 @@ def compute_image_uncertainty_metric_values(
     """
     Return per-image mean uncertainty and per-image depth metrics.
     """
-    mu = _ensure_bchw(mu.detach())
-    target = _ensure_bchw(target.detach())
-    uncertainty = _ensure_bchw(uncertainty.detach())
-    mask = _prepare_bchw_mask(valid_mask, mu)
+    mu = _cpu_float_bchw(mu)
+    target = _cpu_float_bchw(target)
+    uncertainty = _cpu_float_bchw(uncertainty)
+    mask = _prepare_bchw_mask(_cpu_bool_bchw(valid_mask), mu)
 
     abs_rel_error, a1_error = _depth_error_maps(mu, target)
     mean_uncertainty = []
@@ -361,10 +381,10 @@ def compute_image_uncertainty_metric_correlations(
     """
     Correlate image-level mean uncertainty with image-level depth metrics.
     """
-    mean_uncertainty = image_values["mean_uncertainty"].detach().float()
+    mean_uncertainty = image_values["mean_uncertainty"].detach().float().cpu()
     metrics = {
-        "abs_rel": image_values["abs_rel"].detach().float(),
-        "a1": image_values["a1"].detach().float(),
+        "abs_rel": image_values["abs_rel"].detach().float().cpu(),
+        "a1": image_values["a1"].detach().float().cpu(),
     }
 
     result = {
