@@ -2,7 +2,7 @@ import argparse
 import os
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 
 try:
     import wandb
@@ -16,7 +16,6 @@ from ati_motion_dataset import (
     ATI_STATS_GAIN_IDX,
     ATI_STATS_LIGHT_LABEL_IDX,
     ATI_STATS_SPEED_LABEL_IDX,
-    ATI_STATS_TOPOLOGY_IDX,
     ATI_STATS_VALID_PIXEL_RATIO_IDX,
     ATIRealWorldDepthMotionDataset,
     ATIRealWorldDepthMotionValidationDataset,
@@ -129,6 +128,13 @@ def _count_items_by_topology(dataset):
     for item in dataset.items:
         counts[item.topology] = counts.get(item.topology, 0) + 1
     return counts
+
+def _topology_subset_indices(dataset, topology_ids):
+    return [
+        idx
+        for idx, item in enumerate(dataset.items)
+        if _topology_id(item.topology) in topology_ids
+    ]
 
 def _optimizer_lr(optimizer, group_name):
     for group in optimizer.param_groups:
@@ -553,22 +559,6 @@ def _finalize_validation_accumulator(accumulator):
     return val_metrics
 
 
-def _model_output_subset(out, indices):
-    return {
-        "mu": out["mu"][indices],
-        "log_var": out["log_var"][indices],
-        "std": out["std"][indices],
-    }
-
-
-def _topology_split_indices(condition_stats, topology_ids):
-    batch_topology_ids = condition_stats[:, ATI_STATS_TOPOLOGY_IDX].round().long()
-    split_mask = torch.zeros_like(batch_topology_ids, dtype=torch.bool)
-    for topology_id in topology_ids:
-        split_mask |= batch_topology_ids == int(topology_id)
-    return split_mask.nonzero(as_tuple=False).flatten()
-
-
 @torch.no_grad()
 def validate(
     model_id: str,
@@ -584,19 +574,10 @@ def validate(
     min_depth: float = 1e-3,
     max_depth: float = 80.0,
     relative_align_mode: str = "scale_shift",
-    topology_splits=None,
 ):
     model.eval()
 
     total_accumulator = _new_validation_accumulator()
-    topology_split_ids = {
-        split_name: _topology_id_set(topologies)
-        for split_name, topologies in (topology_splits or {}).items()
-    }
-    split_accumulators = {
-        split_name: _new_validation_accumulator()
-        for split_name in topology_split_ids
-    }
 
     for batch in loader:
         if batch is None:
@@ -638,42 +619,7 @@ def validate(
         )
         _accumulate_validation_result(total_accumulator, batch_result)
 
-        for split_name, split_topology_ids in topology_split_ids.items():
-            cpu_indices = _topology_split_indices(condition_stats, split_topology_ids)
-            if cpu_indices.numel() == 0:
-                continue
-
-            device_indices = cpu_indices.to(depth.device)
-            split_result = _validation_batch_result(
-                model_id,
-                _model_output_subset(out, device_indices),
-                depth[device_indices],
-                valid_mask[device_indices],
-                condition_stats[cpu_indices],
-                device,
-                amp,
-                lambda_smooth_logvar,
-                listnet_temperature,
-                uncertainty_mode,
-                list_loss_weight,
-                correlation_max_samples,
-                min_depth,
-                max_depth,
-                relative_align_mode,
-            )
-            _accumulate_validation_result(
-                split_accumulators[split_name],
-                split_result,
-            )
-
-    val_metrics = _finalize_validation_accumulator(total_accumulator)
-    if topology_splits is None:
-        return val_metrics
-
-    return val_metrics, {
-        split_name: _finalize_validation_accumulator(accumulator)
-        for split_name, accumulator in split_accumulators.items()
-    }
+    return _finalize_validation_accumulator(total_accumulator)
 
 
 def save_checkpoint(model, image_processor, output_dir, epoch, val_metrics, dataset_metadata):
@@ -843,20 +789,10 @@ def main():
     validation_topology_counts = _count_items_by_topology(val_set)
     seen_val_topology_ids = _topology_id_set(seen_val_topologies)
     unseen_val_topology_ids = _topology_id_set(unseen_val_topologies)
-    seen_val_count = sum(
-        count
-        for topology, count in validation_topology_counts.items()
-        if _topology_id(topology) in seen_val_topology_ids
-    )
-    unseen_val_count = sum(
-        count
-        for topology, count in validation_topology_counts.items()
-        if _topology_id(topology) in unseen_val_topology_ids
-    )
-    validation_topology_splits = {
-        "seen": seen_val_topologies,
-        "unseen": unseen_val_topologies,
-    }
+    seen_val_indices = _topology_subset_indices(val_set, seen_val_topology_ids)
+    unseen_val_indices = _topology_subset_indices(val_set, unseen_val_topology_ids)
+    seen_val_count = len(seen_val_indices)
+    unseen_val_count = len(unseen_val_indices)
 
     dataset_metadata = {
         "condition_names": list(train_set.condition_names),
@@ -901,6 +837,22 @@ def main():
     )
     val_loader = DataLoader(
         val_set,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=pin_memory,
+        collate_fn=ati_collate_fn,
+    )
+    seen_val_loader = DataLoader(
+        Subset(val_set, seen_val_indices),
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=pin_memory,
+        collate_fn=ati_collate_fn,
+    )
+    unseen_val_loader = DataLoader(
+        Subset(val_set, unseen_val_indices),
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
@@ -975,7 +927,7 @@ def main():
             correlation_max_samples=args.correlation_max_samples,
         )
 
-        val_metrics, split_val_metrics = validate(
+        val_metrics = validate(
             model_id=model_id,
             model=model,
             loader=val_loader,
@@ -989,10 +941,37 @@ def main():
             min_depth=args.min_depth,
             max_depth=args.max_depth,
             relative_align_mode=args.relative_align_mode,
-            topology_splits=validation_topology_splits,
         )
-        seen_val_metrics = split_val_metrics["seen"]
-        unseen_val_metrics = split_val_metrics["unseen"]
+        seen_val_metrics = validate(
+            model_id=model_id,
+            model=model,
+            loader=seen_val_loader,
+            device=device,
+            amp=amp,
+            lambda_smooth_logvar=args.lambda_smooth_logvar,
+            list_loss_weight=args.list_loss_weight,
+            listnet_temperature=args.listnet_temperature,
+            uncertainty_mode=args.uncertainty_mode,
+            correlation_max_samples=args.correlation_max_samples,
+            min_depth=args.min_depth,
+            max_depth=args.max_depth,
+            relative_align_mode=args.relative_align_mode,
+        )
+        unseen_val_metrics = validate(
+            model_id=model_id,
+            model=model,
+            loader=unseen_val_loader,
+            device=device,
+            amp=amp,
+            lambda_smooth_logvar=args.lambda_smooth_logvar,
+            list_loss_weight=args.list_loss_weight,
+            listnet_temperature=args.listnet_temperature,
+            uncertainty_mode=args.uncertainty_mode,
+            correlation_max_samples=args.correlation_max_samples,
+            min_depth=args.min_depth,
+            max_depth=args.max_depth,
+            relative_align_mode=args.relative_align_mode,
+        )
         seen_val_log_metrics = _seen_unseen_log_metrics(seen_val_metrics)
         unseen_val_log_metrics = _seen_unseen_log_metrics(unseen_val_metrics)
 
