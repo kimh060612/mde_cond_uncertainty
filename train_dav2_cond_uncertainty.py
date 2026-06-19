@@ -79,6 +79,16 @@ def _compute_global_image_correlations(accumulator):
 def _prefix_metrics(prefix, metrics):
     return {f"{prefix}_{key}": value for key, value in metrics.items()}
 
+_ALLOWED_TRAIN_TOPOLOGY_IDS = {1, 2, 4}
+_SEEN_UNSEEN_LOG_EXCLUDED_KEYS = {
+    "rmse",
+    "valid_pixel_ratio_mean",
+    "light_label_mean",
+    "speed_label_mean",
+    "exposure_mean",
+    "gain_mean",
+}
+
 def _normalize_topology_name(topology: str) -> str:
     topology = str(topology).strip()
     if not topology:
@@ -94,6 +104,25 @@ def _topology_id(topology: str) -> int:
 
 def _topology_id_set(topologies):
     return {_topology_id(topology) for topology in topologies}
+
+def _training_topology_arg(topology: str) -> str:
+    topology_name = _normalize_topology_name(topology)
+    try:
+        topology_id = _topology_id(topology_name)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
+    if topology_id not in _ALLOWED_TRAIN_TOPOLOGY_IDS:
+        raise argparse.ArgumentTypeError(
+            f"training topology must be one of 1, 2, 4; got {topology}"
+        )
+    return f"topology{topology_id}"
+
+def _seen_unseen_log_metrics(metrics):
+    return {
+        key: value
+        for key, value in metrics.items()
+        if key not in _SEEN_UNSEEN_LOG_EXCLUDED_KEYS
+    }
 
 def _count_items_by_topology(dataset):
     counts = {}
@@ -701,6 +730,13 @@ def parse_args():
     parser.add_argument("--max_train_samples", type=int, default=None)
     parser.add_argument("--max_val_samples", type=int, default=None)
     parser.add_argument(
+        "--train_topologies",
+        nargs="+",
+        type=_training_topology_arg,
+        default=["topology1", "topology2", "topology4"],
+        help="Training topologies to include. Allowed values: 1, 2, 4.",
+    )
+    parser.add_argument(
         "--seen_val_topologies",
         nargs="+",
         default=["topology2", "topology4"],
@@ -779,6 +815,7 @@ def main():
     }
     train_set = ATIRealWorldDepthMotionDataset(
         max_samples=args.max_train_samples,
+        topologies=args.train_topologies,
         **dataset_kwargs,
     )
     val_set = ATIRealWorldDepthMotionValidationDataset(
@@ -956,11 +993,13 @@ def main():
         )
         seen_val_metrics = split_val_metrics["seen"]
         unseen_val_metrics = split_val_metrics["unseen"]
+        seen_val_log_metrics = _seen_unseen_log_metrics(seen_val_metrics)
+        unseen_val_log_metrics = _seen_unseen_log_metrics(unseen_val_metrics)
 
         print(f"[epoch {epoch}] train={train_metrics}")
         print(f"[epoch {epoch}] val={val_metrics}")
-        print(f"[epoch {epoch}] seen_val={seen_val_metrics}")
-        print(f"[epoch {epoch}] unseen_val={unseen_val_metrics}")
+        print(f"[epoch {epoch}] seen_val={seen_val_log_metrics}")
+        print(f"[epoch {epoch}] unseen_val={unseen_val_log_metrics}")
 
         # is_best = val_metrics["abs_rel"] < best_abs_rel
         is_best = val_metrics["image_mean_uncertainty_abs_rel_pearson"] > best_abs_rel_correlation
@@ -968,8 +1007,8 @@ def main():
             best_abs_rel_correlation = val_metrics["image_mean_uncertainty_abs_rel_pearson"]
             checkpoint_val_metrics = {
                 **val_metrics,
-                **_prefix_metrics("seen", seen_val_metrics),
-                **_prefix_metrics("unseen", unseen_val_metrics),
+                **_prefix_metrics("seen", seen_val_log_metrics),
+                **_prefix_metrics("unseen", unseen_val_log_metrics),
             }
             save_checkpoint(
                 model,
@@ -992,10 +1031,10 @@ def main():
             epoch_log.update({f"train/{key}": value for key, value in train_metrics.items()})
             epoch_log.update({f"val/{key}": value for key, value in val_metrics.items()})
             epoch_log.update(
-                {f"val/seen_{key}": value for key, value in seen_val_metrics.items()}
+                {f"val/seen_{key}": value for key, value in seen_val_log_metrics.items()}
             )
             epoch_log.update(
-                {f"val/unseen_{key}": value for key, value in unseen_val_metrics.items()}
+                {f"val/unseen_{key}": value for key, value in unseen_val_log_metrics.items()}
             )
             wandb_run.log(epoch_log, step=global_step)
 

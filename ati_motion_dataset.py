@@ -10,6 +10,7 @@ import numpy as np
 import torch
 from PIL import Image
 from torch.utils.data import Dataset
+from tqdm import tqdm
 
 
 LIGHT_LEVELS = ("dark", "dim", "normal")
@@ -339,7 +340,7 @@ class _ATIRealWorldDepthMotionBase(Dataset):
             "invalid_metadata_frames": 0,
             "missing_paired_files": 0,
         }
-        for scene_dir in sorted(self.root_dir.iterdir()):
+        for scene_dir in tqdm(sorted(self.root_dir.iterdir()), desc="Scanning scenes"):
             if not scene_dir.is_dir():
                 continue
 
