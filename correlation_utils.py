@@ -144,9 +144,9 @@ def compute_masked_correlations(
     The valid pixels are optionally sub-sampled with deterministic uniform
     indexing so this metric does not perturb the training RNG state.
     """
-    x = _cpu_float_bchw(x)
-    y = _cpu_float_bchw(y)
-    valid_mask = _cpu_bool_bchw(valid_mask)
+    # x = _cpu_float_bchw(x)
+    # y = _cpu_float_bchw(y)
+    # valid_mask = _cpu_bool_bchw(valid_mask)
 
     if x.shape != y.shape:
         raise ValueError(f"Shape mismatch: x {tuple(x.shape)} != y {tuple(y.shape)}")
@@ -188,10 +188,10 @@ def compute_loss_uncertainty_correlations(
             Used only when ``uncertainty`` is None. One of "std", "var", or
             "log_var".
     """
-    mu = _cpu_float_bchw(mu)
-    log_var = _cpu_float_bchw(log_var)
-    target = _cpu_float_bchw(target)
-    valid_mask = _cpu_bool_bchw(valid_mask)
+    # mu = _cpu_float_bchw(mu)
+    # log_var = _cpu_float_bchw(log_var)
+    # target = _cpu_float_bchw(target)
+    # valid_mask = _cpu_bool_bchw(valid_mask)
     loss_map = gaussian_nll_loss_map(mu, log_var, target)
 
     if uncertainty is None:
@@ -203,8 +203,8 @@ def compute_loss_uncertainty_correlations(
             uncertainty = log_var
         else:
             raise ValueError(f"Unsupported uncertainty_kind: {uncertainty_kind}")
-    else:
-        uncertainty = _cpu_float_bchw(uncertainty)
+    # else:
+        # uncertainty = _cpu_float_bchw(uncertainty)
 
     return compute_masked_correlations(
         loss_map,
@@ -269,10 +269,10 @@ def compute_sparsification_ause_metrics(
     ``ause_abs_rel`` uses per-pixel AbsRel error. ``ause_a1`` uses the a1
     failure indicator, so lower AUSE is better for both metrics.
     """
-    mu = _cpu_float_bchw(mu)
-    target = _cpu_float_bchw(target)
-    uncertainty = _cpu_float_bchw(uncertainty)
-    mask = _prepare_bchw_mask(_cpu_bool_bchw(valid_mask), mu)
+    # mu = _cpu_float_bchw(mu)
+    # target = _cpu_float_bchw(target)
+    # uncertainty = _cpu_float_bchw(uncertainty)
+    mask = _prepare_bchw_mask(valid_mask, mu) # _cpu_bool_bchw(valid_mask)
 
     abs_rel_error, a1_error = _depth_error_maps(mu, target)
     per_image_max_samples = max_samples
@@ -333,10 +333,10 @@ def compute_image_uncertainty_metric_values(
     """
     Return per-image mean uncertainty and per-image depth metrics.
     """
-    mu = _cpu_float_bchw(mu)
-    target = _cpu_float_bchw(target)
-    uncertainty = _cpu_float_bchw(uncertainty)
-    mask = _prepare_bchw_mask(_cpu_bool_bchw(valid_mask), mu)
+    # mu = _cpu_float_bchw(mu)
+    # target = _cpu_float_bchw(target)
+    # uncertainty = _cpu_float_bchw(uncertainty)
+    mask = _prepare_bchw_mask(valid_mask, mu) # _cpu_bool_bchw(valid_mask)
 
     abs_rel_error, a1_error = _depth_error_maps(mu, target)
     mean_uncertainty = []
