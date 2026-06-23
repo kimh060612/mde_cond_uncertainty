@@ -173,28 +173,28 @@ def main(cfg: DictConfig):
     logger.info("Model: %s", model_id)
         
     for epoch in range(1, cfg.training.num_epochs + 1):
-        train_metrics, global_step = train_one_epoch(
-            model_id=model_id,
-            model=model,
-            loader=train_loader,
-            optimizer=optimizer,
-            scaler=scaler,
-            device=device,
-            epoch=epoch,
-            amp=amp,
-            logger=logger,
-            lambda_smooth_logvar=cfg.training.lambda_smooth_logvar,
-            list_loss_weight=cfg.training.list_loss_weight,
-            listnet_temperature=cfg.training.listnet_temperature,
-            uncertainty_mode=cfg.training.uncertainty_mode,
-            grad_clip=cfg.training.grad_clip,
-            min_depth=cfg.dataset.min_depth,
-            max_depth=cfg.dataset.max_depth,
-            relative_align_mode=cfg.training.relative_align_mode,
-            wandb_run=wandb_run,
-            global_step=global_step,
-            log_interval=cfg.training.log_interval,
-        )
+        # train_metrics, global_step = train_one_epoch(
+        #     model_id=model_id,
+        #     model=model,
+        #     loader=train_loader,
+        #     optimizer=optimizer,
+        #     scaler=scaler,
+        #     device=device,
+        #     epoch=epoch,
+        #     amp=amp,
+        #     logger=logger,
+        #     lambda_smooth_logvar=cfg.training.lambda_smooth_logvar,
+        #     list_loss_weight=cfg.training.list_loss_weight,
+        #     listnet_temperature=cfg.training.listnet_temperature,
+        #     uncertainty_mode=cfg.training.uncertainty_mode,
+        #     grad_clip=cfg.training.grad_clip,
+        #     min_depth=cfg.dataset.min_depth,
+        #     max_depth=cfg.dataset.max_depth,
+        #     relative_align_mode=cfg.training.relative_align_mode,
+        #     wandb_run=wandb_run,
+        #     global_step=global_step,
+        #     log_interval=cfg.training.log_interval,
+        # )
         val_metrics = validate(
             epoch=epoch,
             model_id=model_id,
@@ -244,7 +244,7 @@ def main(cfg: DictConfig):
             relative_align_mode=cfg.training.relative_align_mode,
         )
 
-        print(f"[epoch {epoch}] train={train_metrics}")
+        # print(f"[epoch {epoch}] train={train_metrics}")
         print(f"[epoch {epoch}] val={val_metrics}")
         print(f"[epoch {epoch}] seen_val={seen_val_metrics}")
         print(f"[epoch {epoch}] unseen_val={unseen_val_metrics}")
@@ -276,7 +276,7 @@ def main(cfg: DictConfig):
                 "best/abs_rel_correlation": best_abs_rel_correlation,
                 "best/is_best": int(is_best),
             }
-            epoch_log.update({f"train/{key}": value for key, value in train_metrics.items()})
+            # epoch_log.update({f"train/{key}": value for key, value in train_metrics.items()})
             epoch_log.update({f"val/{key}": value for key, value in val_metrics.items()})
             epoch_log.update(
                 {f"val_seen/{key}": value for key, value in seen_val_metrics.items()}
