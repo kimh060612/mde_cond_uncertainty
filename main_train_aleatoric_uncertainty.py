@@ -144,9 +144,9 @@ def main(cfg: DictConfig):
         freeze_backbone=cfg.training.freeze_backbone,
         min_log_var=cfg.training.min_log_var,
         max_log_var=cfg.training.max_log_var,
-        uncertainty_width=cfg.training.uncertainty_width,
-        uncertainty_blocks=cfg.training.uncertainty_blocks,
-        uncertainty_dropout=cfg.training.uncertainty_dropout,
+        uncertainty_width=cfg.model.uncertainty_width,
+        uncertainty_blocks=cfg.model.uncertainty_blocks,
+        uncertainty_dropout=cfg.model.uncertainty_dropout,
     ).to(device)
     
     backbone_params, uncertainty_params = count_model_parameters(model)
