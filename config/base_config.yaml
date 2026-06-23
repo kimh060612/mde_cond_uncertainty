@@ -36,7 +36,6 @@ training:
   max_log_var: 3.0
   listnet_temperature: 0.1
   list_loss_weight: 0.1
-  uncertainty_mode: "mean"
   grad_clip: 1.0
   relative_align_mode: "scale_shift"
   wandb_entity: "artificial_tripartite_intelligence_team"
