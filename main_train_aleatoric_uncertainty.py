@@ -47,7 +47,7 @@ def main(cfg: DictConfig):
     dataset_kwargs = {
         "root_dir": cfg.dataset.dataset_root,
         "image_processor": image_processor,
-        "image_size": (cfg.dataset.image_height, cfg.dataset.image_width),
+        "image_size": (cfg.model.image_height, cfg.model.image_width),
         "min_depth": cfg.dataset.min_depth,
         "max_depth": cfg.dataset.max_depth,
         "min_valid_depth_ratio": cfg.dataset.min_valid_depth_ratio,
