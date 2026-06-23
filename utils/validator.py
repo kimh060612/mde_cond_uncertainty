@@ -46,6 +46,7 @@ def _accumulate_validation_result(accumulator, result):
     accumulator["running_ause_samples"] += result["ause_metrics"].get("ause_samples", 0)
     accumulator["processed_batches"] += 1
     _extend_metric_values(accumulator, result["batched_metrics"])
+    _extend_metric_values(accumulator, result["uncertainty_mean"])
     _extend_metric_values(accumulator, result["correlations"])
     _extend_metric_values(accumulator, result["ause_metrics"])
 
@@ -194,13 +195,13 @@ def validate(
     a1_uncertainty_correlation = compute_masked_correlations(
         total_a1_tensor,
         total_uncertainty_mean_tensor,
-        mask=torch.isfinite(total_a1_tensor) & torch.isfinite(total_uncertainty_mean_tensor),
+        valid_mask=torch.isfinite(total_a1_tensor) & torch.isfinite(total_uncertainty_mean_tensor),
         prefix="aggregated_a1_unc"
     )
     abs_rel_uncertainty_correlation = compute_masked_correlations(
         total_abs_rel_tensor,
         total_uncertainty_mean_tensor,
-        mask=torch.isfinite(total_abs_rel_tensor) & torch.isfinite(total_uncertainty_mean_tensor),
+        valid_mask=torch.isfinite(total_abs_rel_tensor) & torch.isfinite(total_uncertainty_mean_tensor),
         prefix="aggregated_abs_rel_unc"
     )
     
