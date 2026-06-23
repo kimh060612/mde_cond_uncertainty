@@ -172,7 +172,7 @@ def main(cfg: DictConfig):
     logger.info("Training started")
     logger.info("Model: %s", model_id)
         
-    for epoch in range(1, cfg.training.epochs + 1):
+    for epoch in range(1, cfg.training.num_epochs + 1):
         train_metrics, global_step = train_one_epoch(
             model_id=model_id,
             model=model,
@@ -197,6 +197,7 @@ def main(cfg: DictConfig):
             correlation_max_samples=cfg.training.correlation_max_samples,
         )
         val_metrics = validate(
+            epoch=epoch,
             model_id=model_id,
             model=model,
             loader=val_loader,
@@ -212,6 +213,7 @@ def main(cfg: DictConfig):
             relative_align_mode=cfg.training.relative_align_mode,
         )
         seen_val_metrics = validate(
+            epoch=epoch,
             model_id=model_id,
             model=model,
             loader=seen_val_loader,
@@ -227,6 +229,7 @@ def main(cfg: DictConfig):
             relative_align_mode=cfg.training.relative_align_mode,
         )
         unseen_val_metrics = validate(
+            epoch=epoch,
             model_id=model_id,
             model=model,
             loader=unseen_val_loader,
