@@ -175,7 +175,7 @@ def validate(
             "batched_metrics": batched_metrics,
             "correlations": correlations,
             "ause_metrics": ause_metrics,
-            "uncertainty_mean": batch_uncertainty_mean
+            "uncertainty_mean": { "uncertainty_mean": batch_uncertainty_mean }
         }
         _accumulate_validation_result(total_accumulator, batch_result)
         
