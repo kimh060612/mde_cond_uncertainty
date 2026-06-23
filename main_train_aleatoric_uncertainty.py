@@ -194,7 +194,6 @@ def main(cfg: DictConfig):
             wandb_run=wandb_run,
             global_step=global_step,
             log_interval=cfg.training.log_interval,
-            correlation_max_samples=cfg.training.correlation_max_samples,
         )
         val_metrics = validate(
             epoch=epoch,
