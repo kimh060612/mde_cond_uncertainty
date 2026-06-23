@@ -20,7 +20,7 @@ from utils.logger import setup_logger
 
 
 
-@hydra.main(config_path="configs", config_name="base_config")
+@hydra.main(config_path="config", config_name="base_config")
 def main(cfg: DictConfig):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     amp = (device.type == "cuda") and (not cfg.training.no_amp)
