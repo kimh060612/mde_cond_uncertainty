@@ -1,5 +1,4 @@
 from typing import Dict, Optional, Tuple
-
 import torch
 
 
@@ -10,16 +9,10 @@ def _ensure_bchw(x: torch.Tensor) -> torch.Tensor:
         return x
     raise ValueError(f"Expected tensor with shape [B, H, W] or [B, 1, H, W], got {tuple(x.shape)}")
 
-
-def _cpu_float_bchw(x: torch.Tensor) -> torch.Tensor:
-    return _ensure_bchw(x.detach()).float().cpu()
-
-
-def _cpu_bool_bchw(x: torch.Tensor) -> torch.Tensor:
-    return _ensure_bchw(x.detach()).bool().cpu()
-
-
-def _prepare_bchw_mask(valid_mask: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
+def _prepare_bchw_mask(
+    valid_mask: torch.Tensor, 
+    reference: torch.Tensor
+) -> torch.Tensor:
     if valid_mask.ndim == 3:
         valid_mask = valid_mask.unsqueeze(1)
 
@@ -52,14 +45,47 @@ def _deterministic_subsample(
 def _depth_error_maps(
     mu: torch.Tensor,
     target: torch.Tensor,
+    model_type: str = "relative",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     mu = _ensure_bchw(mu).clamp_min(1e-3)
     target = _ensure_bchw(target).clamp_min(1e-3)
 
-    abs_rel_error = torch.abs(mu - target) / target
-    ratio = torch.maximum(mu / target, target / mu)
-    a1_error = (ratio >= 1.25).float()
+    if model_type == "metric":
+        abs_rel_error = torch.abs(mu - target) / target
+        ratio = torch.maximum(mu / target, target / mu)
+        a1_error = (ratio >= 1.25).float()
+    else:
+        gt_inv = 1.0 / (target + 1e-6)
+        relative_mask = (target > 0) & (mu > 0)
+        x = torch.where(relative_mask, mu, torch.zeros_like(mu))
+        y = torch.where(relative_mask, gt_inv, torch.zeros_like(gt_inv))
 
+        valid_counts = relative_mask.flatten(1).sum(dim=1).to(dtype=torch.float32)
+        safe_counts = valid_counts.clamp_min(1.0)
+        sum_x = x.flatten(1).sum(dim=1)
+        sum_y = y.flatten(1).sum(dim=1)
+        sum_xx = (x * x).flatten(1).sum(dim=1)
+        sum_xy = (x * y).flatten(1).sum(dim=1)
+
+        denom = safe_counts * sum_xx - sum_x.square()
+        stable = (valid_counts > 1) & (denom.abs() > 1e-6)
+        scale = torch.where(
+            stable,
+            (safe_counts * sum_xy - sum_x * sum_y) / denom.clamp(min=1e-6),
+            torch.zeros_like(valid_counts),
+        )
+        shift = torch.where(
+            valid_counts > 0,
+            (sum_y - scale * sum_x) / safe_counts,
+            torch.zeros_like(valid_counts),
+        )
+        pred_aligned = mu * scale.view(-1, 1, 1, 1) + shift.view(-1, 1, 1, 1)
+        pred_depth = 1.0 / pred_aligned.clamp_min(1e-6)
+        
+        abs_rel_error = torch.abs(pred_depth - target) / target
+        ratio = torch.maximum(pred_depth / target, target / pred_depth)
+        a1_error = (ratio >= 1.25).float()
+        
     return abs_rel_error, a1_error
 
 
@@ -144,20 +170,14 @@ def compute_masked_correlations(
     The valid pixels are optionally sub-sampled with deterministic uniform
     indexing so this metric does not perturb the training RNG state.
     """
-    # x = _cpu_float_bchw(x)
-    # y = _cpu_float_bchw(y)
-    # valid_mask = _cpu_bool_bchw(valid_mask)
-
     if x.shape != y.shape:
         raise ValueError(f"Shape mismatch: x {tuple(x.shape)} != y {tuple(y.shape)}")
 
     x_flat, y_flat = _prepare_masked_vectors(x, y, valid_mask, max_samples=max_samples)
-
     if x_flat.numel() < 2:
         return {
             f"{prefix}_pearson": float("nan"),
             f"{prefix}_spearman": float("nan"),
-            f"{prefix}_samples": int(x_flat.numel()),
         }
 
     pearson = _pearson_corr(x_flat, y_flat)
@@ -166,7 +186,6 @@ def compute_masked_correlations(
     return {
         f"{prefix}_pearson": float(pearson.item()),
         f"{prefix}_spearman": float(spearman.item()),
-        f"{prefix}_samples": int(x_flat.numel()),
     }
 
 
@@ -188,10 +207,6 @@ def compute_loss_uncertainty_correlations(
             Used only when ``uncertainty`` is None. One of "std", "var", or
             "log_var".
     """
-    # mu = _cpu_float_bchw(mu)
-    # log_var = _cpu_float_bchw(log_var)
-    # target = _cpu_float_bchw(target)
-    # valid_mask = _cpu_bool_bchw(valid_mask)
     loss_map = gaussian_nll_loss_map(mu, log_var, target)
 
     if uncertainty is None:
@@ -203,8 +218,6 @@ def compute_loss_uncertainty_correlations(
             uncertainty = log_var
         else:
             raise ValueError(f"Unsupported uncertainty_kind: {uncertainty_kind}")
-    # else:
-        # uncertainty = _cpu_float_bchw(uncertainty)
 
     return compute_masked_correlations(
         loss_map,
@@ -214,44 +227,86 @@ def compute_loss_uncertainty_correlations(
         prefix="loss_uncertainty",
     )
 
-
-def _sparsification_ause(
+def _batched_sparsification_ause(
     error: torch.Tensor,
     uncertainty: torch.Tensor,
+    sample_mask: torch.Tensor,
     num_bins: int,
 ) -> torch.Tensor:
-    if error.numel() < 2:
-        return error.new_tensor(float("nan"))
+    if error.ndim != 2 or uncertainty.ndim != 2 or sample_mask.ndim != 2:
+        raise ValueError("Expected error, uncertainty, and sample_mask to have shape [B, N]")
+    if error.shape != uncertainty.shape or error.shape != sample_mask.shape:
+        raise ValueError(
+            f"Shape mismatch: error {tuple(error.shape)}, "
+            f"uncertainty {tuple(uncertainty.shape)}, sample_mask {tuple(sample_mask.shape)}"
+        )
+
+    batch_size, num_samples = error.shape
+    result = error.new_full((batch_size,), float("nan"), dtype=torch.float64)
+    if num_samples < 2 or num_bins <= 0:
+        return result
 
     error = error.float()
     uncertainty = uncertainty.float()
-    n = error.numel()
-    num_points = min(num_bins + 1, n)
+    sample_mask = sample_mask.bool()
+    sample_counts = sample_mask.sum(dim=1)
+    valid_rows = sample_counts >= 2
+    if not valid_rows.any():
+        return result
 
-    remove_counts = torch.linspace(
-        0,
-        n - 1,
-        steps=num_points,
-        device=error.device,
-    ).round().long()
-    remove_counts = torch.unique_consecutive(remove_counts)
-    if remove_counts.numel() < 2:
-        return error.new_tensor(float("nan"))
+    safe_error = torch.where(sample_mask, error, torch.zeros_like(error))
+    neg_inf = torch.full_like(error, float("-inf"))
 
-    uncertainty_order = torch.argsort(uncertainty, descending=True)
-    oracle_order = torch.argsort(error, descending=True)
-    uncertainty_sorted_error = error[uncertainty_order]
-    oracle_sorted_error = error[oracle_order]
-
-    uncertainty_curve = torch.stack(
-        [uncertainty_sorted_error[remove_count:].mean() for remove_count in remove_counts]
+    uncertainty_order = torch.argsort(
+        torch.where(sample_mask, uncertainty, neg_inf),
+        dim=1,
+        descending=True,
     )
-    oracle_curve = torch.stack(
-        [oracle_sorted_error[remove_count:].mean() for remove_count in remove_counts]
+    oracle_order = torch.argsort(
+        torch.where(sample_mask, error, neg_inf),
+        dim=1,
+        descending=True,
     )
-    removed_fractions = remove_counts.double() / float(n)
 
-    return torch.trapz((uncertainty_curve - oracle_curve).double(), removed_fractions)
+    uncertainty_sorted_error = safe_error.gather(1, uncertainty_order)
+    oracle_sorted_error = safe_error.gather(1, oracle_order)
+    uncertainty_suffix_sum = uncertainty_sorted_error.flip(1).cumsum(dim=1).flip(1)
+    oracle_suffix_sum = oracle_sorted_error.flip(1).cumsum(dim=1).flip(1)
+
+    max_points = min(num_bins + 1, num_samples)
+    point_counts = torch.minimum(
+        sample_counts,
+        sample_counts.new_full(sample_counts.shape, max_points),
+    )
+    point_offsets = torch.arange(max_points, device=error.device, dtype=torch.float64).unsqueeze(0)
+    point_denominator = (point_counts - 1).clamp_min(1).to(dtype=torch.float64).unsqueeze(1)
+    remove_counts = torch.round(
+        point_offsets * (sample_counts - 1).clamp_min(0).to(dtype=torch.float64).unsqueeze(1)
+        / point_denominator
+    ).long()
+    remove_counts = remove_counts.clamp_(0, num_samples - 1)
+
+    remaining_counts = (sample_counts.unsqueeze(1) - remove_counts).clamp_min(1).to(dtype=torch.float32)
+    uncertainty_curve = uncertainty_suffix_sum.gather(1, remove_counts) / remaining_counts
+    oracle_curve = oracle_suffix_sum.gather(1, remove_counts) / remaining_counts
+    curve_gap = (uncertainty_curve - oracle_curve).double()
+    removed_fractions = remove_counts.double() / sample_counts.clamp_min(1).double().unsqueeze(1)
+
+    segment_mask = (
+        torch.arange(max_points - 1, device=error.device).unsqueeze(0)
+        < (point_counts - 1).unsqueeze(1)
+    ) & valid_rows.unsqueeze(1)
+    segment_area = (
+        0.5
+        * (curve_gap[:, :-1] + curve_gap[:, 1:])
+        * (removed_fractions[:, 1:] - removed_fractions[:, :-1])
+    )
+    result = torch.where(
+        valid_rows,
+        torch.where(segment_mask, segment_area, torch.zeros_like(segment_area)).sum(dim=1),
+        result,
+    )
+    return result
 
 
 @torch.no_grad()
@@ -262,64 +317,109 @@ def compute_sparsification_ause_metrics(
     uncertainty: torch.Tensor,
     max_samples: Optional[int] = 100_000,
     num_bins: int = 100,
-) -> Dict[str, float]:
+    model_type: str = "relative",
+) -> Dict[str, torch.Tensor]:
     """
     Compute MDE-style AUSE metrics by removing high-uncertainty pixels first.
 
     ``ause_abs_rel`` uses per-pixel AbsRel error. ``ause_a1`` uses the a1
     failure indicator, so lower AUSE is better for both metrics.
     """
-    # mu = _cpu_float_bchw(mu)
-    # target = _cpu_float_bchw(target)
-    # uncertainty = _cpu_float_bchw(uncertainty)
-    mask = _prepare_bchw_mask(valid_mask, mu) # _cpu_bool_bchw(valid_mask)
+    abs_rel_error, a1_error = _depth_error_maps(mu, target, model_type)
+    uncertainty = _ensure_bchw(uncertainty)
+    if uncertainty.shape != abs_rel_error.shape:
+        uncertainty = uncertainty.expand_as(abs_rel_error)
 
-    abs_rel_error, a1_error = _depth_error_maps(mu, target)
+    mask = _prepare_bchw_mask(valid_mask, abs_rel_error)
+    finite_mask = (
+        mask
+        & torch.isfinite(abs_rel_error)
+        & torch.isfinite(a1_error)
+        & torch.isfinite(uncertainty)
+    )
+
+    batch_size = abs_rel_error.shape[0]
+    flat_abs_rel = abs_rel_error.detach().flatten(1)
+    flat_a1 = a1_error.detach().flatten(1)
+    flat_uncertainty = uncertainty.detach().flatten(1)
+    flat_mask = finite_mask.flatten(1)
+    _, num_pixels = flat_abs_rel.shape
+
     per_image_max_samples = max_samples
     if max_samples is not None and max_samples > 0:
-        per_image_max_samples = max(1, max_samples // max(mu.shape[0], 1))
+        per_image_max_samples = max(1, max_samples // max(batch_size, 1))
 
-    ause_abs_rel = []
-    ause_a1 = []
-    total_samples = 0
+    if per_image_max_samples is None or per_image_max_samples <= 0:
+        sample_width = num_pixels
+    else:
+        sample_width = min(per_image_max_samples, num_pixels)
 
-    for batch_idx in range(mu.shape[0]):
-        finite_mask = (
-            mask[batch_idx]
-            & torch.isfinite(abs_rel_error[batch_idx])
-            & torch.isfinite(a1_error[batch_idx])
-            & torch.isfinite(uncertainty[batch_idx])
-        )
-
-        abs_rel_flat = abs_rel_error[batch_idx][finite_mask].flatten()
-        a1_flat = a1_error[batch_idx][finite_mask].flatten()
-        uncertainty_flat = uncertainty[batch_idx][finite_mask].flatten()
-
-        abs_rel_flat, a1_flat, uncertainty_flat = _deterministic_subsample(
-            abs_rel_flat,
-            a1_flat,
-            uncertainty_flat,
-            max_samples=per_image_max_samples,
-        )
-
-        if uncertainty_flat.numel() < 2:
-            continue
-
-        total_samples += int(uncertainty_flat.numel())
-        ause_abs_rel.append(_sparsification_ause(abs_rel_flat, uncertainty_flat, num_bins=num_bins))
-        ause_a1.append(_sparsification_ause(a1_flat, uncertainty_flat, num_bins=num_bins))
-
-    if not ause_abs_rel:
+    if sample_width < 1:
         return {
             "ause_abs_rel": float("nan"),
             "ause_a1": float("nan"),
-            "ause_samples": int(total_samples),
+            "ause_samples": 0,
+        }
+
+    pixel_offsets = torch.arange(num_pixels, device=flat_mask.device).expand(batch_size, -1)
+    compact_order = torch.argsort(
+        torch.where(flat_mask, pixel_offsets, pixel_offsets + num_pixels),
+        dim=1,
+    )
+
+    compact_abs_rel = flat_abs_rel.gather(1, compact_order)
+    compact_a1 = flat_a1.gather(1, compact_order)
+    compact_uncertainty = flat_uncertainty.gather(1, compact_order)
+
+    valid_counts = flat_mask.sum(dim=1)
+    sample_offsets = torch.arange(sample_width, device=flat_mask.device).expand(batch_size, -1)
+    sample_counts = valid_counts.clamp_max(sample_width)
+
+    if sample_width == 1:
+        sample_indices = torch.zeros_like(sample_offsets)
+    else:
+        uniform_indices = (
+            sample_offsets
+            * (valid_counts - 1).clamp_min(0).unsqueeze(1)
+            // (sample_width - 1)
+        )
+        sample_indices = torch.where(
+            (valid_counts > sample_width).unsqueeze(1),
+            uniform_indices,
+            sample_offsets,
+        )
+    sample_indices = sample_indices.clamp_(0, num_pixels - 1)
+    sample_mask = sample_offsets < sample_counts.unsqueeze(1)
+
+    abs_rel_samples = compact_abs_rel.gather(1, sample_indices)
+    a1_samples = compact_a1.gather(1, sample_indices)
+    uncertainty_samples = compact_uncertainty.gather(1, sample_indices)
+
+    ause_abs_rel = _batched_sparsification_ause(
+        abs_rel_samples,
+        uncertainty_samples,
+        sample_mask,
+        num_bins=num_bins,
+    )
+    ause_a1 = _batched_sparsification_ause(
+        a1_samples,
+        uncertainty_samples,
+        sample_mask,
+        num_bins=num_bins,
+    )
+    sample_rows = sample_counts >= 2
+    finite_rows = torch.isfinite(ause_abs_rel) & torch.isfinite(ause_a1)
+    total_samples = int(sample_counts[sample_rows].sum().item())
+
+    if not finite_rows.any():
+        return {
+            "ause_abs_rel": ause_abs_rel.new_tensor(float("nan")),
+            "ause_a1": ause_a1.new_tensor(float("nan")),
         }
 
     return {
-        "ause_abs_rel": float(torch.stack(ause_abs_rel).mean().item()),
-        "ause_a1": float(torch.stack(ause_a1).mean().item()),
-        "ause_samples": int(total_samples),
+        "ause_abs_rel": ause_abs_rel[finite_rows],
+        "ause_a1": ause_a1[finite_rows]
     }
 
 
@@ -333,9 +433,6 @@ def compute_image_uncertainty_metric_values(
     """
     Return per-image mean uncertainty and per-image depth metrics.
     """
-    # mu = _cpu_float_bchw(mu)
-    # target = _cpu_float_bchw(target)
-    # uncertainty = _cpu_float_bchw(uncertainty)
     mask = _prepare_bchw_mask(valid_mask, mu) # _cpu_bool_bchw(valid_mask)
 
     abs_rel_error, a1_error = _depth_error_maps(mu, target)

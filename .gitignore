@@ -2,5 +2,6 @@ ckpt/
 wandb/
 __pycache__/
 .vscode/
-eval_results*/
+comparison_ae/
 ckpt*
+output/*

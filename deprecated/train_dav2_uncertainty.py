@@ -10,16 +10,16 @@ except ImportError:
     wandb = None
 
 from transformers import AutoImageProcessor
-from dav2_model import GaussianDepthAnythingV2, MODEL_IDS
-from dataset import NYUv2RGBDepthDataset, nyu_collate_fn
-from correlation_utils import (
+from model.dav2_model import GaussianDepthAnythingV2, MODEL_IDS
+from dataset.dataset import NYUv2RGBDepthDataset, nyu_collate_fn
+from evaluation_utils.correlation_utils import (
     compute_image_uncertainty_metric_correlations,
     compute_image_uncertainty_metric_values,
     compute_loss_uncertainty_correlations,
     compute_sparsification_ause_metrics,
 )
-from loss_fn import gaussian_nll_depth_loss, image_level_listnet_loss
-from eval_utils import (
+from model.loss_fn import gaussian_nll_depth_loss, image_level_listnet_loss
+from evaluation_utils.eval_utils import (
     compute_metrics,
     compute_relative_depth_metrics,
     _accumulate_finite_metrics,

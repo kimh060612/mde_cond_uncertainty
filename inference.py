@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoImageProcessor
 
-from dav2_model import GaussianDepthAnythingV2, MODEL_IDS
+from model.dav2_model import GaussianDepthAnythingV2, MODEL_IDS
 
 
 @torch.no_grad()

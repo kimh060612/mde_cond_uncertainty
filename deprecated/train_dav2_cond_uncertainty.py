@@ -11,7 +11,7 @@ except ImportError:
 
 from transformers import AutoImageProcessor
 
-from ati_motion_dataset import (
+from dataset.ati_motion_dataset import (
     ATI_STATS_EXPOSURE_IDX,
     ATI_STATS_GAIN_IDX,
     ATI_STATS_LIGHT_LABEL_IDX,
@@ -22,20 +22,20 @@ from ati_motion_dataset import (
     W_SPIN,
     ati_collate_fn,
 )
-from correlation_utils import (
+from evaluation_utils.correlation_utils import (
     compute_image_uncertainty_metric_correlations,
     compute_image_uncertainty_metric_values,
     compute_loss_uncertainty_correlations,
     compute_sparsification_ause_metrics,
 )
-from dav2_ati_model import ConditionedGaussianDepthAnythingV2, MODEL_IDS
-from eval_utils import (
+from model.dav2_ati_model import ConditionedGaussianDepthAnythingV2, MODEL_IDS
+from evaluation_utils.eval_utils import (
     compute_metrics,
     compute_relative_depth_metrics,
     _accumulate_finite_metrics,
     _mean_finite_metrics,
 )
-from loss_fn import gaussian_nll_depth_loss, image_level_listnet_loss
+from model.loss_fn import gaussian_nll_depth_loss, image_level_listnet_loss
 
 
 def _wandb_log_prefixed(wandb_run, prefix, metrics, step):
@@ -707,7 +707,7 @@ def parse_args():
         help="Minimum absolute yaw rate for the spin class.",
     )
 
-    parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--num_workers", type=int, default=16)
     parser.add_argument("--no_amp", action="store_true")
     parser.add_argument("--hf_cache_dir", type=str, default=None)
     parser.add_argument("--log_interval", type=int, default=20)

@@ -10,15 +10,15 @@ import numpy as np
 import torch
 from transformers import AutoImageProcessor
 
-from ati_dataset import ATIRealWorldDepthDataset
-from dav2_ati_model import ConditionedGaussianDepthAnythingV2, MODEL_IDS
-from eval_utils import (
+from dataset.ati_dataset import ATIRealWorldDepthDataset
+from model.dav2_ati_model import ConditionedGaussianDepthAnythingV2, MODEL_IDS
+from evaluation_utils.eval_utils import (
     compute_metrics,
     compute_relative_depth_metrics,
     _accumulate_finite_metrics,
     _mean_finite_metrics,
 )
-from loss_fn import image_uncertainty_score
+from model.loss_fn import image_uncertainty_score
 
 
 def _natural_key(value):

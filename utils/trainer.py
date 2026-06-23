@@ -1,0 +1,188 @@
+import torch
+from torch.utils.data import DataLoader, Subset
+import wandb
+from model.loss_fn import gaussian_nll_depth_loss, image_level_listnet_loss
+from evaluation_utils.eval_utils import (
+    compute_comprehensive_depth_metrics,
+    _mean_finite_metrics,
+)
+from tqdm.auto import tqdm
+from utils.train_utils import *
+from utils.logger import wandb_log_prefixed
+import logging
+
+def train_one_epoch(
+    model_id: str,
+    model,
+    loader,
+    optimizer,
+    scaler,
+    device,
+    epoch,
+    amp: bool,
+    lambda_smooth_logvar: float,
+    list_loss_weight: float,
+    listnet_temperature: float,
+    uncertainty_mode: str,
+    grad_clip: float,
+    logger: logging.Logger,
+    min_depth: float = 1e-3,
+    max_depth: float = 80.0,
+    relative_align_mode: str = "scale_shift",
+    wandb_run=None,
+    global_step: int = 0,
+    log_interval: int = 20,
+):
+    model.train()
+    progress_bar = tqdm(
+        loader,
+        desc=f"Train {epoch:03d}",
+        dynamic_ncols=True,
+        leave=False,
+    )
+    
+    running_loss = 0.0
+    running_nll_loss = 0.0
+    running_list_loss = 0.0
+    running_abs_rel = 0.0
+    running_rmse = 0.0
+    running_a1 = 0.0
+    running_corr_samples = 0
+    running_ause_samples = 0
+    corr_sums = {}
+    corr_counts = {}
+    condition_sums = {}
+    processed_batches = 0
+
+    for step, batch in enumerate(progress_bar, start=1):
+        if batch is None:
+            continue
+        (
+            pixel_values,
+            depth,
+            valid_mask,
+            condition,
+            _,
+        ) = unpack_ati_batch(batch, device)
+
+        target_size = depth.shape[-2:]
+
+        optimizer.zero_grad(set_to_none=True)
+
+        with torch.autocast(device_type=device.type, enabled=amp):
+            out = model(
+                pixel_values,
+                condition=condition,
+                target_size=target_size,
+            )
+            nll_loss = gaussian_nll_depth_loss(
+                out["mu"],
+                out["log_var"],
+                depth,
+                valid_mask,
+                lambda_smooth_logvar=lambda_smooth_logvar,
+            )
+            list_loss = image_level_listnet_loss(
+                out["mu"],
+                out["std"],
+                depth,
+                valid_mask,
+                temperature=listnet_temperature,
+                uncertainty_mode=uncertainty_mode,
+            )
+            loss = nll_loss + list_loss_weight * list_loss
+
+        scaler.scale(loss).backward()
+
+        if grad_clip > 0:
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
+
+        scaler.step(optimizer)
+        scaler.update()
+        
+        prefix_head = "metric" if model_id.startswith("metric") else "relative"
+        batched_metrics = compute_comprehensive_depth_metrics(
+            mu=out["mu"].detach(),
+            target=depth,
+            valid_mask=valid_mask,
+            min_depth=min_depth,
+            max_depth=max_depth,
+            align_mode=relative_align_mode,
+            depth_model_type=prefix_head,
+        )
+        
+        prefix_head = "metric_depth" if model_id.startswith("metric") else "relative_depth"
+        running_loss += loss.item()
+        running_nll_loss += nll_loss.item()
+        running_list_loss += list_loss.item()
+        running_abs_rel += batched_metrics["abs_rel"].mean().item()
+        running_rmse += batched_metrics["rmse"].mean().item()
+        running_a1 += batched_metrics["a1"].mean().item()
+        processed_batches += 1
+
+        progress_bar.set_postfix(
+            loss=f"{loss.item():.4f}",
+            avg=f"{running_loss / step:.4f}",
+            abs_rel=f"{running_abs_rel / step:.4f}",
+            a1=f"{running_a1 / step:.4f}",
+        )
+        if log_interval > 0 and step % log_interval == 0:
+            logger.info(
+                "epoch=%d step=%d/%d avg_loss=%.6f abs_rel=%.6f a1=%.6f",
+                epoch,
+                step,
+                len(loader),
+                running_loss / step,
+                running_abs_rel / step,
+                running_a1 / step,
+            )
+            train_step_metrics = {
+                "loss_step": loss.item(),
+                "nll_loss_step": nll_loss.item(),
+                "list_loss_step": list_loss.item(),
+                "abs_rel_step": batched_metrics["abs_rel"].mean().item(),
+                "rmse_step": batched_metrics["rmse"].mean().item(),
+                "a1_step": batched_metrics["a1"].mean().item(),
+                "epoch": epoch,
+                **{f"{prefix_head}_{key}_step": value.mean().item() for key, value in batched_metrics.items()},
+            }
+            wandb_log_prefixed(wandb_run, "train", train_step_metrics, global_step)
+
+        global_step += 1
+
+    n = max(processed_batches, 1)
+    epoch_metrics = {
+        "loss": running_loss / n,
+        "nll_loss": running_nll_loss / n,
+        "list_loss": running_list_loss / n,
+        "abs_rel": running_abs_rel / n,
+        "rmse": running_rmse / n,
+        "a1": running_a1 / n,
+        "loss_uncertainty_samples": running_corr_samples,
+        "ause_samples": running_ause_samples,
+    }
+    epoch_metrics.update({key: value / n for key, value in condition_sums.items()})
+    epoch_metrics.update(_mean_finite_metrics(corr_sums, corr_counts))
+
+    return epoch_metrics, global_step
+
+
+# ## Train에서 봐야하는 것: 
+# if model_id.startswith("metric"):
+#     metrics = _prefix_metrics(
+#         "metric_depth",
+#         compute_metrics(out["mu"].detach(), depth, valid_mask)
+#     )
+# else:
+#     metrics = _prefix_metrics(
+#         "relative_depth",
+#         compute_relative_depth_metrics(
+#             out["mu"].detach(),
+#             depth,
+#             valid_mask,
+#             min_depth=min_depth,
+#             max_depth=max_depth,
+#             align_mode=relative_align_mode,
+#         ),
+#     )
