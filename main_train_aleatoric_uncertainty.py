@@ -109,7 +109,7 @@ def main(cfg: DictConfig):
         train_set,
         batch_size=cfg.training.batch_size,
         shuffle=True,
-        num_workers=cfg.training.num_workers,
+        num_workers=cfg.num_workers.num_workers,
         pin_memory=pin_memory,
         collate_fn=ati_collate_fn,
     )
@@ -117,7 +117,7 @@ def main(cfg: DictConfig):
         val_set,
         batch_size=cfg.training.batch_size,
         shuffle=False,
-        num_workers=cfg.training.num_workers,
+        num_workers=cfg.num_workers.num_workers,
         pin_memory=pin_memory,
         collate_fn=ati_collate_fn,
     )
@@ -125,7 +125,7 @@ def main(cfg: DictConfig):
         Subset(val_set, seen_val_indices),
         batch_size=cfg.training.batch_size,
         shuffle=False,
-        num_workers=cfg.training.num_workers,
+        num_workers=cfg.num_workers.num_workers,
         pin_memory=pin_memory,
         collate_fn=ati_collate_fn,
     )
@@ -133,7 +133,7 @@ def main(cfg: DictConfig):
         Subset(val_set, unseen_val_indices),
         batch_size=cfg.training.batch_size,
         shuffle=False,
-        num_workers=cfg.training.num_workers,
+        num_workers=cfg.num_workers.num_workers,
         pin_memory=pin_memory,
         collate_fn=ati_collate_fn,
     )
