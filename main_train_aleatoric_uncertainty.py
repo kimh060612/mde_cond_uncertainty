@@ -121,22 +121,22 @@ def main(cfg: DictConfig):
         pin_memory=pin_memory,
         collate_fn=ati_collate_fn,
     )
-    seen_val_loader = DataLoader(
-        Subset(val_set, seen_val_indices),
-        batch_size=cfg.training.batch_size,
-        shuffle=False,
-        num_workers=cfg.dataset.num_workers,
-        pin_memory=pin_memory,
-        collate_fn=ati_collate_fn,
-    )
-    unseen_val_loader = DataLoader(
-        Subset(val_set, unseen_val_indices),
-        batch_size=cfg.training.batch_size,
-        shuffle=False,
-        num_workers=cfg.dataset.num_workers,
-        pin_memory=pin_memory,
-        collate_fn=ati_collate_fn,
-    )
+    # seen_val_loader = DataLoader(
+    #     Subset(val_set, seen_val_indices),
+    #     batch_size=cfg.training.batch_size,
+    #     shuffle=False,
+    #     num_workers=cfg.dataset.num_workers,
+    #     pin_memory=pin_memory,
+    #     collate_fn=ati_collate_fn,
+    # )
+    # unseen_val_loader = DataLoader(
+    #     Subset(val_set, unseen_val_indices),
+    #     batch_size=cfg.training.batch_size,
+    #     shuffle=False,
+    #     num_workers=cfg.dataset.num_workers,
+    #     pin_memory=pin_memory,
+    #     collate_fn=ati_collate_fn,
+    # )
 
     model = ConditionedGaussianDepthAnythingV2(
         model_id=model_id,
@@ -171,7 +171,12 @@ def main(cfg: DictConfig):
     )
     logger.info("Training started")
     logger.info("Model: %s", model_id)
-        
+    
+    seen_topology_idx = torch.Tensor(seen_val_topology_ids).long()
+    unseen_topology_idx = torch.Tensor(unseen_val_topology_ids).long()
+    print("[Training] Seen validation topologies:", seen_topology_idx)
+    print("[Training] Unseen validation topologies:", unseen_topology_idx)
+    
     for epoch in range(1, cfg.training.num_epochs + 1):
         train_metrics, global_step = train_one_epoch(
             model_id=model_id,
@@ -201,6 +206,8 @@ def main(cfg: DictConfig):
             loader=val_loader,
             device=device,
             amp=amp,
+            seen_topology_numbers=seen_topology_idx,
+            unseen_topology_numbers=unseen_topology_idx,
             lambda_smooth_logvar=cfg.training.lambda_smooth_logvar,
             list_loss_weight=cfg.training.list_loss_weight,
             listnet_temperature=cfg.training.listnet_temperature,

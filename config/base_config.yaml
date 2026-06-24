@@ -1,6 +1,6 @@
 dataset:
   name: ati_dataset
-  dataset_root: /media/michael/ssd1/AIoT_ATI/realworld_dataset
+  dataset_root: /home/kimh060612/ati_workspace/realworld_dataset
   min_depth: 1e-3
   max_depth: 10.0
   min_valid_depth_ratio: 0.7
@@ -21,8 +21,8 @@ model:
   model_id: "small"
   image_height: 518
   image_width: 518
-  uncertainty_width: 64
-  uncertainty_blocks: 6
+  uncertainty_width: 32
+  uncertainty_blocks: 3
   uncertainty_dropout: 0.05
   
 training:

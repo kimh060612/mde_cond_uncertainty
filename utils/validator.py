@@ -308,8 +308,3 @@ def validate(
     unseen_metrics = _finalize_validation_accumulator(unseen_accumulator)
 
     return total_metrics, seen_metrics, unseen_metrics
-    {
-        **total_metrics,
-        **{f"seen_{key}": value for key, value in seen_metrics.items()},
-        **{f"unseen_{key}": value for key, value in unseen_metrics.items()},
-    }
