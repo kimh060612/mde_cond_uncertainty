@@ -248,8 +248,7 @@ def main(cfg: DictConfig):
         print(f"[epoch {epoch}] val={val_metrics}")
         print(f"[epoch {epoch}] seen_val={seen_val_metrics}")
         print(f"[epoch {epoch}] unseen_val={unseen_val_metrics}")
-
-        # is_best = val_metrics["abs_rel"] < best_abs_rel
+        
         is_best = val_metrics["aggregated_abs_rel_unc_pearson"] > best_abs_rel_correlation
         if is_best:
             best_abs_rel_correlation = val_metrics["aggregated_abs_rel_unc_pearson"]
@@ -266,26 +265,20 @@ def main(cfg: DictConfig):
                 checkpoint_val_metrics,
                 dataset_metadata,
             )
-            if wandb_run is not None:
-                wandb_run.summary["best_abs_rel_correlation"] = best_abs_rel_correlation
-                wandb_run.summary["best_epoch"] = epoch
+            wandb_run.summary["best_abs_rel_correlation"] = best_abs_rel_correlation
+            wandb_run.summary["best_epoch"] = epoch
 
-        if wandb_run is not None:
-            epoch_log = {
-                "epoch": epoch,
-                "best/abs_rel_correlation": best_abs_rel_correlation,
-                "best/is_best": int(is_best),
-            }
-            epoch_log.update({f"train/{key}": value for key, value in train_metrics.items()})
-            epoch_log.update({f"val/{key}": value for key, value in val_metrics.items()})
-            epoch_log.update(
-                {f"val_seen/{key}": value for key, value in seen_val_metrics.items()}
-            )
-            epoch_log.update(
-                {f"val_unseen/{key}": value for key, value in unseen_val_metrics.items()}
-            )
-            wandb_run.log(epoch_log, step=epoch)
-
+        epoch_log = {
+            "epoch": epoch,
+            "best/abs_rel_correlation": best_abs_rel_correlation,
+            "best/is_best": int(is_best),
+        }
+        epoch_log.update({f"train/{key}": value for key, value in train_metrics.items()})
+        epoch_log.update({f"val/{key}": value for key, value in val_metrics.items()})
+        epoch_log.update({f"val_seen/{key}": value for key, value in seen_val_metrics.items()})
+        epoch_log.update({f"val_unseen/{key}": value for key, value in unseen_val_metrics.items()})
+        wandb_run.log(epoch_log, step=epoch)
+    
     if wandb_run is not None:
         wandb_run.finish()
 

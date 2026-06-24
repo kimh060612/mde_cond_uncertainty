@@ -1,4 +1,5 @@
 from typing import Dict, Optional, Tuple
+from evaluation_utils.eval_utils import _masked_median
 import torch
 
 
@@ -41,7 +42,6 @@ def _deterministic_subsample(
         idx = idx * (numel - 1) // (max_samples - 1)
     return tuple(v[idx] for v in vectors)
 
-
 def _depth_error_maps(
     mu: torch.Tensor,
     target: torch.Tensor,
@@ -49,7 +49,8 @@ def _depth_error_maps(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     mu = _ensure_bchw(mu).clamp_min(1e-3)
     target = _ensure_bchw(target).clamp_min(1e-3)
-
+    eps = 1e-8
+    
     if model_type == "metric":
         abs_rel_error = torch.abs(mu - target) / target
         ratio = torch.maximum(mu / target, target / mu)
@@ -57,37 +58,17 @@ def _depth_error_maps(
     else:
         gt_inv = 1.0 / (target + 1e-6)
         relative_mask = (target > 0) & (mu > 0)
-        x = torch.where(relative_mask, mu, torch.zeros_like(mu))
-        y = torch.where(relative_mask, gt_inv, torch.zeros_like(gt_inv))
-
-        valid_counts = relative_mask.flatten(1).sum(dim=1).to(dtype=torch.float32)
-        safe_counts = valid_counts.clamp_min(1.0)
-        sum_x = x.flatten(1).sum(dim=1)
-        sum_y = y.flatten(1).sum(dim=1)
-        sum_xx = (x * x).flatten(1).sum(dim=1)
-        sum_xy = (x * y).flatten(1).sum(dim=1)
-
-        denom = safe_counts * sum_xx - sum_x.square()
-        stable = (valid_counts > 1) & (denom.abs() > 1e-6)
-        scale = torch.where(
-            stable,
-            (safe_counts * sum_xy - sum_x * sum_y) / denom.clamp(min=1e-6),
-            torch.zeros_like(valid_counts),
-        )
-        shift = torch.where(
-            valid_counts > 0,
-            (sum_y - scale * sum_x) / safe_counts,
-            torch.zeros_like(valid_counts),
-        )
-        pred_aligned = mu * scale.view(-1, 1, 1, 1) + shift.view(-1, 1, 1, 1)
-        pred_depth = 1.0 / pred_aligned.clamp_min(1e-6)
         
-        abs_rel_error = torch.abs(pred_depth - target) / target
-        ratio = torch.maximum(pred_depth / target, target / pred_depth)
+        pred_median = _masked_median(mu, relative_mask)
+        gt_inv_median = _masked_median(gt_inv, relative_mask)
+        scale = gt_inv_median / (pred_median + eps)
+        pred_aligned = mu * scale.view(-1, 1, 1, 1)
+        
+        abs_rel_error = torch.abs(pred_aligned - target) / target
+        ratio = torch.maximum(pred_aligned / target, target / pred_aligned)
         a1_error = (ratio >= 1.25).float()
         
     return abs_rel_error, a1_error
-
 
 def gaussian_nll_loss_map(
     mu: torch.Tensor,
