@@ -57,7 +57,6 @@ def main(cfg: DictConfig):
     
     seen_val_topologies = [ str(topology).strip() for topology in cfg.dataset.seen_val_topologies ]
     unseen_val_topologies = [ str(topology).strip() for topology in cfg.dataset.unseen_val_topologies ]
-    validation_topology_counts = count_items_by_topology(val_set)
     seen_val_topology_ids = {topology_id(topology) for topology in seen_val_topologies}
     unseen_val_topology_ids = {topology_id(topology) for topology in unseen_val_topologies}
     seen_val_indices = topology_subset_indices(val_set, seen_val_topology_ids)
@@ -77,6 +76,7 @@ def main(cfg: DictConfig):
         **dataset_kwargs,
     )
     copy_condition_normalization(val_set, train_set)
+    validation_topology_counts = count_items_by_topology(val_set)
     
     dataset_metadata = {
         "condition_names": list(train_set.condition_names),
