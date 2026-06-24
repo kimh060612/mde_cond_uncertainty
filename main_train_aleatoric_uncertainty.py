@@ -59,10 +59,6 @@ def main(cfg: DictConfig):
     unseen_val_topologies = [ str(topology).strip() for topology in cfg.dataset.unseen_val_topologies ]
     seen_val_topology_ids = {topology_id(topology) for topology in seen_val_topologies}
     unseen_val_topology_ids = {topology_id(topology) for topology in unseen_val_topologies}
-    seen_val_indices = topology_subset_indices(val_set, seen_val_topology_ids)
-    unseen_val_indices = topology_subset_indices(val_set, unseen_val_topology_ids)
-    seen_val_count = len(seen_val_indices)
-    unseen_val_count = len(unseen_val_indices)
     seen_topology_idx = torch.Tensor(list(seen_val_topology_ids)).long()
     unseen_topology_idx = torch.Tensor(list(unseen_val_topology_ids)).long()
     print("[Training] Seen validation topologies:", seen_topology_idx)
@@ -77,6 +73,10 @@ def main(cfg: DictConfig):
     )
     copy_condition_normalization(val_set, train_set)
     validation_topology_counts = count_items_by_topology(val_set)
+    seen_val_indices = topology_subset_indices(val_set, seen_val_topology_ids)
+    unseen_val_indices = topology_subset_indices(val_set, unseen_val_topology_ids)
+    seen_val_count = len(seen_val_indices)
+    unseen_val_count = len(unseen_val_indices)
     
     dataset_metadata = {
         "condition_names": list(train_set.condition_names),
