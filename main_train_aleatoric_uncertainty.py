@@ -250,7 +250,7 @@ def main(cfg: DictConfig):
             **{f"val/{key}": value for key, value in val_total_metrics.items()}, 
             **{f"val_seen/{key}": value for key, value in val_seen_metrics.items()},
             **{f"val_unseen/{key}": value for key, value in val_unseen_metrics.items()}
-        }, step=epoch)
+        }, step=epoch, commit=True)
     
     if wandb_run is not None:
         wandb_run.finish()
