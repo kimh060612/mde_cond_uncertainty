@@ -191,7 +191,6 @@ def main(cfg: DictConfig):
             min_depth=cfg.dataset.min_depth,
             max_depth=cfg.dataset.max_depth,
             relative_align_mode=cfg.training.relative_align_mode,
-            wandb_run=wandb_run,
             global_step=global_step,
             log_interval=cfg.training.log_interval,
         )
