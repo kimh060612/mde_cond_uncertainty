@@ -6,9 +6,13 @@ from evaluation_utils.eval_utils import (
     compute_comprehensive_depth_metrics,
     _mean_finite_metrics,
 )
+from evaluation_utils.correlation_utils import (
+    compute_sparsification_ause_metrics,
+    compute_sparsification_aurg_metrics
+)
 from tqdm.auto import tqdm
 from utils.train_utils import *
-from utils.logger import wandb_log_prefixed
+# from utils.logger import wandb_log_prefixed
 import logging
 
 def train_one_epoch(
@@ -28,8 +32,8 @@ def train_one_epoch(
     logger: logging.Logger,
     min_depth: float = 1e-3,
     max_depth: float = 80.0,
+    correlation_max_samples: int = 100_000,
     relative_align_mode: str = "scale_shift",
-    wandb_run=None,
     global_step: int = 0,
     log_interval: int = 20,
 ):
@@ -47,8 +51,10 @@ def train_one_epoch(
     running_abs_rel = 0.0
     running_rmse = 0.0
     running_a1 = 0.0
-    running_corr_samples = 0
-    running_ause_samples = 0
+    running_ause_abs_rel = []
+    running_aurg_abs_rel = []
+    running_ause_a1 = []
+    running_aurg_a1 = []
     corr_sums = {}
     corr_counts = {}
     condition_sums = {}
@@ -111,6 +117,22 @@ def train_one_epoch(
             align_mode=relative_align_mode,
             depth_model_type=prefix_head,
         )
+        ause_metrics = compute_sparsification_ause_metrics(
+            out["mu"].detach(),
+            depth,
+            valid_mask,
+            uncertainty=out["std"].detach(),
+            max_samples=correlation_max_samples,
+            model_type=prefix_head
+        )
+        aurg_metrics = compute_sparsification_aurg_metrics(
+            out["mu"].detach(),
+            depth,
+            valid_mask,
+            uncertainty=out["std"].detach(),
+            max_samples=correlation_max_samples,
+            model_type=prefix_head
+        )
         
         prefix_head = "metric_depth" if model_id.startswith("metric") else "relative_depth"
         running_loss += loss.item()
@@ -119,6 +141,10 @@ def train_one_epoch(
         running_abs_rel += batched_metrics["abs_rel"].mean().item()
         running_rmse += batched_metrics["rmse"].mean().item()
         running_a1 += batched_metrics["a1"].mean().item()
+        running_ause_abs_rel.append(ause_metrics["ause_abs_rel"])
+        running_aurg_abs_rel.append(aurg_metrics["aurg_abs_rel"])
+        running_ause_a1.append(ause_metrics["ause_a1"])
+        running_aurg_a1.append(aurg_metrics["aurg_a1"])
         processed_batches += 1
 
         progress_bar.set_postfix(
@@ -126,28 +152,23 @@ def train_one_epoch(
             avg=f"{running_loss / step:.4f}",
             abs_rel=f"{running_abs_rel / step:.4f}",
             a1=f"{running_a1 / step:.4f}",
+            ause_abs_rel=f"{torch.cat(running_ause_abs_rel, dim=0).mean().item():.4f}",
+            ause_a1=f"{torch.cat(running_ause_a1, dim=0).mean().item():.4f}",
         )
         if log_interval > 0 and step % log_interval == 0:
             logger.info(
-                "epoch=%d step=%d/%d avg_loss=%.6f abs_rel=%.6f a1=%.6f",
+                "epoch=%d step=%d/%d avg_loss=%.6f abs_rel=%.6f a1=%.6f ause_abs_rel=%.6f aurg_abs_rel=%.6f ause_a1=%.6f aurg_a1=%.6f",
                 epoch,
                 step,
                 len(loader),
                 running_loss / step,
                 running_abs_rel / step,
                 running_a1 / step,
+                torch.cat(running_ause_abs_rel, dim=0).mean().item(),
+                torch.cat(running_aurg_abs_rel, dim=0).mean().item(),
+                torch.cat(running_ause_a1, dim=0).mean().item(),
+                torch.cat(running_aurg_a1, dim=0).mean().item(),
             )
-            train_step_metrics = {
-                "loss_step": loss.item(),
-                "nll_loss_step": nll_loss.item(),
-                "list_loss_step": list_loss.item(),
-                "abs_rel_step": batched_metrics["abs_rel"].mean().item(),
-                "rmse_step": batched_metrics["rmse"].mean().item(),
-                "a1_step": batched_metrics["a1"].mean().item(),
-                "epoch": epoch,
-                **{f"{prefix_head}_{key}_step": value.mean().item() for key, value in batched_metrics.items()},
-            }
-            wandb_log_prefixed(wandb_run, "train", train_step_metrics, global_step)
 
         global_step += 1
 
@@ -159,30 +180,12 @@ def train_one_epoch(
         "abs_rel": running_abs_rel / n,
         "rmse": running_rmse / n,
         "a1": running_a1 / n,
-        "loss_uncertainty_samples": running_corr_samples,
-        "ause_samples": running_ause_samples,
+        "ause_abs_rel": torch.cat(running_ause_abs_rel, dim=0).mean().item(),
+        "aurg_abs_rel": torch.cat(running_aurg_abs_rel, dim=0).mean().item(),
+        "ause_a1": torch.cat(running_ause_a1, dim=0).mean().item(),
+        "aurg_a1": torch.cat(running_aurg_a1, dim=0).mean().item(),
     }
     epoch_metrics.update({key: value / n for key, value in condition_sums.items()})
     epoch_metrics.update(_mean_finite_metrics(corr_sums, corr_counts))
-
+    
     return epoch_metrics, global_step
-
-
-# ## Train에서 봐야하는 것: 
-# if model_id.startswith("metric"):
-#     metrics = _prefix_metrics(
-#         "metric_depth",
-#         compute_metrics(out["mu"].detach(), depth, valid_mask)
-#     )
-# else:
-#     metrics = _prefix_metrics(
-#         "relative_depth",
-#         compute_relative_depth_metrics(
-#             out["mu"].detach(),
-#             depth,
-#             valid_mask,
-#             min_depth=min_depth,
-#             max_depth=max_depth,
-#             align_mode=relative_align_mode,
-#         ),
-#     )

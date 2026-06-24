@@ -8,7 +8,9 @@ from evaluation_utils.eval_utils import (
 from evaluation_utils.correlation_utils import (
     compute_loss_uncertainty_correlations,
     compute_sparsification_ause_metrics,
-    compute_masked_correlations
+    compute_sparsification_aurg_metrics,
+    compute_masked_correlations,
+    compute_aru_rmsu_metrics
 )
 from tqdm.auto import tqdm
 
@@ -32,6 +34,8 @@ def _extend_metric_values(accumulator, metrics):
         if not isinstance(accumulator.get(key), list):
             continue
         values = _metric_values_to_tensor(value)
+        if values is None:
+            continue
         accumulator[key].append(values)
 
 def _accumulate_validation_result(accumulator, result):
@@ -49,6 +53,8 @@ def _accumulate_validation_result(accumulator, result):
     _extend_metric_values(accumulator, result["uncertainty_mean"])
     _extend_metric_values(accumulator, result["correlations"])
     _extend_metric_values(accumulator, result["ause_metrics"])
+    _extend_metric_values(accumulator, result["aurg_metrics"])
+    _extend_metric_values(accumulator, result["aru_rmsu"])
 
 
 def _finalize_validation_accumulator(accumulator):
@@ -56,11 +62,83 @@ def _finalize_validation_accumulator(accumulator):
     for key, values in accumulator.items():
         if not isinstance(values, list):
             continue
+        if not values:
+            continue
         stacked_values = torch.cat(values, dim=0)
         finite_mask = torch.isfinite(stacked_values)
-        val_metrics[key] = float(stacked_values[finite_mask].mean().item())
+        val_metrics[key] = (
+            float(stacked_values[finite_mask].mean().item())
+            if finite_mask.any()
+            else float("nan")
+        )
+
+    if accumulator.get("abs_rel") and accumulator.get("uncertainty_mean"):
+        abs_rel = torch.cat(accumulator["abs_rel"], dim=0)
+        a1 = torch.cat(accumulator["a1"], dim=0)
+        uncertainty_mean = torch.cat(accumulator["uncertainty_mean"], dim=0)
+        a1_uncertainty_correlation = compute_masked_correlations(
+            a1,
+            uncertainty_mean,
+            valid_mask=torch.isfinite(a1) & torch.isfinite(uncertainty_mean),
+            prefix="aggregated_a1_unc"
+        )
+        abs_rel_uncertainty_correlation = compute_masked_correlations(
+            abs_rel,
+            uncertainty_mean,
+            valid_mask=torch.isfinite(abs_rel) & torch.isfinite(uncertainty_mean),
+            prefix="aggregated_abs_rel_unc"
+        )
+        val_metrics.update(a1_uncertainty_correlation)
+        val_metrics.update(abs_rel_uncertainty_correlation)
     return val_metrics
 
+
+def _select_metric_values(metrics, sample_mask):
+    return {
+        key: value[sample_mask]
+        if torch.is_tensor(value) and value.ndim > 0 and value.shape[0] == sample_mask.shape[0]
+        else value
+        for key, value in metrics.items()
+    }
+
+
+def _select_batch_result(result, sample_mask):
+    if not sample_mask.any().item():
+        return None
+
+    return {
+        "loss": result["loss"],
+        "prefix_head": result["prefix_head"],
+        "batched_metrics": _select_metric_values(result["batched_metrics"], sample_mask),
+        "ause_metrics": _select_metric_values(result["ause_metrics"], sample_mask),
+        "aurg_metrics": _select_metric_values(result["aurg_metrics"], sample_mask),
+        "correlations": _select_metric_values(result["correlations"], sample_mask),
+        "aru_rmsu": _select_metric_values(result["aru_rmsu"], sample_mask),
+        "uncertainty_mean": _select_metric_values(result["uncertainty_mean"], sample_mask),
+    }
+
+def __create_accumulator():
+    return {
+        "running_loss": 0.0,
+        "running_abs_rel": 0.0,
+        "running_rmse": 0.0,
+        "running_a1": 0.0,
+        "running_corr_samples": 0,
+        "running_ause_samples": 0,
+        "processed_batches": 0,
+        "abs_rel": [],
+        "rmse": [],
+        "a1": [],
+        "loss_uncertainty_pearson": [],
+        "loss_uncertainty_spearman": [],
+        "uncertainty_mean": [],
+        "ause_abs_rel": [],
+        "ause_a1": [],
+        "aurg_abs_rel": [],
+        "aurg_a1": [],
+        "aru": [],
+        "rmsu": []
+    }
 
 @torch.no_grad()
 def validate(
@@ -74,6 +152,8 @@ def validate(
     listnet_temperature: float,
     uncertainty_mode: str,
     list_loss_weight: float,
+    seen_topology_numbers: torch.Tensor = None,
+    unseen_topology_numbers: torch.Tensor = None,
     correlation_max_samples: int = 100_000,
     min_depth: float = 1e-3,
     max_depth: float = 80.0,
@@ -81,23 +161,9 @@ def validate(
 ):
     model.eval()
 
-    total_accumulator = {
-        "running_loss": 0.0,
-        "running_abs_rel": 0.0,
-        "running_rmse": 0.0,
-        "running_a1": 0.0,
-        "running_corr_samples": 0,
-        "running_ause_samples": 0,
-        "processed_batches": 0,
-        "abs_rel": [],
-        "rmse": [],
-        "a1": [],
-        "uncertainty_mean": [],
-        "ause_abs_rel": [],
-        "ause_a1": [],
-        "loss_uncertainty_pearson": [],
-        "loss_uncertainty_spearman": [],
-    }
+    total_accumulator = __create_accumulator()
+    seen_accumulator = __create_accumulator()
+    unseen_accumulator = __create_accumulator()
 
     progress_bar = tqdm(
         loader,
@@ -115,10 +181,11 @@ def validate(
             depth,
             valid_mask,
             condition,
-            _,
+            info,
         ) = unpack_ati_batch(batch, device)
 
         target_size = depth.shape[-2:]
+        topology_number = info[:, 6].to(device=device).long() # The topology number is stored in the 7th column of the info tensor
 
         with torch.autocast(device_type=device.type, enabled=amp):
             out = model(
@@ -160,6 +227,7 @@ def validate(
             valid_mask,
             uncertainty=out["std"].detach(),
             max_samples=correlation_max_samples,
+            model_type=prefix_head
         )
         ause_metrics = compute_sparsification_ause_metrics(
             out["mu"].detach(),
@@ -167,17 +235,64 @@ def validate(
             valid_mask,
             uncertainty=out["std"].detach(),
             max_samples=correlation_max_samples,
+            model_type=prefix_head
         )
-        batch_uncertainty_mean = torch.mean(out["std"].detach(), dim=[1, 2, 3]) # [B]
+        aurg_metrics = compute_sparsification_aurg_metrics(
+            out["mu"].detach(),
+            depth,
+            valid_mask,
+            uncertainty=out["std"].detach(),
+            max_samples=correlation_max_samples,
+            model_type=prefix_head
+        )
+        aru_rmsu_metrics = compute_aru_rmsu_metrics(
+            out["mu"].detach(),
+            depth,
+            valid_mask,
+            uncertainty=out["std"].detach(),
+            model_type=prefix_head
+        )
+        uncertainty_map = out["std"].detach()
+        uncertainty_mask = valid_mask.bool()
+        if uncertainty_mask.ndim == 3:
+            uncertainty_mask = uncertainty_mask.unsqueeze(1)
+        if uncertainty_mask.shape != uncertainty_map.shape:
+            uncertainty_mask = uncertainty_mask.expand_as(uncertainty_map)
+        uncertainty_counts = uncertainty_mask.flatten(1).sum(dim=1)
+        batch_uncertainty_mean = (
+            torch.where(uncertainty_mask, uncertainty_map, torch.zeros_like(uncertainty_map))
+            .flatten(1)
+            .sum(dim=1)
+            / uncertainty_counts.clamp_min(1).to(dtype=uncertainty_map.dtype)
+        ) # [B]
+        batch_uncertainty_mean = torch.where(
+            uncertainty_counts > 0,
+            batch_uncertainty_mean,
+            batch_uncertainty_mean.new_full(batch_uncertainty_mean.shape, float("nan")),
+        )
         batch_result = {
             "loss": loss.item(),
             "prefix_head": prefix_head,
             "batched_metrics": batched_metrics,
-            "correlations": correlations,
             "ause_metrics": ause_metrics,
+            "aurg_metrics": aurg_metrics,
+            "correlations": correlations,
+            "aru_rmsu": aru_rmsu_metrics,
             "uncertainty_mean": { "uncertainty_mean": batch_uncertainty_mean }
         }
         _accumulate_validation_result(total_accumulator, batch_result)
+        if seen_topology_numbers is not None:
+            seen_mask = torch.isin(topology_number, seen_topology_numbers.to(device=device).long())
+            _accumulate_validation_result(
+                seen_accumulator,
+                _select_batch_result(batch_result, seen_mask),
+            )
+        if unseen_topology_numbers is not None:
+            unseen_mask = torch.isin(topology_number, unseen_topology_numbers.to(device=device).long())
+            _accumulate_validation_result(
+                unseen_accumulator,
+                _select_batch_result(batch_result, unseen_mask),
+            )
         
         progress_bar.set_postfix(
             loss=f"{loss.item():.4f}",
@@ -188,25 +303,12 @@ def validate(
             ause_abs_rel=f"{ause_metrics['ause_abs_rel'].mean().item():.4f}",
         )
     
-    total_abs_rel_tensor = torch.cat(total_accumulator["abs_rel"], dim=0)
-    total_a1_tensor = torch.cat(total_accumulator["a1"], dim=0)
-    total_uncertainty_mean_tensor = torch.cat(total_accumulator["uncertainty_mean"], dim=0)
-    
-    a1_uncertainty_correlation = compute_masked_correlations(
-        total_a1_tensor,
-        total_uncertainty_mean_tensor,
-        valid_mask=torch.isfinite(total_a1_tensor) & torch.isfinite(total_uncertainty_mean_tensor),
-        prefix="aggregated_a1_unc"
-    )
-    abs_rel_uncertainty_correlation = compute_masked_correlations(
-        total_abs_rel_tensor,
-        total_uncertainty_mean_tensor,
-        valid_mask=torch.isfinite(total_abs_rel_tensor) & torch.isfinite(total_uncertainty_mean_tensor),
-        prefix="aggregated_abs_rel_unc"
-    )
-    
+    total_metrics = _finalize_validation_accumulator(total_accumulator)
+    seen_metrics = _finalize_validation_accumulator(seen_accumulator)
+    unseen_metrics = _finalize_validation_accumulator(unseen_accumulator)
+
     return {
-        **a1_uncertainty_correlation,
-        **abs_rel_uncertainty_correlation,
-        **_finalize_validation_accumulator(total_accumulator)
+        **total_metrics,
+        **{f"seen_{key}": value for key, value in seen_metrics.items()},
+        **{f"unseen_{key}": value for key, value in unseen_metrics.items()},
     }
