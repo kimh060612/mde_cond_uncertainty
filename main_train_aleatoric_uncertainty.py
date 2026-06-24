@@ -55,14 +55,6 @@ def main(cfg: DictConfig):
         "speed_levels": MOTION_LEVELS,
     }
     
-    train_set = ATIRealWorldUncertaintyDataset(
-        topologies=cfg.dataset.train_topologies,
-        **dataset_kwargs,
-    )
-    val_set = ATIRealWorldUncertaintyValidationDataset(
-        **dataset_kwargs,
-    )
-    copy_condition_normalization(val_set, train_set)
     seen_val_topologies = [ str(topology).strip() for topology in cfg.dataset.seen_val_topologies ]
     unseen_val_topologies = [ str(topology).strip() for topology in cfg.dataset.unseen_val_topologies ]
     validation_topology_counts = count_items_by_topology(val_set)
@@ -72,6 +64,19 @@ def main(cfg: DictConfig):
     unseen_val_indices = topology_subset_indices(val_set, unseen_val_topology_ids)
     seen_val_count = len(seen_val_indices)
     unseen_val_count = len(unseen_val_indices)
+    seen_topology_idx = torch.Tensor(list(seen_val_topology_ids)).long()
+    unseen_topology_idx = torch.Tensor(list(unseen_val_topology_ids)).long()
+    print("[Training] Seen validation topologies:", seen_topology_idx)
+    print("[Training] Unseen validation topologies:", unseen_topology_idx)
+    
+    train_set = ATIRealWorldUncertaintyDataset(
+        topologies=cfg.dataset.train_topologies,
+        **dataset_kwargs,
+    )
+    val_set = ATIRealWorldUncertaintyValidationDataset(
+        **dataset_kwargs,
+    )
+    copy_condition_normalization(val_set, train_set)
     
     dataset_metadata = {
         "condition_names": list(train_set.condition_names),
@@ -171,11 +176,6 @@ def main(cfg: DictConfig):
     )
     logger.info("Training started")
     logger.info("Model: %s", model_id)
-    
-    seen_topology_idx = torch.Tensor(seen_val_topology_ids).long()
-    unseen_topology_idx = torch.Tensor(unseen_val_topology_ids).long()
-    print("[Training] Seen validation topologies:", seen_topology_idx)
-    print("[Training] Unseen validation topologies:", unseen_topology_idx)
     
     for epoch in range(1, cfg.training.num_epochs + 1):
         train_metrics, global_step = train_one_epoch(
