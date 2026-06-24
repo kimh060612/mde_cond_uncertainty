@@ -195,7 +195,7 @@ def main(cfg: DictConfig):
             global_step=global_step,
             log_interval=cfg.training.log_interval,
         )
-        val_metrics = validate(
+        val_total_metrics, val_seen_metrics, val_unseen_metrics = validate(
             epoch=epoch,
             model_id=model_id,
             model=model,
@@ -211,51 +211,19 @@ def main(cfg: DictConfig):
             max_depth=cfg.dataset.max_depth,
             relative_align_mode=cfg.training.relative_align_mode,
         )
-        seen_val_metrics = validate(
-            epoch=epoch,
-            model_id=model_id,
-            model=model,
-            loader=seen_val_loader,
-            device=device,
-            amp=amp,
-            lambda_smooth_logvar=cfg.training.lambda_smooth_logvar,
-            list_loss_weight=cfg.training.list_loss_weight,
-            listnet_temperature=cfg.training.listnet_temperature,
-            uncertainty_mode=cfg.training.uncertainty_mode,
-            correlation_max_samples=cfg.training.correlation_max_samples,
-            min_depth=cfg.dataset.min_depth,
-            max_depth=cfg.dataset.max_depth,
-            relative_align_mode=cfg.training.relative_align_mode,
-        )
-        unseen_val_metrics = validate(
-            epoch=epoch,
-            model_id=model_id,
-            model=model,
-            loader=unseen_val_loader,
-            device=device,
-            amp=amp,
-            lambda_smooth_logvar=cfg.training.lambda_smooth_logvar,
-            list_loss_weight=cfg.training.list_loss_weight,
-            listnet_temperature=cfg.training.listnet_temperature,
-            uncertainty_mode=cfg.training.uncertainty_mode,
-            correlation_max_samples=cfg.training.correlation_max_samples,
-            min_depth=cfg.dataset.min_depth,
-            max_depth=cfg.dataset.max_depth,
-            relative_align_mode=cfg.training.relative_align_mode,
-        )
-
-        print(f"[epoch {epoch}] train={train_metrics}")
-        print(f"[epoch {epoch}] val={val_metrics}")
-        print(f"[epoch {epoch}] seen_val={seen_val_metrics}")
-        print(f"[epoch {epoch}] unseen_val={unseen_val_metrics}")
         
-        is_best = val_metrics["aggregated_abs_rel_unc_pearson"] > best_abs_rel_correlation
+        print(f"[epoch {epoch}] train={train_metrics}")
+        print(f"[epoch {epoch}] val={val_total_metrics}")
+        print(f"[epoch {epoch}] seen_val={val_seen_metrics}")
+        print(f"[epoch {epoch}] unseen_val={val_unseen_metrics}")
+        
+        is_best = val_total_metrics["aggregated_abs_rel_unc_pearson"] > best_abs_rel_correlation
         if is_best:
-            best_abs_rel_correlation = val_metrics["aggregated_abs_rel_unc_pearson"]
+            best_abs_rel_correlation = val_total_metrics["aggregated_abs_rel_unc_pearson"]
             checkpoint_val_metrics = {
-                **val_metrics,
-                **prefix_metrics("val_seen", seen_val_metrics),
-                **prefix_metrics("val_unseen", unseen_val_metrics),
+                **val_total_metrics,
+                **prefix_metrics("val_seen", val_seen_metrics),
+                **prefix_metrics("val_unseen", val_unseen_metrics),
             }
             save_checkpoint(
                 model,
@@ -274,9 +242,9 @@ def main(cfg: DictConfig):
             "best/is_best": int(is_best),
         }
         epoch_log.update({f"train/{key}": value for key, value in train_metrics.items()})
-        epoch_log.update({f"val/{key}": value for key, value in val_metrics.items()})
-        epoch_log.update({f"val_seen/{key}": value for key, value in seen_val_metrics.items()})
-        epoch_log.update({f"val_unseen/{key}": value for key, value in unseen_val_metrics.items()})
+        epoch_log.update({f"val/{key}": value for key, value in val_total_metrics.items()})
+        epoch_log.update({f"val_seen/{key}": value for key, value in val_seen_metrics.items()})
+        epoch_log.update({f"val_unseen/{key}": value for key, value in val_unseen_metrics.items()})
         wandb_run.log(epoch_log, step=epoch)
     
     if wandb_run is not None:
@@ -284,3 +252,37 @@ def main(cfg: DictConfig):
 
 if __name__ == "__main__":
     main()
+
+
+# seen_val_metrics = validate(
+#             epoch=epoch,
+#             model_id=model_id,
+#             model=model,
+#             loader=seen_val_loader,
+#             device=device,
+#             amp=amp,
+#             lambda_smooth_logvar=cfg.training.lambda_smooth_logvar,
+#             list_loss_weight=cfg.training.list_loss_weight,
+#             listnet_temperature=cfg.training.listnet_temperature,
+#             uncertainty_mode=cfg.training.uncertainty_mode,
+#             correlation_max_samples=cfg.training.correlation_max_samples,
+#             min_depth=cfg.dataset.min_depth,
+#             max_depth=cfg.dataset.max_depth,
+#             relative_align_mode=cfg.training.relative_align_mode,
+#         )
+#         unseen_val_metrics = validate(
+#             epoch=epoch,
+#             model_id=model_id,
+#             model=model,
+#             loader=unseen_val_loader,
+#             device=device,
+#             amp=amp,
+#             lambda_smooth_logvar=cfg.training.lambda_smooth_logvar,
+#             list_loss_weight=cfg.training.list_loss_weight,
+#             listnet_temperature=cfg.training.listnet_temperature,
+#             uncertainty_mode=cfg.training.uncertainty_mode,
+#             correlation_max_samples=cfg.training.correlation_max_samples,
+#             min_depth=cfg.dataset.min_depth,
+#             max_depth=cfg.dataset.max_depth,
+#             relative_align_mode=cfg.training.relative_align_mode,
+#         )

@@ -1,6 +1,5 @@
+from typing import Tuple, Dict
 import torch
-from torch.utils.data import DataLoader, Subset
-import wandb
 from model.loss_fn import gaussian_nll_depth_loss, image_level_listnet_loss
 from evaluation_utils.eval_utils import (
     compute_comprehensive_depth_metrics,
@@ -36,7 +35,7 @@ def train_one_epoch(
     relative_align_mode: str = "scale_shift",
     global_step: int = 0,
     log_interval: int = 20,
-):
+)-> Tuple[Dict[str, float], int]:
     model.train()
     progress_bar = tqdm(
         loader,
