@@ -39,9 +39,9 @@ training:
   lambda_smooth_logvar: 1e-3
   grad_clip: 1.0
   relative_align_mode: "scale_shift"
-  wandb_entity: "artificial_tripartite_intelligence_team"
-  wandb_project: "mde_uncertainty_measure"
-  wandb_name: "dav2_cond_uncertainty"
+  wandb_entity: artificial_tripartite_intelligence_team
+  wandb_project: mde_uncertainty_measure
+  wandb_name: dav2_cond_uncertainty
   uncertainty_mode: "mean"
   disable_wandb: false
   no_amp: false

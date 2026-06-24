@@ -242,16 +242,15 @@ def main(cfg: DictConfig):
             wandb_run.summary["best_abs_rel_correlation"] = best_abs_rel_correlation
             wandb_run.summary["best_epoch"] = epoch
 
-        epoch_log = {
+        wandb_run.log({
             "epoch": epoch,
             "best/abs_rel_correlation": best_abs_rel_correlation,
             "best/is_best": int(is_best),
-        }
-        epoch_log.update({f"train/{key}": value for key, value in train_metrics.items()})
-        epoch_log.update({f"val/{key}": value for key, value in val_total_metrics.items()})
-        epoch_log.update({f"val_seen/{key}": value for key, value in val_seen_metrics.items()})
-        epoch_log.update({f"val_unseen/{key}": value for key, value in val_unseen_metrics.items()})
-        wandb_run.log(epoch_log, step=epoch)
+            **{f"train/{key}": value for key, value in train_metrics.items()},
+            **{f"val/{key}": value for key, value in val_total_metrics.items()}, 
+            **{f"val_seen/{key}": value for key, value in val_seen_metrics.items()},
+            **{f"val_unseen/{key}": value for key, value in val_unseen_metrics.items()}
+        }, step=epoch)
     
     if wandb_run is not None:
         wandb_run.finish()
