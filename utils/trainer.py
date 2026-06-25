@@ -114,14 +114,21 @@ def train_one_epoch(
                 depth,
                 valid_mask,
                 out["std"].detach(),
-                align_mode=relative_align_mode,
+                align_mode="median",
+            )
+            s_mu_aligned, _ = align_relative_depth_and_uncertainty(
+                out["mu"].detach(),
+                depth,
+                valid_mask,
+                out["std"].detach(),
+                align_mode="scale_shift",
             )
         else: 
             mu_aligned = out["mu"].detach()
             std_aligned = out["std"].detach()
         
         batched_metrics = compute_comprehensive_depth_metrics(
-            mu=mu_aligned,
+            mu=s_mu_aligned,
             target=depth,
             valid_mask=valid_mask,
             min_depth=min_depth,

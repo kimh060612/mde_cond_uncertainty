@@ -211,14 +211,21 @@ def validate(
                 depth,
                 valid_mask,
                 out["std"].detach(),
-                align_mode=relative_align_mode,
+                align_mode="median",
+            )
+            s_mu_aligned, s_std_aligned = align_relative_depth_and_uncertainty(
+                out["mu"].detach(),
+                depth,
+                valid_mask,
+                out["std"].detach(),
+                align_mode="scale_shift",
             )
         else: 
             mu_aligned = out["mu"].detach()
             std_aligned = out["std"].detach()
         
         batched_metrics = compute_comprehensive_depth_metrics(
-            mu=mu_aligned.detach(),
+            mu=s_mu_aligned.detach(),
             target=depth,
             valid_mask=valid_mask,
             min_depth=min_depth,
@@ -252,7 +259,7 @@ def validate(
             valid_mask,
             uncertainty=std_aligned.detach()
         )
-        uncertainty_map = std_aligned.detach()
+        uncertainty_map = s_std_aligned.detach()
         uncertainty_mask = valid_mask.bool()
         if uncertainty_mask.ndim == 3:
             uncertainty_mask = uncertainty_mask.unsqueeze(1)

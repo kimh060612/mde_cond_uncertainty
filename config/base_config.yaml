@@ -18,7 +18,7 @@ dataset:
     - "topology5"
 
 model:
-  model_id: "base"
+  model_id: "small"
   image_height: 518
   image_width: 518
   uncertainty_width: 32
@@ -38,7 +38,7 @@ training:
   list_loss_weight: 0.1
   lambda_smooth_logvar: 1e-3
   grad_clip: 1.0
-  relative_align_mode: median
+  relative_align_mode: scale_shift
   wandb_entity: artificial_tripartite_intelligence_team
   wandb_project: mde_uncertainty_measure
   wandb_name: dav2_cond_uncertainty

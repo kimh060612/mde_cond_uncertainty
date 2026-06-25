@@ -79,17 +79,16 @@ def align_relative_depth_and_uncertainty(
     pred = ensure_bchw(pred.detach()) # [B, 1, H, W]
     gt = ensure_bchw(gt.detach()) # [B, 1, H, W]
     valid_mask = ensure_bchw(valid_mask).bool()
-
+    calc_dtype = torch.float64 if pred.dtype == torch.float64 or gt.dtype == torch.float64 else torch.float32
+    pred = pred.to(dtype=calc_dtype)
+    gt = gt.to(dtype=calc_dtype)
+    
     if pred.shape != gt.shape:
         raise ValueError(f"Shape mismatch: target {gt.shape}, pred {pred.shape}")
     if valid_mask.shape != pred.shape:
         valid_mask = valid_mask.expand_as(pred)
 
-    calc_dtype = torch.float64 if pred.dtype == torch.float64 or gt.dtype == torch.float64 else torch.float32
-    pred = pred.to(dtype=calc_dtype)
-    gt = gt.to(dtype=calc_dtype)
-    eps = 1e-8
-    
+    eps = 1e-8    
     relative_mask = valid_mask & torch.isfinite(pred) & torch.isfinite(gt) & (gt > 0) & (pred > 0)
     gt_inv = 1.0 / (gt + eps)
 
