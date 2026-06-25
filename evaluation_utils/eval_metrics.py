@@ -166,8 +166,7 @@ def compute_sparsification_aurg_metrics(
         a1_error,
         uncertainty,
         finite_mask,
-        max_samples=max_samples,
-        num_bins=num_bins,
+        max_samples=max_samples
     )
     if samples is None:
         empty = abs_rel_error.new_full((abs_rel_error.shape[0],), float("nan"), dtype=torch.float64)
@@ -236,31 +235,52 @@ def compute_aru_rmsu_metrics(
 
 ### Global Correlation Metrics
 @torch.no_grad()
-def compute_masked_correlations(
+def compute_vector_masked_correlations(
     x: torch.Tensor,
     y: torch.Tensor,
-    valid_mask: torch.Tensor,
+    valid_mask: Optional[torch.Tensor] = None,
     max_samples: Optional[int] = 100_000,
     prefix: str = "correlation",
 ) -> Dict[str, float]:
     """
-    Compute Pearson and Spearman correlations between two per-pixel maps.
+    Compute Pearson/Spearman correlations for image-level 1D vectors.
 
-    The valid pixels are optionally sub-sampled with deterministic uniform
-    indexing so this metric does not perturb the training RNG state.
+    Intended for cases like:
+        abs_rel: [N]
+        a1: [N]
+        uncertainty_mean: [N]
+
+    Unlike compute_masked_correlations(), this does not expect BCHW tensors.
     """
+    x = x.detach().flatten()
+    y = y.detach().flatten()
+
     if x.shape != y.shape:
         raise ValueError(f"Shape mismatch: x {tuple(x.shape)} != y {tuple(y.shape)}")
 
-    x_flat, y_flat = prepare_masked_vectors(x, y, valid_mask, max_samples=max_samples)
-    if x_flat.numel() < 2:
+    finite_mask = torch.isfinite(x) & torch.isfinite(y)
+
+    if valid_mask is not None:
+        valid_mask = valid_mask.detach().flatten().bool()
+        if valid_mask.shape != x.shape:
+            raise ValueError(
+                f"Shape mismatch: valid_mask {tuple(valid_mask.shape)} != x {tuple(x.shape)}"
+            )
+        finite_mask = finite_mask & valid_mask
+
+    x = x[finite_mask].float()
+    y = y[finite_mask].float()
+
+    x, y = deterministic_subsample(x, y, max_samples=max_samples)
+
+    if x.numel() < 2:
         return {
             f"{prefix}_pearson": float("nan"),
             f"{prefix}_spearman": float("nan"),
         }
+    pearson = pearson_corr(x, y)
+    spearman = spearman_corr(x, y)
 
-    pearson = pearson_corr(x_flat, y_flat)
-    spearman = spearman_corr(x_flat, y_flat)
     return {
         f"{prefix}_pearson": float(pearson.item()),
         f"{prefix}_spearman": float(spearman.item()),
@@ -319,3 +339,35 @@ def compute_loss_uncertainty_correlations(
             sample_mask,
         ),
     }
+
+# @torch.no_grad()
+# def compute_masked_correlations(
+#     x: torch.Tensor,
+#     y: torch.Tensor,
+#     valid_mask: torch.Tensor,
+#     max_samples: Optional[int] = 100_000,
+#     prefix: str = "correlation",
+# ) -> Dict[str, float]:
+#     """
+#     Compute Pearson and Spearman correlations between two per-pixel maps.
+
+#     The valid pixels are optionally sub-sampled with deterministic uniform
+#     indexing so this metric does not perturb the training RNG state.
+#     """
+#     if x.shape != y.shape:
+#         raise ValueError(f"Shape mismatch: x {tuple(x.shape)} != y {tuple(y.shape)}")
+
+#     x_flat, y_flat = prepare_masked_vectors(x, y, valid_mask, max_samples=max_samples)
+#     if x_flat.numel() < 2:
+#         return {
+#             f"{prefix}_pearson": float("nan"),
+#             f"{prefix}_spearman": float("nan"),
+#         }
+
+#     pearson = pearson_corr(x_flat, y_flat)
+#     spearman = spearman_corr(x_flat, y_flat)
+#     return {
+#         f"{prefix}_pearson": float(pearson.item()),
+#         f"{prefix}_spearman": float(spearman.item()),
+#     }
+    

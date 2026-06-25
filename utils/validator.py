@@ -70,13 +70,13 @@ def _finalize_validation_accumulator(accumulator):
         abs_rel = torch.cat(accumulator["abs_rel"], dim=0)
         a1 = torch.cat(accumulator["a1"], dim=0)
         uncertainty_mean = torch.cat(accumulator["uncertainty_mean"], dim=0)
-        a1_uncertainty_correlation = compute_masked_correlations(
+        a1_uncertainty_correlation = compute_vector_masked_correlations( 
             a1,
             uncertainty_mean,
             valid_mask=torch.isfinite(a1) & torch.isfinite(uncertainty_mean),
             prefix="aggregated_a1_unc"
         )
-        abs_rel_uncertainty_correlation = compute_masked_correlations(
+        abs_rel_uncertainty_correlation = compute_vector_masked_correlations(
             abs_rel,
             uncertainty_mean,
             valid_mask=torch.isfinite(abs_rel) & torch.isfinite(uncertainty_mean),
