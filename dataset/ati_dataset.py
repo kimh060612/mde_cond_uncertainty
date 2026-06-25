@@ -81,8 +81,11 @@ def _parse_scene_dir_name(name: str, scene_prefixes: Sequence[str]):
     return None
 
 
-def _parse_exposure_dir_name(name: str):
-    match = re.fullmatch(r"exposure_([0-9.]+)_gain_([0-9.]+)", name)
+def parse_exposure_dir_name(name: str):
+    match = re.fullmatch(
+        r"pair_\d+_exposure_([0-9.]+)_gain_([0-9.]+)",
+        name,
+    )
     if match is None:
         return None
     return float(match.group(1)), float(match.group(2))
@@ -249,7 +252,7 @@ class ATIRealWorldDepthDataset(Dataset):
                     print(exposure_dir.name, "does not match any known scene prefixes. Skipping....")
                     continue
 
-                parsed_exposure = _parse_exposure_dir_name(exposure_dir.name)
+                parsed_exposure = parse_exposure_dir_name(exposure_dir.name)
                 if parsed_exposure is None:
                     print(exposure_dir.name, "does not match any known scene prefixes. Skipping....")
                     continue
