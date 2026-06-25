@@ -29,7 +29,7 @@ def masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     means = sums / valid_counts.clamp_min(1).to(dtype=values.dtype)
     return torch.where(valid_counts > 0, means, torch.full_like(means, float("nan")))
 
-def _masked_median(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+def masked_median(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     flat_values = values.flatten(1)
     flat_mask = mask.flatten(1)
     valid_counts = flat_mask.sum(dim=1)
@@ -76,14 +76,26 @@ def align_relative_depth_and_uncertainty(
     align_mode: str = "scale_shift",
     calc_dtype=torch.float32,
 ):
-    eps = 1e-8
+    pred = ensure_bchw(pred.detach()) # [B, 1, H, W]
+    gt = ensure_bchw(gt.detach()) # [B, 1, H, W]
     valid_mask = ensure_bchw(valid_mask).bool()
+
+    if pred.shape != gt.shape:
+        raise ValueError(f"Shape mismatch: target {gt.shape}, pred {pred.shape}")
+    if valid_mask.shape != pred.shape:
+        valid_mask = valid_mask.expand_as(pred)
+
+    calc_dtype = torch.float64 if pred.dtype == torch.float64 or gt.dtype == torch.float64 else torch.float32
+    pred = pred.to(dtype=calc_dtype)
+    gt = gt.to(dtype=calc_dtype)
+    eps = 1e-8
+    
     relative_mask = valid_mask & torch.isfinite(pred) & torch.isfinite(gt) & (gt > 0) & (pred > 0)
     gt_inv = 1.0 / (gt + eps)
 
     if align_mode == "median":
-        pred_median = _masked_median(pred, relative_mask)
-        gt_inv_median = _masked_median(gt_inv, relative_mask)
+        pred_median = masked_median(pred, relative_mask)
+        gt_inv_median = masked_median(gt_inv, relative_mask)
         scale = gt_inv_median / (pred_median + eps)
         pred_aligned = pred * scale.view(-1, 1, 1, 1)
         sigma_aligned = sigma * scale.view(-1, 1, 1, 1) if sigma is not None else None
