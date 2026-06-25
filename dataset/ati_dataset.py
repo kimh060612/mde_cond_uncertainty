@@ -226,12 +226,15 @@ class ATIRealWorldDepthDataset(Dataset):
             raise FileNotFoundError(f"Dataset root does not exist: {self.root_dir}")
 
         items = []
+        print(self.root_dir.name)
         for scene_dir in sorted(self.root_dir.iterdir()):
             if not scene_dir.is_dir():
+                print(scene_dir.name, "is not a directory. Skipping....")
                 continue
 
             parsed_scene = _parse_scene_dir_name(scene_dir.name, self.scene_prefixes)
             if parsed_scene is None:
+                print(scene_dir.name, "does not match any known scene prefixes. Skipping....")
                 continue
 
             scene_prefix, light, speed, topology = parsed_scene
