@@ -230,6 +230,11 @@ class ATIRealWorldDepthDataset(Dataset):
             raise FileNotFoundError(f"Dataset root does not exist: {self.root_dir}")
 
         items = []
+        scan_stats = {
+            "candidate_frames": 0,
+            "included_frames": 0,
+            "missing_paired_files": 0,
+        }
         for scene_dir in tqdm(sorted(self.root_dir.iterdir()), desc="Scanning scenes"):
             if not scene_dir.is_dir():
                 continue
@@ -266,8 +271,12 @@ class ATIRealWorldDepthDataset(Dataset):
                     rgb_files = _index_files_by_stem(lap_dir / "rgb", [".png"])
                     depth_files = _index_files_by_stem(lap_dir / "depth", [".npy"])
                     paired_frame_ids = set(rgb_files) & set(depth_files)
+                    scan_stats["missing_paired_files"] += (
+                        len(set(rgb_files) | set(depth_files)) - len(paired_frame_ids)
+                    )
                     
                     for frame_id in sorted(paired_frame_ids):
+                        scan_stats["candidate_frames"] += 1
                         items.append(
                             ATIFrameItem(
                                 rgb_path=rgb_files[frame_id],
@@ -282,7 +291,9 @@ class ATIRealWorldDepthDataset(Dataset):
                                 topology=topology
                             )
                         )
-
+                        scan_stats["included_frames"] += 1
+        
+        self.scan_stats = scan_stats
         return items
 
     def __len__(self):

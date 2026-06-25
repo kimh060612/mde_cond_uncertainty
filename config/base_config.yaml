@@ -5,7 +5,7 @@ dataset:
   max_depth: 10.0
   min_valid_depth_ratio: 0.7
   output_dir: ./da2_ati_cond_uncertainty_ckpt
-  num_workers: 16
+  num_workers: 8
   train_topologies:
     - "topology1"
     - "topology2"
