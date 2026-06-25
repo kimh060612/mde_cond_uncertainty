@@ -50,6 +50,7 @@ def compute_comprehensive_depth_metrics(
     gt = target.to(dtype=calc_dtype)
     eps = 1e-8
 
+    valid_mask = valid_mask.bool()
     metric_mask = valid_mask & torch.isfinite(pred) & torch.isfinite(gt) & (gt > 0)
     return metric_dict(
         pred, 
