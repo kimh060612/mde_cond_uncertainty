@@ -4,7 +4,8 @@ from utils.train_utils import *
 from model.loss_fn import gaussian_nll_depth_loss, image_level_listnet_loss
 from evaluation_utils.eval_metrics import *
 from evaluation_utils.eval_utils import (
-    align_relative_depth_and_uncertainty,
+    align_relative_prediction_to_depth_space,
+    ensure_bchw,
 ) 
 from tqdm.auto import tqdm
 
@@ -21,6 +22,26 @@ def _finite_mean(value):
     if not finite_mask.any():
         return float("nan")
     return float(values[finite_mask].mean().item())
+
+
+def _masked_image_mean(values, valid_mask):
+    mask = valid_mask.bool()
+    if mask.ndim == 3:
+        mask = mask.unsqueeze(1)
+    if mask.shape != values.shape:
+        mask = mask.expand_as(values)
+    counts = mask.flatten(1).sum(dim=1)
+    means = (
+        torch.where(mask, values, torch.zeros_like(values))
+        .flatten(1)
+        .sum(dim=1)
+        / counts.clamp_min(1).to(dtype=values.dtype)
+    )
+    return torch.where(
+        counts > 0,
+        means,
+        means.new_full(means.shape, float("nan")),
+    )
 
 
 def _extend_metric_values(accumulator, metrics):
@@ -126,6 +147,7 @@ def __create_accumulator():
         "loss_uncertainty_pearson": [],
         "loss_uncertainty_spearman": [],
         "uncertainty_mean": [],
+        "depth_uncertainty_mean": [],
         "ause_abs_rel": [],
         "ause_a1": [],
         "aurg_abs_rel": [],
@@ -188,13 +210,21 @@ def validate(
                 context=condition,
                 target_size=target_size,
             )
-            scale, shift = compute_align_scale_shift(
-                out["predicted_depth"],
-                depth,
-                valid_mask,
-            )
-            aligned_mean = scale * out["predicted_depth"] + shift
-            aligned_log_var = out["log_variance"] + 2.0 * torch.log(scale.abs().clamp_min(1e-6))
+            if prefix_head == "relative":
+                aligned = align_relative_prediction_to_depth_space(
+                    out["predicted_depth"],
+                    depth,
+                    valid_mask,
+                    log_var=out["log_variance"],
+                    align_mode=relative_align_mode,
+                )
+                aligned_mean = aligned["depth"]
+                aligned_log_var = aligned["log_var"]
+            else:
+                aligned_mean = out["predicted_depth"]
+                aligned_log_var = out["log_variance"]
+            aligned_std = torch.exp(0.5 * aligned_log_var)
+            relative_uncertainty = aligned_std / ensure_bchw(depth).clamp_min(min_depth)
             
             nll_loss = gaussian_nll_depth_loss(
                 aligned_mean,
@@ -205,7 +235,7 @@ def validate(
             )
             list_loss = image_level_listnet_loss(
                 aligned_mean,
-                torch.exp(0.5 * aligned_log_var),
+                relative_uncertainty,
                 depth,
                 valid_mask,
                 temperature=listnet_temperature,
@@ -213,17 +243,9 @@ def validate(
             )
             loss = nll_loss + list_loss_weight * list_loss
 
-        if prefix_head == "relative":
-            mu_aligned, std_aligned = align_relative_depth_and_uncertainty(
-                out["predicted_depth"].detach(),
-                depth,
-                valid_mask,
-                out["std"].detach(),
-                align_mode=relative_align_mode,
-            )
-        else: 
-            mu_aligned = out["predicted_depth"].detach()
-            std_aligned = out["std"].detach()
+        mu_aligned = aligned_mean.detach()
+        std_aligned = aligned_std.detach()
+        relative_uncertainty = relative_uncertainty.detach()
 
         batched_metrics = compute_comprehensive_depth_metrics(
             mu=mu_aligned.detach(),
@@ -237,46 +259,38 @@ def validate(
             depth,
             valid_mask,
             uncertainty=std_aligned.detach(),
-            max_samples=correlation_max_samples
+            max_samples=correlation_max_samples,
+            min_depth=min_depth,
+            max_depth=max_depth,
         )
         ause_metrics = compute_sparsification_ause_metrics(
             mu_aligned.detach(),
             depth,
             valid_mask,
-            uncertainty=std_aligned.detach(),
-            max_samples=correlation_max_samples
+            uncertainty=relative_uncertainty.detach(),
+            max_samples=correlation_max_samples,
+            min_depth=min_depth,
+            max_depth=max_depth,
         )
         aurg_metrics = compute_sparsification_aurg_metrics(
             mu_aligned.detach(),
             depth,
             valid_mask,
-            uncertainty=std_aligned.detach(),
-            max_samples=correlation_max_samples
+            uncertainty=relative_uncertainty.detach(),
+            max_samples=correlation_max_samples,
+            min_depth=min_depth,
+            max_depth=max_depth,
         )
         aru_rmsu_metrics = compute_aru_rmsu_metrics(
             mu_aligned.detach(),
             depth,
             valid_mask,
-            uncertainty=std_aligned.detach()
+            uncertainty=std_aligned.detach(),
+            min_depth=min_depth,
+            max_depth=max_depth,
         )
-        uncertainty_map = std_aligned.detach()
-        uncertainty_mask = valid_mask.bool()
-        if uncertainty_mask.ndim == 3:
-            uncertainty_mask = uncertainty_mask.unsqueeze(1)
-        if uncertainty_mask.shape != uncertainty_map.shape:
-            uncertainty_mask = uncertainty_mask.expand_as(uncertainty_map)
-        uncertainty_counts = uncertainty_mask.flatten(1).sum(dim=1)
-        batch_uncertainty_mean = (
-            torch.where(uncertainty_mask, uncertainty_map, torch.zeros_like(uncertainty_map))
-            .flatten(1)
-            .sum(dim=1)
-            / uncertainty_counts.clamp_min(1).to(dtype=uncertainty_map.dtype)
-        ) # [B]
-        batch_uncertainty_mean = torch.where(
-            uncertainty_counts > 0,
-            batch_uncertainty_mean,
-            batch_uncertainty_mean.new_full(batch_uncertainty_mean.shape, float("nan")),
-        )
+        batch_uncertainty_mean = _masked_image_mean(relative_uncertainty, valid_mask)
+        batch_depth_uncertainty_mean = _masked_image_mean(std_aligned, valid_mask)
         batch_result = {
             "loss": loss.item(),
             "prefix_head": prefix_head,
@@ -285,7 +299,10 @@ def validate(
             "aurg_metrics": aurg_metrics,
             "correlations": correlations,
             "aru_rmsu": aru_rmsu_metrics,
-            "uncertainty_mean": { "uncertainty_mean": batch_uncertainty_mean }
+            "uncertainty_mean": {
+                "uncertainty_mean": batch_uncertainty_mean,
+                "depth_uncertainty_mean": batch_depth_uncertainty_mean,
+            }
         }
         _accumulate_validation_result(total_accumulator, batch_result)
         if seen_topology_numbers is not None:

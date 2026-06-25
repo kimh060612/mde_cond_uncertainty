@@ -2,7 +2,8 @@ from typing import Tuple, Dict
 import torch
 from model.loss_fn import gaussian_nll_depth_loss, image_level_listnet_loss
 from evaluation_utils.eval_utils import (
-    align_relative_depth_and_uncertainty,
+    align_relative_prediction_to_depth_space,
+    ensure_bchw,
     _mean_finite_metrics,
 )
 from evaluation_utils.eval_metrics import (
@@ -82,13 +83,21 @@ def train_one_epoch(
                 context=condition,
                 target_size=target_size,
             )
-            scale, shift = compute_align_scale_shift(
-                out["predicted_depth"],
-                depth,
-                valid_mask,
-            )
-            aligned_mean = scale * out["predicted_depth"] + shift
-            aligned_log_var = out["log_variance"] + 2.0 * torch.log(scale.abs().clamp_min(1e-6))
+            if prefix_head == "relative":
+                aligned = align_relative_prediction_to_depth_space(
+                    out["predicted_depth"],
+                    depth,
+                    valid_mask,
+                    log_var=out["log_variance"],
+                    align_mode=relative_align_mode,
+                )
+                aligned_mean = aligned["depth"]
+                aligned_log_var = aligned["log_var"]
+            else:
+                aligned_mean = out["predicted_depth"]
+                aligned_log_var = out["log_variance"]
+            aligned_std = torch.exp(0.5 * aligned_log_var)
+            relative_uncertainty = aligned_std / ensure_bchw(depth).clamp_min(min_depth)
             
             nll_loss = gaussian_nll_depth_loss(
                 aligned_mean,
@@ -99,7 +108,7 @@ def train_one_epoch(
             )
             list_loss = image_level_listnet_loss(
                 aligned_mean,
-                torch.exp(0.5 * aligned_log_var),
+                relative_uncertainty,
                 depth,
                 valid_mask,
                 temperature=listnet_temperature,
@@ -115,18 +124,10 @@ def train_one_epoch(
 
         scaler.step(optimizer)
         scaler.update()
-        
-        if prefix_head == "relative":
-            mu_aligned, std_aligned = align_relative_depth_and_uncertainty(
-                out["predicted_depth"],
-                depth,
-                valid_mask,
-                out["std"],
-                align_mode=relative_align_mode,
-            )
-        else: 
-            mu_aligned = out["predicted_depth"]
-            std_aligned = out["std"]
+
+        mu_aligned = aligned_mean.detach()
+        std_aligned = aligned_std.detach()
+        relative_uncertainty = relative_uncertainty.detach()
         
         batched_metrics = compute_comprehensive_depth_metrics(
             mu=mu_aligned,
@@ -139,15 +140,19 @@ def train_one_epoch(
             mu_aligned,
             depth,
             valid_mask,
-            uncertainty=std_aligned,
+            uncertainty=relative_uncertainty,
             max_samples=correlation_max_samples,
+            min_depth=min_depth,
+            max_depth=max_depth,
         )
         aurg_metrics = compute_sparsification_aurg_metrics(
             mu_aligned,
             depth,
             valid_mask,
-            uncertainty=std_aligned,
+            uncertainty=relative_uncertainty,
             max_samples=correlation_max_samples,
+            min_depth=min_depth,
+            max_depth=max_depth,
         )
         
         running_loss += loss.item()

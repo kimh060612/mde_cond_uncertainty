@@ -51,10 +51,17 @@ def calculate_l1_depth_lossmap(
     mu: torch.Tensor,
     target: torch.Tensor,
     valid_mask: torch.Tensor,
+    min_depth: Optional[float] = None,
+    max_depth: Optional[float] = None,
 ) -> torch.Tensor:
     mu = ensure_bchw(mu)
     target = ensure_bchw(target)
     valid_mask = prepare_bchw_mask(valid_mask, target)
+    if min_depth is not None or max_depth is not None:
+        clamp_min = min_depth if min_depth is not None else -float("inf")
+        clamp_max = max_depth if max_depth is not None else float("inf")
+        mu = torch.clamp(mu, clamp_min, clamp_max)
+        target = torch.clamp(target, clamp_min, clamp_max)
     l1_loss_map = torch.abs(mu - target)
     return l1_loss_map
 

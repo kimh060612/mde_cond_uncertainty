@@ -77,7 +77,9 @@ def compute_sparsification_ause_metrics(
     valid_mask: torch.Tensor,
     uncertainty: torch.Tensor,
     max_samples: Optional[int] = 100_000,
-    num_bins: int = 100
+    num_bins: int = 100,
+    min_depth: float = 1e-3,
+    max_depth: float = 80.0,
 ) -> Dict[str, torch.Tensor]:
     """
     Compute MDE-style AUSE metrics by removing high-uncertainty pixels first.
@@ -86,7 +88,12 @@ def compute_sparsification_ause_metrics(
     failure indicator, so lower AUSE is better for both metrics.
     """
     
-    abs_rel_error, a1_error = depth_error_maps(mu, target)
+    abs_rel_error, a1_error = depth_error_maps(
+        mu,
+        target,
+        min_depth=min_depth,
+        max_depth=max_depth,
+    )
     uncertainty = ensure_bchw(uncertainty)
     if uncertainty.shape != abs_rel_error.shape:
         uncertainty = uncertainty.expand_as(abs_rel_error)
@@ -140,6 +147,8 @@ def compute_sparsification_aurg_metrics(
     uncertainty: torch.Tensor,
     max_samples: Optional[int] = 100_000,
     num_bins: int = 100,
+    min_depth: float = 1e-3,
+    max_depth: float = 80.0,
 ) -> Dict[str, torch.Tensor]:
     """
     Compute MDE-style AURG metrics by removing high-uncertainty pixels first.
@@ -147,7 +156,12 @@ def compute_sparsification_aurg_metrics(
     ``aurg_abs_rel`` uses per-pixel AbsRel error. ``aurg_a1`` uses the a1
     failure indicator, so higher AURG is better for both metrics.
     """
-    abs_rel_error, a1_error = depth_error_maps(mu, target)
+    abs_rel_error, a1_error = depth_error_maps(
+        mu,
+        target,
+        min_depth=min_depth,
+        max_depth=max_depth,
+    )
     uncertainty = ensure_bchw(uncertainty)
     if uncertainty.shape != abs_rel_error.shape:
         uncertainty = uncertainty.expand_as(abs_rel_error)
@@ -201,10 +215,18 @@ def compute_aru_rmsu_metrics(
     gt: torch.Tensor,
     valid_mask: torch.Tensor,
     uncertainty: torch.Tensor,
+    min_depth: float = 1e-3,
+    max_depth: float = 80.0,
 ) -> Dict[str, torch.Tensor]:
     gt = ensure_bchw(gt)
     valid_mask = prepare_bchw_mask(valid_mask, gt)
-    l1_loss_map = calculate_l1_depth_lossmap(mu, gt, valid_mask)
+    l1_loss_map = calculate_l1_depth_lossmap(
+        mu,
+        gt,
+        valid_mask,
+        min_depth=min_depth,
+        max_depth=max_depth,
+    )
     uncertainty = ensure_bchw(uncertainty)
     if uncertainty.shape != l1_loss_map.shape:
         uncertainty = uncertainty.expand_as(l1_loss_map)
@@ -291,7 +313,9 @@ def compute_loss_uncertainty_correlations(
     target: torch.Tensor,
     valid_mask: torch.Tensor,
     uncertainty: torch.Tensor,
-    max_samples: Optional[int] = 100_000
+    max_samples: Optional[int] = 100_000,
+    min_depth: float = 1e-3,
+    max_depth: float = 80.0,
 ) -> Dict[str, torch.Tensor]:
     """
     Compute correlation between per-pixel L1 depth loss and uncertainty.
@@ -300,7 +324,13 @@ def compute_loss_uncertainty_correlations(
         uncertainty:
             Per-pixel uncertainty map.
     """
-    loss_map = calculate_l1_depth_lossmap(mu, target, valid_mask)
+    loss_map = calculate_l1_depth_lossmap(
+        mu,
+        target,
+        valid_mask,
+        min_depth=min_depth,
+        max_depth=max_depth,
+    )
     uncertainty = ensure_bchw(uncertainty)
     if uncertainty.shape != loss_map.shape:
         uncertainty = uncertainty.expand_as(loss_map)
@@ -365,4 +395,3 @@ def compute_loss_uncertainty_correlations(
 #         f"{prefix}_pearson": float(pearson.item()),
 #         f"{prefix}_spearman": float(spearman.item()),
 #     }
-    
