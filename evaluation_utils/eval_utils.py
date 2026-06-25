@@ -77,6 +77,7 @@ def align_relative_depth_and_uncertainty(
     calc_dtype=torch.float32,
 ):
     eps = 1e-8
+    valid_mask = ensure_bchw(valid_mask).bool()
     relative_mask = valid_mask & torch.isfinite(pred) & torch.isfinite(gt) & (gt > 0) & (pred > 0)
     gt_inv = 1.0 / (gt + eps)
 
