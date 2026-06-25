@@ -2,20 +2,20 @@ import torch
 from torch.utils.data import DataLoader, Subset
 import wandb
 from transformers import AutoImageProcessor
-# from dataset.ati_dataset_refactored import (
-#     ATIRealWorldUncertaintyDataset,
-#     ATIRealWorldUncertaintyValidationDataset,
-#     ati_collate_fn,
-#     LIGHT_LEVELS,
-#     MOTION_LEVELS,
-# )
-from dataset.ati_dataset import (
-    ATIRealWorldUncertaintyDataset, 
+from dataset.ati_dataset_refactored import (
+    ATIRealWorldUncertaintyDataset,
     ATIRealWorldUncertaintyValidationDataset,
     ati_collate_fn,
     LIGHT_LEVELS,
-    MOTION_LEVELS
+    MOTION_LEVELS,
 )
+# from dataset.ati_dataset import (
+#     ATIRealWorldUncertaintyDataset, 
+#     ATIRealWorldUncertaintyValidationDataset,
+#     ati_collate_fn,
+#     LIGHT_LEVELS,
+#     MOTION_LEVELS
+# )
 from model.dav2_ati_model import ConditionedGaussianDepthAnythingV2, MODEL_IDS
 from omegaconf import DictConfig, OmegaConf
 import hydra
