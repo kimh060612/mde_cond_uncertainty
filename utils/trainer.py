@@ -75,22 +75,31 @@ def train_one_epoch(
 
         optimizer.zero_grad(set_to_none=True)
 
+        prefix_head = "metric" if model_id.startswith("metric") else "relative"
         with torch.autocast(device_type=device.type, enabled=amp):
             out = model(
                 pixel_values,
-                condition=condition,
+                context=condition,
                 target_size=target_size,
             )
+            scale, shift = compute_align_scale_shift(
+                out["predicted_depth"],
+                depth,
+                valid_mask,
+            )
+            aligned_mean = scale * out["predicted_depth"] + shift
+            aligned_log_var = out["log_variance"] + 2.0 * torch.log(scale.abs().clamp_min(1e-6))
+            
             nll_loss = gaussian_nll_depth_loss(
-                out["mu"],
-                out["log_var"],
+                aligned_mean,
+                aligned_log_var,
                 depth,
                 valid_mask,
                 lambda_smooth_logvar=lambda_smooth_logvar,
             )
             list_loss = image_level_listnet_loss(
-                out["mu"],
-                out["std"],
+                aligned_mean,
+                torch.exp(0.5 * aligned_log_var),
                 depth,
                 valid_mask,
                 temperature=listnet_temperature,
@@ -107,28 +116,20 @@ def train_one_epoch(
         scaler.step(optimizer)
         scaler.update()
         
-        prefix_head = "metric" if model_id.startswith("metric") else "relative"
         if prefix_head == "relative":
             mu_aligned, std_aligned = align_relative_depth_and_uncertainty(
-                out["mu"].detach(),
+                out["predicted_depth"],
                 depth,
                 valid_mask,
-                out["std"].detach(),
-                align_mode="median",
-            )
-            s_mu_aligned, _ = align_relative_depth_and_uncertainty(
-                out["mu"].detach(),
-                depth,
-                valid_mask,
-                out["std"].detach(),
-                align_mode="scale_shift",
+                out["std"],
+                align_mode=relative_align_mode,
             )
         else: 
-            mu_aligned = out["mu"].detach()
-            std_aligned = out["std"].detach()
+            mu_aligned = out["predicted_depth"]
+            std_aligned = out["std"]
         
         batched_metrics = compute_comprehensive_depth_metrics(
-            mu=s_mu_aligned,
+            mu=mu_aligned,
             target=depth,
             valid_mask=valid_mask,
             min_depth=min_depth,

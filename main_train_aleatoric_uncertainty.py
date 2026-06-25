@@ -9,14 +9,8 @@ from dataset.ati_dataset_refactored import (
     LIGHT_LEVELS,
     MOTION_LEVELS,
 )
-# from dataset.ati_dataset import (
-#     ATIRealWorldUncertaintyDataset, 
-#     ATIRealWorldUncertaintyValidationDataset,
-#     ati_collate_fn,
-#     LIGHT_LEVELS,
-#     MOTION_LEVELS
-# )
-from model.dav2_ati_model import ConditionedGaussianDepthAnythingV2, MODEL_IDS
+# from model.dav2_ati_model import ConditionedGaussianDepthAnythingV2, MODEL_IDS
+from model.dav2_unccond_model import DepthAnythingFiLMUncertainty, MODEL_IDS
 from omegaconf import DictConfig, OmegaConf
 import hydra
 from utils.train_utils import *
@@ -134,27 +128,47 @@ def main(cfg: DictConfig):
         collate_fn=ati_collate_fn,
     )
 
-    model = ConditionedGaussianDepthAnythingV2(
+    model = DepthAnythingFiLMUncertainty(
         model_id=model_id,
-        cond_dim=train_set.condition_dim,
-        freeze_backbone=cfg.training.freeze_backbone,
-        min_log_var=cfg.training.min_log_var,
-        max_log_var=cfg.training.max_log_var,
-        uncertainty_width=cfg.model.uncertainty_width,
-        uncertainty_blocks=cfg.model.uncertainty_blocks,
-        uncertainty_dropout=cfg.model.uncertainty_dropout,
+        context_dim=train_set.condition_dim,
+        min_log_variance=cfg.training.min_log_var,
+        max_log_variance=cfg.training.max_log_var,
+        uncertainty_channels=cfg.model.uncertainty_width,
+        film_hidden_dim=cfg.model.uncertainty_blocks,
+        detach_uncertainty_feature=cfg.training.detach_uncertainty_feature,
     ).to(device)
+    # model = ConditionedGaussianDepthAnythingV2(
+    #     model_id=model_id,
+    #     cond_dim=train_set.condition_dim,
+    #     freeze_backbone=cfg.training.freeze_backbone,
+    #     min_log_var=cfg.training.min_log_var,
+    #     max_log_var=cfg.training.max_log_var,
+    #     uncertainty_width=cfg.model.uncertainty_width,
+    #     uncertainty_blocks=cfg.model.uncertainty_blocks,
+    #     uncertainty_dropout=cfg.model.uncertainty_dropout,
+    # ).to(device)
     
-    backbone_params, uncertainty_params = count_model_parameters(model)
-    param_groups = []
-    if backbone_params:
-        param_groups.append({"name": "backbone", "params": backbone_params, "lr": cfg.training.lr_backbone})
-    if uncertainty_params:
-        param_groups.append({"name": "uncertainty", "params": uncertainty_params, "lr": cfg.training.lr_uncertainty})
-    if not param_groups:
-        raise ValueError("No trainable parameters found")
+    
+    # param_groups = []
+    # if backbone_params:
+    #     param_groups.append({"name": "backbone", "params": backbone_params, "lr": cfg.training.lr_backbone})
+    # if uncertainty_params:
+    #     param_groups.append({"name": "uncertainty", "params": uncertainty_params, "lr": cfg.training.lr_uncertainty})
+    # if not param_groups:
+    #     raise ValueError("No trainable parameters found")
+    # optimizer = torch.optim.AdamW(param_groups, weight_decay=cfg.training.weight_decay)
+    count_model_param_finetune(model)
+    optimizer = torch.optim.AdamW(
+        [
+            { "params": model.depth_model.neck.parameters(), "lr": cfg.training.lr_backbone },
+            { "params": model.depth_model.head.parameters(), "lr": cfg.training.lr_backbone },
+            { "params": model.uncertainty_projection.parameters(), "lr": cfg.training.lr_uncertainty },
+            { "params": model.film_generator.parameters(), "lr": cfg.training.lr_uncertainty },
+            { "params": model.uncertainty_head.parameters(), "lr": cfg.training.lr_uncertainty },
+        ],
+        weight_decay=cfg.training.weight_decay,
+    )
 
-    optimizer = torch.optim.AdamW(param_groups, weight_decay=cfg.training.weight_decay)
     scaler = torch.amp.GradScaler("cuda", enabled=amp)
 
     best_abs_rel_correlation = float("-inf")

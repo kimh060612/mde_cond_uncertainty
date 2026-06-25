@@ -76,8 +76,8 @@ def align_relative_depth_and_uncertainty(
     align_mode: str = "scale_shift",
     calc_dtype=torch.float32,
 ):
-    pred = ensure_bchw(pred.detach()) # [B, 1, H, W]
-    gt = ensure_bchw(gt.detach()) # [B, 1, H, W]
+    pred = ensure_bchw(pred) # [B, 1, H, W]
+    gt = ensure_bchw(gt) # [B, 1, H, W]
     valid_mask = ensure_bchw(valid_mask).bool()
     calc_dtype = torch.float64 if pred.dtype == torch.float64 or gt.dtype == torch.float64 else torch.float32
     pred = pred.to(dtype=calc_dtype)
@@ -97,7 +97,7 @@ def align_relative_depth_and_uncertainty(
         gt_inv_median = masked_median(gt_inv, relative_mask)
         scale = gt_inv_median / (pred_median + eps)
         pred_aligned = pred * scale.view(-1, 1, 1, 1)
-        sigma_aligned = sigma * scale.view(-1, 1, 1, 1) if sigma is not None else None
+        safe_inv_depth = pred_aligned.clamp_min(1e-6)
     elif align_mode == "scale_shift":
         x = torch.where(relative_mask, pred, torch.zeros_like(pred))
         y = torch.where(relative_mask, gt_inv, torch.zeros_like(gt_inv))
@@ -122,13 +122,15 @@ def align_relative_depth_and_uncertainty(
             torch.zeros_like(valid_counts),
         )
         pred_aligned = pred * scale.view(-1, 1, 1, 1) + shift.view(-1, 1, 1, 1)
-        sigma_aligned = sigma * scale.view(-1, 1, 1, 1) + shift.view(-1, 1, 1, 1) if sigma is not None else None
+        safe_inv_depth = pred_aligned.clamp_min(1e-6)
     else:
         raise ValueError(f"Unknown align_mode: {align_mode}")
 
-    pred_depth = 1.0 / pred_aligned.clamp_min(1e-6)
+    pred_depth = 1.0 / safe_inv_depth
+    sigma_aligned = sigma.to(calc_dtype) * scale.abs().view(-1, 1, 1, 1) if sigma is not None else None
+    sigma_depth = sigma_aligned / safe_inv_depth.square()
     if sigma_aligned is not None:
-        return pred_depth, sigma_aligned
+        return pred_depth, sigma_depth
     else:
         return pred_depth
 

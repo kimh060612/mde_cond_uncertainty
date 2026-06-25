@@ -288,23 +288,19 @@ def compute_vector_masked_correlations(
 @torch.no_grad()
 def compute_loss_uncertainty_correlations(
     mu: torch.Tensor,
-    log_var: torch.Tensor,
     target: torch.Tensor,
     valid_mask: torch.Tensor,
-    uncertainty: Optional[torch.Tensor] = None,
+    uncertainty: torch.Tensor,
     max_samples: Optional[int] = 100_000
 ) -> Dict[str, torch.Tensor]:
     """
     Compute correlation between per-pixel L1 depth loss and uncertainty.
 
     Args:
-        uncertainty_kind:
-            Used only when ``uncertainty`` is None. One of "std", "var", or
-            "log_var".
+        uncertainty:
+            Per-pixel uncertainty map.
     """
     loss_map = calculate_l1_depth_lossmap(mu, target, valid_mask)
-    if uncertainty is None:
-        uncertainty = torch.exp(0.5 * log_var)
     uncertainty = ensure_bchw(uncertainty)
     if uncertainty.shape != loss_map.shape:
         uncertainty = uncertainty.expand_as(loss_map)
