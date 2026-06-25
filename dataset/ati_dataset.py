@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from PIL import Image
 from torch.utils.data import Dataset
-
+from tqdm import tqdm
 
 SPEED_LEVELS = ("slow", "fast")
 LIGHT_LEVELS = ("dark", "dim", "normal")
@@ -230,7 +230,7 @@ class ATIRealWorldDepthDataset(Dataset):
             raise FileNotFoundError(f"Dataset root does not exist: {self.root_dir}")
 
         items = []
-        for scene_dir in sorted(self.root_dir.iterdir()):
+        for scene_dir in tqdm(sorted(self.root_dir.iterdir()), desc="Scanning scenes"):
             if not scene_dir.is_dir():
                 continue
 
@@ -240,21 +240,19 @@ class ATIRealWorldDepthDataset(Dataset):
 
             scene_prefix, light, speed, topology = parsed_scene
             if self.topologies is not None and topology not in self.topologies:
-                print(scene_dir.name, "does not match any known scene prefixes. Skipping....")
+                print(scene_dir.name, "does not match any known scene prefixes. Skipping....", topology, self.topologies)
                 continue
             
             if light not in self.light_to_idx or speed not in self.speed_to_idx:
-                print(scene_dir.name, "does not match any known scene prefixes. Skipping....")
+                print(scene_dir.name, "does not match any known scene prefixes. Skipping....", light, speed, self.light_to_idx, self.speed_to_idx)
                 continue
 
             for exposure_dir in sorted(scene_dir.iterdir()):
                 if not exposure_dir.is_dir():
-                    print(exposure_dir.name, "does not match any known scene prefixes. Skipping....")
                     continue
 
                 parsed_exposure = parse_exposure_dir_name(exposure_dir.name)
                 if parsed_exposure is None:
-                    print(exposure_dir.name, "does not match any known scene prefixes. Skipping....")
                     continue
 
                 exposure, gain = parsed_exposure
@@ -263,7 +261,6 @@ class ATIRealWorldDepthDataset(Dataset):
                         not lap_dir.is_dir()
                         or re.fullmatch(r"lap_\d+", lap_dir.name) is None
                     ):
-                        print(lap_dir.name, "does not match any known scene prefixes. Skipping....")
                         continue
                     
                     rgb_files = _index_files_by_stem(lap_dir / "rgb", [".png"])
