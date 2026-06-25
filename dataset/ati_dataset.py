@@ -11,9 +11,9 @@ from PIL import Image
 from torch.utils.data import Dataset
 from tqdm import tqdm
 
-SPEED_LEVELS = ("slow", "fast")
+# SPEED_LEVELS = ("slow", "fast")
 LIGHT_LEVELS = ("dark", "dim", "normal")
-MOTION_LEVELS = ("stop", "slow", "fast", "rotate", "spin")
+MOTION_LEVELS = ("slow", "fast") # ("stop", "slow", "fast", "rotate", "spin")
 SCENE_PREFIXES = ("comlab_scene2", "realsense_scene")
 TRAIN_SCENE_PREFIX = "comlab_scene"
 VALIDATION_SCENE_PREFIX = "val_comlab_scene"
