@@ -183,6 +183,7 @@ class ATIRealWorldDepthDataset(Dataset):
         self.light_levels = tuple(light_levels)
         self.speed_levels = tuple(speed_levels)
         self.scene_prefixes = tuple([self.scene_prefix] + list(scene_prefixes))
+        print(self.scene_prefix, self.scene_prefixes)
         self.topologies = tuple(topologies) if topologies is not None else None
         self.light_to_idx = {name: idx for idx, name in enumerate(self.light_levels)}
         self.speed_to_idx = {name: idx for idx, name in enumerate(self.speed_levels)}
@@ -226,10 +227,8 @@ class ATIRealWorldDepthDataset(Dataset):
             raise FileNotFoundError(f"Dataset root does not exist: {self.root_dir}")
 
         items = []
-        print(self.root_dir.name)
         for scene_dir in sorted(self.root_dir.iterdir()):
             if not scene_dir.is_dir():
-                print(scene_dir.name, "is not a directory. Skipping....")
                 continue
 
             parsed_scene = _parse_scene_dir_name(scene_dir.name, self.scene_prefixes)
