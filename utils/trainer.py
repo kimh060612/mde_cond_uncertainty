@@ -108,6 +108,7 @@ def train_one_epoch(
         scaler.update()
         
         prefix_head = "metric" if model_id.startswith("metric") else "relative"
+        print(f"prefix_head: {prefix_head}, model_id: {model_id}, model_id.startswith('metric'): {model_id.startswith('metric')}")
         if prefix_head == "relative":
             mu_aligned, std_aligned = align_relative_depth_and_uncertainty(
                 out["mu"].detach(),

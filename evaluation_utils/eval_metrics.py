@@ -48,17 +48,15 @@ def compute_comprehensive_depth_metrics(
     pred = ensure_bchw(mu.detach())
     gt = ensure_bchw(target.detach())
     valid_mask = ensure_bchw(valid_mask).bool()
-
+    calc_dtype = torch.float64 if mu.dtype == torch.float64 or target.dtype == torch.float64 else torch.float32
+    pred = pred.to(dtype=calc_dtype)
+    gt = gt.to(dtype=calc_dtype)
     if pred.shape != gt.shape:
         raise ValueError(...)
     if valid_mask.shape != pred.shape:
         valid_mask = valid_mask.expand_as(pred)
     
-    calc_dtype = torch.float64 if mu.dtype == torch.float64 or target.dtype == torch.float64 else torch.float32
-    pred = mu.to(dtype=calc_dtype)
-    gt = target.to(dtype=calc_dtype)
     eps = 1e-8
-
     valid_mask = valid_mask.bool()
     metric_mask = valid_mask & torch.isfinite(pred) & torch.isfinite(gt) & (gt > 0)
     return metric_dict(
