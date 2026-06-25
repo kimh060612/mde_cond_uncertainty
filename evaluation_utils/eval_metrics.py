@@ -87,7 +87,7 @@ def compute_sparsification_ause_metrics(
     failure indicator, so lower AUSE is better for both metrics.
     """
     
-    abs_rel_error, a1_error = depth_error_maps(mu, target, valid_mask)
+    abs_rel_error, a1_error = depth_error_maps(mu, target)
     uncertainty = ensure_bchw(uncertainty)
     if uncertainty.shape != abs_rel_error.shape:
         uncertainty = uncertainty.expand_as(abs_rel_error)
@@ -148,7 +148,7 @@ def compute_sparsification_aurg_metrics(
     ``aurg_abs_rel`` uses per-pixel AbsRel error. ``aurg_a1`` uses the a1
     failure indicator, so higher AURG is better for both metrics.
     """
-    abs_rel_error, a1_error = depth_error_maps(mu, target, valid_mask)
+    abs_rel_error, a1_error = depth_error_maps(mu, target)
     uncertainty = ensure_bchw(uncertainty)
     if uncertainty.shape != abs_rel_error.shape:
         uncertainty = uncertainty.expand_as(abs_rel_error)
