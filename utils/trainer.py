@@ -126,8 +126,6 @@ def train_one_epoch(
             valid_mask=valid_mask,
             min_depth=min_depth,
             max_depth=max_depth,
-            align_mode=relative_align_mode,
-            depth_model_type=prefix_head,
         )
         ause_metrics = compute_sparsification_ause_metrics(
             mu_aligned,
@@ -135,7 +133,6 @@ def train_one_epoch(
             valid_mask,
             uncertainty=std_aligned,
             max_samples=correlation_max_samples,
-            model_type=prefix_head
         )
         aurg_metrics = compute_sparsification_aurg_metrics(
             mu_aligned,
@@ -143,10 +140,8 @@ def train_one_epoch(
             valid_mask,
             uncertainty=std_aligned,
             max_samples=correlation_max_samples,
-            model_type=prefix_head
         )
         
-        prefix_head = "metric_depth" if model_id.startswith("metric") else "relative_depth"
         running_loss += loss.item()
         running_nll_loss += nll_loss.item()
         running_list_loss += list_loss.item()

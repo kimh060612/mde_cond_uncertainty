@@ -25,7 +25,6 @@ def compute_comprehensive_depth_metrics(
     mu: torch.Tensor,
     target: torch.Tensor,
     valid_mask: torch.Tensor,
-    depth_model_type: str,
     min_depth=1e-3,
     max_depth=80.0,
 ) -> Dict[str, torch.Tensor]:
@@ -38,10 +37,8 @@ def compute_comprehensive_depth_metrics(
             - mu: Predicted depth map tensor of shape [B, 1, H, W]
             - target: Ground truth depth map tensor of shape [B, 1, H, W]
             - valid_mask: Boolean tensor indicating valid pixels of shape [B, 1, H, W]
-            - depth_model_type: str, either "metric" or "relative"
             - min_depth: Minimum depth value for clamping
-            - max_depth: Maximum depth value for clamping
-            - align_mode: Alignment mode for relative depth metrics, either "median" or "scale_shift"       
+            - max_depth: Maximum depth value for clamping 
     
         Output:
             - metrics: Dictionary containing computed depth metrics 
@@ -61,8 +58,6 @@ def compute_comprehensive_depth_metrics(
     pred = pred.to(dtype=calc_dtype)
     gt = gt.to(dtype=calc_dtype)
     eps = 1e-8
-
-    depth_model_type = depth_model_type.lower()
 
     metric_mask = valid_mask & torch.isfinite(pred) & torch.isfinite(gt) & (gt > 0)
     return metric_dict(

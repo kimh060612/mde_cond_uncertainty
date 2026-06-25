@@ -223,8 +223,6 @@ def validate(
             valid_mask=valid_mask,
             min_depth=min_depth,
             max_depth=max_depth,
-            align_mode=relative_align_mode,
-            depth_model_type=prefix_head,
         )
         correlations = compute_loss_uncertainty_correlations(
             mu_aligned.detach(),
@@ -232,31 +230,27 @@ def validate(
             depth,
             valid_mask,
             uncertainty=std_aligned.detach(),
-            max_samples=correlation_max_samples,
-            model_type=prefix_head
+            max_samples=correlation_max_samples
         )
         ause_metrics = compute_sparsification_ause_metrics(
             mu_aligned.detach(),
             depth,
             valid_mask,
             uncertainty=std_aligned.detach(),
-            max_samples=correlation_max_samples,
-            model_type=prefix_head
+            max_samples=correlation_max_samples
         )
         aurg_metrics = compute_sparsification_aurg_metrics(
             mu_aligned.detach(),
             depth,
             valid_mask,
             uncertainty=std_aligned.detach(),
-            max_samples=correlation_max_samples,
-            model_type=prefix_head
+            max_samples=correlation_max_samples
         )
         aru_rmsu_metrics = compute_aru_rmsu_metrics(
             mu_aligned.detach(),
             depth,
             valid_mask,
-            uncertainty=std_aligned.detach(),
-            model_type=prefix_head
+            uncertainty=std_aligned.detach()
         )
         uncertainty_map = std_aligned.detach()
         uncertainty_mask = valid_mask.bool()
