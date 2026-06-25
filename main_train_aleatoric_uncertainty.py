@@ -126,22 +126,6 @@ def main(cfg: DictConfig):
         pin_memory=pin_memory,
         collate_fn=ati_collate_fn,
     )
-    # seen_val_loader = DataLoader(
-    #     Subset(val_set, seen_val_indices),
-    #     batch_size=cfg.training.batch_size,
-    #     shuffle=False,
-    #     num_workers=cfg.dataset.num_workers,
-    #     pin_memory=pin_memory,
-    #     collate_fn=ati_collate_fn,
-    # )
-    # unseen_val_loader = DataLoader(
-    #     Subset(val_set, unseen_val_indices),
-    #     batch_size=cfg.training.batch_size,
-    #     shuffle=False,
-    #     num_workers=cfg.dataset.num_workers,
-    #     pin_memory=pin_memory,
-    #     collate_fn=ati_collate_fn,
-    # )
 
     model = ConditionedGaussianDepthAnythingV2(
         model_id=model_id,

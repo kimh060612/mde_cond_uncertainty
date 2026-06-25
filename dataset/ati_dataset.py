@@ -64,12 +64,12 @@ def _parse_scene_dir_name(name: str, scene_prefixes: Sequence[str]):
             continue
 
         suffix = name[len(stem):]
-        parts = suffix.rsplit("_", maxsplit=1)
-        if len(parts) != 2:
+        parts = suffix.rsplit("_", maxsplit=2)
+        if len(parts) != 3:
             return None
 
-        light, speed = parts
-        return prefix, light, speed
+        light, speed, topology = parts[:3]
+        return prefix, light, speed, topology
 
     return None
 
@@ -160,6 +160,7 @@ class ATIRealWorldDepthDataset(Dataset):
         speed_levels: Sequence[str] = SPEED_LEVELS,
         scene_prefixes: Sequence[str] = SCENE_PREFIXES,
         max_samples: Optional[int] = None,
+        topologies: Optional[Sequence[str]] = None,
     ):
         self.root_dir = Path(root_dir)
         self.image_processor = image_processor
@@ -173,6 +174,7 @@ class ATIRealWorldDepthDataset(Dataset):
         self.light_levels = tuple(light_levels)
         self.speed_levels = tuple(speed_levels)
         self.scene_prefixes = tuple(scene_prefixes)
+        self.topologies = tuple(topologies) if topologies is not None else None
         self.light_to_idx = {name: idx for idx, name in enumerate(self.light_levels)}
         self.speed_to_idx = {name: idx for idx, name in enumerate(self.speed_levels)}
         self.condition_names = (
@@ -223,7 +225,10 @@ class ATIRealWorldDepthDataset(Dataset):
             if parsed_scene is None:
                 continue
 
-            scene_prefix, light, speed = parsed_scene
+            scene_prefix, light, speed, topology = parsed_scene
+            if self.topologies is not None and topology not in self.topologies:
+                continue
+            
             if light not in self.light_to_idx or speed not in self.speed_to_idx:
                 continue
 
