@@ -3,7 +3,7 @@ dataset:
   dataset_root: /home/kimh060612/ati_workspace/realworld_dataset
   min_depth: 1e-3
   max_depth: 10.0
-  min_valid_depth_ratio: 0.7
+  min_valid_depth_ratio: 0.9
   output_dir: ./da2_ati_cond_uncertainty_ckpt
   num_workers: 8
   train_topologies:
