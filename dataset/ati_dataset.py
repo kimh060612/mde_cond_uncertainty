@@ -17,8 +17,6 @@ MOTION_LEVELS = ("stop", "slow", "fast", "rotate", "spin")
 SCENE_PREFIXES = ("comlab_scene2", "realsense_scene")
 TRAIN_SCENE_PREFIX = "comlab_scene"
 VALIDATION_SCENE_PREFIX = "val_comlab_scene"
-IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp")
-DEPTH_EXTENSIONS = (".npy", ".png", ".tif", ".tiff", ".exr")
 ATI_PIXEL_VALUES_IDX = 0
 ATI_DEPTH_IDX = 1
 ATI_VALID_MASK_IDX = 2
@@ -252,24 +250,32 @@ class ATIRealWorldDepthDataset(Dataset):
                     continue
 
                 exposure, gain = parsed_exposure
-                rgb_files = _index_files_by_stem(exposure_dir / "rgb", IMAGE_EXTENSIONS)
-                depth_files = _index_files_by_stem(exposure_dir / "depth", DEPTH_EXTENSIONS)
-
-                for frame_id in sorted(set(rgb_files) & set(depth_files)):
-                    items.append(
-                        ATIFrameItem(
-                            rgb_path=rgb_files[frame_id],
-                            depth_path=depth_files[frame_id],
-                            scene_name=scene_dir.name,
-                            scene_prefix=scene_prefix,
-                            light=light,
-                            speed=speed,
-                            exposure=exposure,
-                            gain=gain,
-                            frame_id=frame_id,
-                            topology=topology
+                for lap_dir in sorted(exposure_dir.iterdir()):
+                    if (
+                        not lap_dir.is_dir()
+                        or re.fullmatch(r"lap_\d+", lap_dir.name) is None
+                    ):
+                        continue
+                    
+                    rgb_files = _index_files_by_stem(lap_dir / "rgb", [".png"])
+                    depth_files = _index_files_by_stem(lap_dir / "depth", [".npy"])
+                    paired_frame_ids = set(rgb_files) & set(depth_files)
+                    
+                    for frame_id in sorted(paired_frame_ids):
+                        items.append(
+                            ATIFrameItem(
+                                rgb_path=rgb_files[frame_id],
+                                depth_path=depth_files[frame_id],
+                                scene_name=scene_dir.name,
+                                scene_prefix=scene_prefix,
+                                light=light,
+                                speed=speed,
+                                exposure=exposure,
+                                gain=gain,
+                                frame_id=frame_id,
+                                topology=topology
+                            )
                         )
-                    )
 
         return items
 
