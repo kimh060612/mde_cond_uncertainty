@@ -11,14 +11,17 @@ MODEL_IDS = {
     # relative depth
     "small": "depth-anything/Depth-Anything-V2-Small-hf",
     "base": "depth-anything/Depth-Anything-V2-Base-hf",
+    "large": "depth-anything/Depth-Anything-V2-Large-hf",
 
     # metric depth, indoor
     "metric-indoor-small": "depth-anything/Depth-Anything-V2-Metric-Indoor-Small-hf",
     "metric-indoor-base": "depth-anything/Depth-Anything-V2-Metric-Indoor-Base-hf",
+    "metric-indoor-large": "depth-anything/Depth-Anything-V2-Metric-Indoor-Large-hf",
 
     # metric depth, outdoor
     "metric-outdoor-small": "depth-anything/Depth-Anything-V2-Metric-Outdoor-Small-hf",
     "metric-outdoor-base": "depth-anything/Depth-Anything-V2-Metric-Outdoor-Base-hf",
+    "metric-outdoor-large": "depth-anything/Depth-Anything-V2-Metric-Outdoor-Large-hf",
 }
 
 
