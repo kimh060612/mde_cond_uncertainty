@@ -190,6 +190,7 @@ class ATIRealWorldUncertaintyBaseDataset(Dataset):
         }
         for scene_dir in tqdm(sorted(self.root_dir.iterdir()), desc="Scanning scenes"):
             if not scene_dir.is_dir():
+                print(scene_dir.name, "is not a directory. Skipping....")
                 continue
 
             parsed_scene = parse_scene_dir_name(
