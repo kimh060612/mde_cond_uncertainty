@@ -2,12 +2,13 @@ from typing import Tuple, Dict
 import torch
 from model.loss_fn import gaussian_nll_depth_loss, image_level_listnet_loss
 from evaluation_utils.eval_utils import (
-    compute_comprehensive_depth_metrics,
+    align_relative_depth_and_uncertainty,
     _mean_finite_metrics,
 )
-from evaluation_utils.correlation_utils import (
+from evaluation_utils.eval_metrics import (
     compute_sparsification_ause_metrics,
-    compute_sparsification_aurg_metrics
+    compute_sparsification_aurg_metrics,
+    compute_comprehensive_depth_metrics
 )
 from tqdm.auto import tqdm
 from utils.train_utils import *
@@ -107,8 +108,20 @@ def train_one_epoch(
         scaler.update()
         
         prefix_head = "metric" if model_id.startswith("metric") else "relative"
+        if prefix_head == "relative":
+            mu_aligned, std_aligned = align_relative_depth_and_uncertainty(
+                out["mu"].detach(),
+                depth,
+                valid_mask,
+                out["std"].detach(),
+                align_mode=relative_align_mode,
+            )
+        else: 
+            mu_aligned = out["mu"].detach()
+            std_aligned = out["std"].detach()
+        
         batched_metrics = compute_comprehensive_depth_metrics(
-            mu=out["mu"].detach(),
+            mu=mu_aligned,
             target=depth,
             valid_mask=valid_mask,
             min_depth=min_depth,
@@ -117,18 +130,18 @@ def train_one_epoch(
             depth_model_type=prefix_head,
         )
         ause_metrics = compute_sparsification_ause_metrics(
-            out["mu"].detach(),
+            mu_aligned,
             depth,
             valid_mask,
-            uncertainty=out["std"].detach(),
+            uncertainty=std_aligned,
             max_samples=correlation_max_samples,
             model_type=prefix_head
         )
         aurg_metrics = compute_sparsification_aurg_metrics(
-            out["mu"].detach(),
+            mu_aligned,
             depth,
             valid_mask,
-            uncertainty=out["std"].detach(),
+            uncertainty=std_aligned,
             max_samples=correlation_max_samples,
             model_type=prefix_head
         )

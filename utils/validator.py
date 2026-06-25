@@ -2,16 +2,10 @@ import torch
 from torch.utils.data import DataLoader, Subset
 from utils.train_utils import *
 from model.loss_fn import gaussian_nll_depth_loss, image_level_listnet_loss
+from evaluation_utils.eval_metrics import *
 from evaluation_utils.eval_utils import (
-    compute_comprehensive_depth_metrics,
-)
-from evaluation_utils.correlation_utils import (
-    compute_loss_uncertainty_correlations,
-    compute_sparsification_ause_metrics,
-    compute_sparsification_aurg_metrics,
-    compute_masked_correlations,
-    compute_aru_rmsu_metrics
-)
+    align_relative_depth_and_uncertainty,
+) 
 from tqdm.auto import tqdm
 
 def _metric_values_to_tensor(value):
@@ -211,8 +205,20 @@ def validate(
             loss = nll_loss + list_loss_weight * list_loss
 
         prefix_head = "metric" if model_id.startswith("metric") else "relative"
+        if prefix_head == "relative":
+            mu_aligned, std_aligned = align_relative_depth_and_uncertainty(
+                out["mu"].detach(),
+                depth,
+                valid_mask,
+                out["std"].detach(),
+                align_mode=relative_align_mode,
+            )
+        else: 
+            mu_aligned = out["mu"].detach()
+            std_aligned = out["std"].detach()
+        
         batched_metrics = compute_comprehensive_depth_metrics(
-            mu=out["mu"].detach(),
+            mu=mu_aligned.detach(),
             target=depth,
             valid_mask=valid_mask,
             min_depth=min_depth,
@@ -221,38 +227,38 @@ def validate(
             depth_model_type=prefix_head,
         )
         correlations = compute_loss_uncertainty_correlations(
-            out["mu"].detach(),
+            mu_aligned.detach(),
             out["log_var"].detach(),
             depth,
             valid_mask,
-            uncertainty=out["std"].detach(),
+            uncertainty=std_aligned.detach(),
             max_samples=correlation_max_samples,
             model_type=prefix_head
         )
         ause_metrics = compute_sparsification_ause_metrics(
-            out["mu"].detach(),
+            mu_aligned.detach(),
             depth,
             valid_mask,
-            uncertainty=out["std"].detach(),
+            uncertainty=std_aligned.detach(),
             max_samples=correlation_max_samples,
             model_type=prefix_head
         )
         aurg_metrics = compute_sparsification_aurg_metrics(
-            out["mu"].detach(),
+            mu_aligned.detach(),
             depth,
             valid_mask,
-            uncertainty=out["std"].detach(),
+            uncertainty=std_aligned.detach(),
             max_samples=correlation_max_samples,
             model_type=prefix_head
         )
         aru_rmsu_metrics = compute_aru_rmsu_metrics(
-            out["mu"].detach(),
+            mu_aligned.detach(),
             depth,
             valid_mask,
-            uncertainty=out["std"].detach(),
+            uncertainty=std_aligned.detach(),
             model_type=prefix_head
         )
-        uncertainty_map = out["std"].detach()
+        uncertainty_map = std_aligned.detach()
         uncertainty_mask = valid_mask.bool()
         if uncertainty_mask.ndim == 3:
             uncertainty_mask = uncertainty_mask.unsqueeze(1)
@@ -308,3 +314,12 @@ def validate(
     unseen_metrics = _finalize_validation_accumulator(unseen_accumulator)
 
     return total_metrics, seen_metrics, unseen_metrics
+
+# compute_comprehensive_depth_metrics,
+# from evaluation_utils.correlation_utils import (
+#     compute_loss_uncertainty_correlations,
+#     compute_sparsification_ause_metrics,
+#     compute_sparsification_aurg_metrics,
+#     compute_masked_correlations,
+#     compute_aru_rmsu_metrics
+# )
