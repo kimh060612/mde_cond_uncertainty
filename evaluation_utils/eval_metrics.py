@@ -45,6 +45,15 @@ def compute_comprehensive_depth_metrics(
             Key: "abs_rel", "rmse", "sq_rel", "a1", "a2", "a3"
             Values: Tensor of shape [B] containing the metric for each image in the batch
     """
+    pred = ensure_bchw(mu.detach())
+    gt = ensure_bchw(target.detach())
+    valid_mask = ensure_bchw(valid_mask).bool()
+
+    if pred.shape != gt.shape:
+        raise ValueError(...)
+    if valid_mask.shape != pred.shape:
+        valid_mask = valid_mask.expand_as(pred)
+    
     calc_dtype = torch.float64 if mu.dtype == torch.float64 or target.dtype == torch.float64 else torch.float32
     pred = mu.to(dtype=calc_dtype)
     gt = target.to(dtype=calc_dtype)
