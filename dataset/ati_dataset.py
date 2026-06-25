@@ -11,9 +11,12 @@ from PIL import Image
 from torch.utils.data import Dataset
 
 
-LIGHT_LEVELS = ("dark", "dim", "normal")
 SPEED_LEVELS = ("slow", "fast")
+LIGHT_LEVELS = ("dark", "dim", "normal")
+MOTION_LEVELS = ("stop", "slow", "fast", "rotate", "spin")
 SCENE_PREFIXES = ("comlab_scene2", "realsense_scene")
+TRAIN_SCENE_PREFIX = "comlab_scene"
+VALIDATION_SCENE_PREFIX = "val_comlab_scene"
 IMAGE_EXTENSIONS = (".png", ".jpg", ".jpeg", ".bmp")
 DEPTH_EXTENSIONS = (".npy", ".png", ".tif", ".tiff", ".exr")
 ATI_PIXEL_VALUES_IDX = 0
@@ -55,7 +58,13 @@ class ATIFrameItem:
     exposure: float
     gain: float
     frame_id: str
+    topology: Optional[str] = None
 
+def _topology_number(topology: str) -> int:
+    topology_suffix = topology[len("topology"):]
+    if not topology_suffix.isdigit():
+        raise ValueError(f"Expected numeric topology name, got {topology}")
+    return int(topology_suffix)
 
 def _parse_scene_dir_name(name: str, scene_prefixes: Sequence[str]):
     for prefix in scene_prefixes:
@@ -144,7 +153,9 @@ class ATIRealWorldDepthDataset(Dataset):
     Returned condition vector:
         [light one-hot, speed one-hot, normalized exposure, normalized gain]
     """
-
+    scene_prefix = ""
+    split_name = ""
+    
     def __init__(
         self,
         root_dir: str = "/media/michael/ssd1/AIoT_ATI/realworld_dataset",
@@ -157,15 +168,15 @@ class ATIRealWorldDepthDataset(Dataset):
         max_depth: float = 10.0,
         min_valid_depth_ratio: float = 0.3,
         light_levels: Sequence[str] = LIGHT_LEVELS,
-        speed_levels: Sequence[str] = SPEED_LEVELS,
-        scene_prefixes: Sequence[str] = SCENE_PREFIXES,
+        speed_levels: Sequence[str] = MOTION_LEVELS,
+        scene_prefixes: Sequence[str] = [],
         max_samples: Optional[int] = None,
         topologies: Optional[Sequence[str]] = None,
     ):
         self.root_dir = Path(root_dir)
         self.image_processor = image_processor
         self.image_size = image_size
-        self.split = split
+        self.split = self.split_name
         self.val_ratio = val_ratio
         self.split_seed = split_seed
         self.min_depth = min_depth
@@ -173,7 +184,7 @@ class ATIRealWorldDepthDataset(Dataset):
         self.min_valid_depth_ratio = min_valid_depth_ratio
         self.light_levels = tuple(light_levels)
         self.speed_levels = tuple(speed_levels)
-        self.scene_prefixes = tuple(scene_prefixes)
+        self.scene_prefixes = tuple([self.scene_prefix] + list(scene_prefixes))
         self.topologies = tuple(topologies) if topologies is not None else None
         self.light_to_idx = {name: idx for idx, name in enumerate(self.light_levels)}
         self.speed_to_idx = {name: idx for idx, name in enumerate(self.speed_levels)}
@@ -256,6 +267,7 @@ class ATIRealWorldDepthDataset(Dataset):
                             exposure=exposure,
                             gain=gain,
                             frame_id=frame_id,
+                            topology=topology
                         )
                     )
 
@@ -332,10 +344,24 @@ class ATIRealWorldDepthDataset(Dataset):
                     float(self.speed_to_idx[item.speed]),
                     item.exposure,
                     item.gain,
+                    float(_topology_number(item.topology)),
                 ],
                 dtype=torch.float32,
             ),
         )
+
+class ATIRealWorldUncertaintyDataset(ATIRealWorldDepthDataset):
+    """Training-only dataset backed by comlab_scene_* directories."""
+
+    scene_prefix = TRAIN_SCENE_PREFIX
+    split_name = "train"
+
+
+class ATIRealWorldUncertaintyValidationDataset(ATIRealWorldDepthDataset):
+    """Validation-only dataset backed by val_comlab_scene_* directories."""
+
+    scene_prefix = VALIDATION_SCENE_PREFIX
+    split_name = "validation"
 
 
 def ati_collate_fn(batch: List[ATISample]) -> Optional[ATIBatch]:
@@ -358,75 +384,3 @@ def ati_collate_fn(batch: List[ATISample]) -> Optional[ATIBatch]:
         torch.stack([sample[ATI_CONDITION_IDX] for sample in batch], dim=0),
         torch.stack([sample[ATI_CONDITION_STATS_IDX] for sample in batch], dim=0),
     )
-
-
-class RGBDepthDataset(Dataset):
-    def __init__(
-        self,
-        csv_path: str,
-        image_processor,
-        image_size: Optional[Tuple[int, int]] = None,
-        min_depth: float = 1e-3,
-        max_depth: float = 80.0,
-    ):
-        self.items = []
-        self.image_processor = image_processor
-        self.image_size = image_size
-        self.min_depth = min_depth
-        self.max_depth = max_depth
-
-        with open(csv_path, "r") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                self.items.append((row["image_path"], row["depth_path"]))
-
-    def __len__(self):
-        return len(self.items)
-
-    def load_depth(self, path: str) -> np.ndarray:
-        if path.endswith(".npy"):
-            depth = np.load(path).astype(np.float32)
-        else:
-            depth = np.array(Image.open(path)).astype(np.float32)
-            depth = depth / 1000.0
-        return depth
-
-    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
-        image_path, depth_path = self.items[idx]
-
-        image = Image.open(image_path).convert("RGB")
-        depth = self.load_depth(depth_path)
-
-        if self.image_size is not None:
-            height, width = self.image_size
-            image = image.resize((width, height), Image.BICUBIC)
-            depth_img = Image.fromarray(depth)
-            depth = np.array(depth_img.resize((width, height), Image.NEAREST)).astype(np.float32)
-
-        inputs = self.image_processor(images=image, return_tensors="pt")
-        pixel_values = inputs["pixel_values"].squeeze(0)
-
-        depth = torch.from_numpy(depth).float()
-        valid_mask = torch.isfinite(depth)
-        valid_mask &= depth > self.min_depth
-        valid_mask &= depth < self.max_depth
-
-        depth = torch.nan_to_num(depth, nan=0.0, posinf=0.0, neginf=0.0)
-
-        return {
-            "pixel_values": pixel_values,
-            "depth": depth,
-            "valid_mask": valid_mask.float(),
-        }
-
-
-def collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
-    pixel_values = torch.stack([x["pixel_values"] for x in batch], dim=0)
-    depths = torch.stack([x["depth"] for x in batch], dim=0)
-    masks = torch.stack([x["valid_mask"] for x in batch], dim=0)
-
-    return {
-        "pixel_values": pixel_values,
-        "depth": depths,
-        "valid_mask": masks,
-    }

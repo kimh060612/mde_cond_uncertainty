@@ -190,7 +190,6 @@ class ATIRealWorldUncertaintyBaseDataset(Dataset):
         }
         for scene_dir in tqdm(sorted(self.root_dir.iterdir()), desc="Scanning scenes"):
             if not scene_dir.is_dir():
-                print(scene_dir.name, "is not a directory. Skipping....")
                 continue
 
             parsed_scene = parse_scene_dir_name(
@@ -206,12 +205,10 @@ class ATIRealWorldUncertaintyBaseDataset(Dataset):
             
             for exposure_dir in sorted(scene_dir.iterdir()):
                 if not exposure_dir.is_dir():
-                    print(exposure_dir.name, "is not a directory. Skipping....")
                     continue
                 
                 parsed_exposure = parse_exposure_dir_name(exposure_dir.name)
                 if parsed_exposure is None:
-                    print(exposure_dir.name, "is not a valid exposure directory name. Skipping....")
                     continue
 
                 exposure, gain = parsed_exposure
@@ -220,7 +217,6 @@ class ATIRealWorldUncertaintyBaseDataset(Dataset):
                         not lap_dir.is_dir()
                         or re.fullmatch(r"lap_\d+", lap_dir.name) is None
                     ):
-                        print(lap_dir.name, "is not a valid lap directory name. Skipping....")
                         continue
 
                     rgb_files = index_files_by_stem(lap_dir / "rgb", [".png"])

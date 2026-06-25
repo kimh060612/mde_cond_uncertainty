@@ -2,12 +2,19 @@ import torch
 from torch.utils.data import DataLoader, Subset
 import wandb
 from transformers import AutoImageProcessor
-from dataset.ati_dataset_refactored import (
-    ATIRealWorldUncertaintyDataset,
+# from dataset.ati_dataset_refactored import (
+#     ATIRealWorldUncertaintyDataset,
+#     ATIRealWorldUncertaintyValidationDataset,
+#     ati_collate_fn,
+#     LIGHT_LEVELS,
+#     MOTION_LEVELS,
+# )
+from dataset.ati_dataset import (
+    ATIRealWorldUncertaintyDataset, 
     ATIRealWorldUncertaintyValidationDataset,
     ati_collate_fn,
     LIGHT_LEVELS,
-    MOTION_LEVELS,
+    MOTION_LEVELS
 )
 from model.dav2_ati_model import ConditionedGaussianDepthAnythingV2, MODEL_IDS
 from omegaconf import DictConfig, OmegaConf
@@ -241,37 +248,3 @@ def main(cfg: DictConfig):
 
 if __name__ == "__main__":
     main()
-
-
-# seen_val_metrics = validate(
-#             epoch=epoch,
-#             model_id=model_id,
-#             model=model,
-#             loader=seen_val_loader,
-#             device=device,
-#             amp=amp,
-#             lambda_smooth_logvar=cfg.training.lambda_smooth_logvar,
-#             list_loss_weight=cfg.training.list_loss_weight,
-#             listnet_temperature=cfg.training.listnet_temperature,
-#             uncertainty_mode=cfg.training.uncertainty_mode,
-#             correlation_max_samples=cfg.training.correlation_max_samples,
-#             min_depth=cfg.dataset.min_depth,
-#             max_depth=cfg.dataset.max_depth,
-#             relative_align_mode=cfg.training.relative_align_mode,
-#         )
-#         unseen_val_metrics = validate(
-#             epoch=epoch,
-#             model_id=model_id,
-#             model=model,
-#             loader=unseen_val_loader,
-#             device=device,
-#             amp=amp,
-#             lambda_smooth_logvar=cfg.training.lambda_smooth_logvar,
-#             list_loss_weight=cfg.training.list_loss_weight,
-#             listnet_temperature=cfg.training.listnet_temperature,
-#             uncertainty_mode=cfg.training.uncertainty_mode,
-#             correlation_max_samples=cfg.training.correlation_max_samples,
-#             min_depth=cfg.dataset.min_depth,
-#             max_depth=cfg.dataset.max_depth,
-#             relative_align_mode=cfg.training.relative_align_mode,
-#         )
