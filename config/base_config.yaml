@@ -18,7 +18,7 @@ dataset:
     - "topology5"
 
 model:
-  model_id: "small"
+  model_id: "metric-indoor-base"
   image_height: 518
   image_width: 518
   uncertainty_width: 32
