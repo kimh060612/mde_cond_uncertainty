@@ -47,4 +47,4 @@ training:
   no_amp: false
   log_interval: 20
   correlation_max_samples: 100000
-  detach_uncertainty_feature: false
+  detach_uncertainty_feature: true
