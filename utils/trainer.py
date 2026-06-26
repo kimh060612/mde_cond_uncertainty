@@ -161,7 +161,7 @@ def train_one_epoch(
         
         running_loss += loss.item()
         running_nll_loss += nll_loss.item()
-        # running_list_loss += list_loss.item()
+        running_list_loss += list_loss.item()
         running_abs_rel += batched_metrics["abs_rel"].mean().item()
         running_rmse += batched_metrics["rmse"].mean().item()
         running_a1 += batched_metrics["a1"].mean().item()
@@ -200,7 +200,7 @@ def train_one_epoch(
     epoch_metrics = {
         "loss": running_loss / n,
         "nll_loss": running_nll_loss / n,
-        # "list_loss": running_list_loss / n,
+        "list_loss": running_list_loss / n,
         "abs_rel": running_abs_rel / n,
         "rmse": running_rmse / n,
         "a1": running_a1 / n,

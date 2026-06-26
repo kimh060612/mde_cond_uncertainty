@@ -11,6 +11,7 @@ from dataset.ati_dataset_refactored import (
 )
 from model.dav2_ati_model import ConditionedGaussianDepthAnythingV2, MODEL_IDS
 from model.dav2_unccond_model import DepthAnythingFiLMUncertainty, MODEL_IDS
+from model.dav2_ati_bias_model import FrozenDepthCameraGaussian
 from omegaconf import DictConfig, OmegaConf
 import hydra
 from utils.train_utils import *
@@ -147,7 +148,17 @@ def main(cfg: DictConfig):
         uncertainty_blocks=cfg.model.uncertainty_blocks,
         uncertainty_dropout=cfg.model.uncertainty_dropout,
     ).to(device)
-    
+    model = FrozenDepthCameraGaussian(
+        model_id=model_id,
+        context_dim=train_set.condition_dim,
+        cache_dir=None,
+        feature_channels=cfg.model.uncertainty_width,
+        hidden_channels=cfg.model.uncertainty_width,
+        # film_hidden_dim=cfg.model.uncertainty_blocks,
+        # max_bias=cfg.training.max_bias,
+        min_log_variance=cfg.training.min_log_var,
+        max_log_variance=cfg.training.max_log_var,
+    ).to(device)
     
     backbone_params = []
     uncertainty_params = []
