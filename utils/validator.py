@@ -236,15 +236,15 @@ def validate(
                 valid_mask,
                 lambda_smooth_logvar=lambda_smooth_logvar,
             )
-            # list_loss = image_level_listnet_loss(
-            #     aligned_mean,
-            #     uncertainty_map,
-            #     depth,
-            #     valid_mask,
-            #     temperature=listnet_temperature,
-            #     uncertainty_mode=uncertainty_mode,
-            # )
-            loss = nll_loss # + list_loss_weight * list_loss
+            list_loss = image_level_listnet_loss(
+                aligned_mean,
+                uncertainty_map,
+                depth,
+                valid_mask,
+                temperature=listnet_temperature,
+                uncertainty_mode=uncertainty_mode,
+            )
+            loss = nll_loss + list_loss_weight * list_loss
 
         mu_aligned = aligned_mean.detach()
         std_aligned = aligned_std.detach()
