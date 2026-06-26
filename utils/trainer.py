@@ -89,15 +89,18 @@ def train_one_epoch(
                     depth,
                     valid_mask,
                     log_var=out["log_variance"],
+                    sigma=out["std"],
                     align_mode=relative_align_mode,
                 )
                 aligned_mean = aligned["depth"]
                 aligned_log_var = aligned["log_var"]
+                aligned_std = aligned["std"]
+                relative_uncertainty = aligned_std / ensure_bchw(depth).clamp_min(min_depth)
             else:
                 aligned_mean = out["predicted_depth"]
                 aligned_log_var = out["log_variance"]
-            aligned_std = torch.exp(0.5 * aligned_log_var)
-            relative_uncertainty = aligned_std / ensure_bchw(depth).clamp_min(min_depth)
+                aligned_std = torch.exp(0.5 * aligned_log_var)
+            uncertainty_map = relative_uncertainty if prefix_head == "relative" else aligned_std 
             
             nll_loss = gaussian_nll_depth_loss(
                 aligned_mean,
@@ -106,15 +109,15 @@ def train_one_epoch(
                 valid_mask,
                 lambda_smooth_logvar=lambda_smooth_logvar,
             )
-            list_loss = image_level_listnet_loss(
-                aligned_mean,
-                relative_uncertainty,
-                depth,
-                valid_mask,
-                temperature=listnet_temperature,
-                uncertainty_mode=uncertainty_mode,
-            )
-            loss = nll_loss + list_loss_weight * list_loss
+            # list_loss = image_level_listnet_loss(
+            #     aligned_mean,
+            #     uncertainty_map,
+            #     depth,
+            #     valid_mask,
+            #     temperature=listnet_temperature,
+            #     uncertainty_mode=uncertainty_mode,
+            # )
+            loss = nll_loss # + list_loss_weight * list_loss
 
         scaler.scale(loss).backward()
 
@@ -126,8 +129,9 @@ def train_one_epoch(
         scaler.update()
 
         mu_aligned = aligned_mean.detach()
-        std_aligned = aligned_std.detach()
-        relative_uncertainty = relative_uncertainty.detach()
+        # std_aligned = aligned_std.detach()
+        # relative_uncertainty = relative_uncertainty.detach()
+        uncertainty_map = uncertainty_map.detach()
         
         batched_metrics = compute_comprehensive_depth_metrics(
             mu=mu_aligned,
@@ -140,7 +144,7 @@ def train_one_epoch(
             mu_aligned,
             depth,
             valid_mask,
-            uncertainty=relative_uncertainty,
+            uncertainty=uncertainty_map,
             max_samples=correlation_max_samples,
             min_depth=min_depth,
             max_depth=max_depth,
@@ -149,7 +153,7 @@ def train_one_epoch(
             mu_aligned,
             depth,
             valid_mask,
-            uncertainty=relative_uncertainty,
+            uncertainty=uncertainty_map,
             max_samples=correlation_max_samples,
             min_depth=min_depth,
             max_depth=max_depth,
@@ -157,7 +161,7 @@ def train_one_epoch(
         
         running_loss += loss.item()
         running_nll_loss += nll_loss.item()
-        running_list_loss += list_loss.item()
+        # running_list_loss += list_loss.item()
         running_abs_rel += batched_metrics["abs_rel"].mean().item()
         running_rmse += batched_metrics["rmse"].mean().item()
         running_a1 += batched_metrics["a1"].mean().item()
@@ -196,7 +200,7 @@ def train_one_epoch(
     epoch_metrics = {
         "loss": running_loss / n,
         "nll_loss": running_nll_loss / n,
-        "list_loss": running_list_loss / n,
+        # "list_loss": running_list_loss / n,
         "abs_rel": running_abs_rel / n,
         "rmse": running_rmse / n,
         "a1": running_a1 / n,

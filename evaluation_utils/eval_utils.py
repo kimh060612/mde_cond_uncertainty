@@ -116,7 +116,7 @@ def align_relative_prediction_to_depth_space(
     sigma: Optional[torch.Tensor] = None,
     log_var: Optional[torch.Tensor] = None,
     align_mode: str = "scale_shift",
-    inv_depth_min: float = 1e-6,
+    inv_depth_min: float = 1e-1,
     eps: float = 1e-8,
 ) -> Dict[str, Optional[torch.Tensor]]:
     pred = ensure_bchw(pred)
@@ -151,7 +151,7 @@ def align_relative_prediction_to_depth_space(
 
     if log_var is not None:
         log_var_inv = ensure_bchw(log_var).to(dtype=calc_dtype) + 2.0 * torch.log(scale_abs)
-        result["log_var"] = log_var_inv - 4.0 * torch.log(safe_inv_depth)
+        result["log_var"] = log_var_inv # - 4.0 * torch.log(safe_inv_depth)
 
     return result
 

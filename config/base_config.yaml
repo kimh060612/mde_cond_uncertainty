@@ -42,7 +42,7 @@ training:
   wandb_entity: artificial_tripartite_intelligence_team
   wandb_project: mde_uncertainty_measure
   wandb_name: dav2_cond_uncertainty
-  uncertainty_mode: "mean"
+  uncertainty_mode: "top20"
   disable_wandb: false
   no_amp: false
   log_interval: 20

@@ -220,11 +220,13 @@ def validate(
                 )
                 aligned_mean = aligned["depth"]
                 aligned_log_var = aligned["log_var"]
+                aligned_std = aligned["std"]
+                relative_uncertainty = aligned_std / ensure_bchw(depth).clamp_min(min_depth)
             else:
                 aligned_mean = out["predicted_depth"]
                 aligned_log_var = out["log_variance"]
-            aligned_std = torch.exp(0.5 * aligned_log_var)
-            relative_uncertainty = aligned_std / ensure_bchw(depth).clamp_min(min_depth)
+                aligned_std = torch.exp(0.5 * aligned_log_var)
+            uncertainty_map = relative_uncertainty if prefix_head == "relative" else aligned_std 
             
             nll_loss = gaussian_nll_depth_loss(
                 aligned_mean,
@@ -233,15 +235,15 @@ def validate(
                 valid_mask,
                 lambda_smooth_logvar=lambda_smooth_logvar,
             )
-            list_loss = image_level_listnet_loss(
-                aligned_mean,
-                relative_uncertainty,
-                depth,
-                valid_mask,
-                temperature=listnet_temperature,
-                uncertainty_mode=uncertainty_mode,
-            )
-            loss = nll_loss + list_loss_weight * list_loss
+            # list_loss = image_level_listnet_loss(
+            #     aligned_mean,
+            #     uncertainty_map,
+            #     depth,
+            #     valid_mask,
+            #     temperature=listnet_temperature,
+            #     uncertainty_mode=uncertainty_mode,
+            # )
+            loss = nll_loss # + list_loss_weight * list_loss
 
         mu_aligned = aligned_mean.detach()
         std_aligned = aligned_std.detach()
@@ -267,7 +269,7 @@ def validate(
             mu_aligned.detach(),
             depth,
             valid_mask,
-            uncertainty=relative_uncertainty.detach(),
+            uncertainty=uncertainty_map.detach(),
             max_samples=correlation_max_samples,
             min_depth=min_depth,
             max_depth=max_depth,
@@ -276,7 +278,7 @@ def validate(
             mu_aligned.detach(),
             depth,
             valid_mask,
-            uncertainty=relative_uncertainty.detach(),
+            uncertainty=uncertainty_map.detach(),
             max_samples=correlation_max_samples,
             min_depth=min_depth,
             max_depth=max_depth,
