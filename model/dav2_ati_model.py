@@ -264,8 +264,8 @@ class ConditionedGaussianDepthAnythingV2(nn.Module):
         log_var = self.uncertainty_head(uncertainty_input, condition)
 
         return {
-            "mu": mu,
-            "log_var": log_var,
-            "var": torch.exp(log_var),
+            "predicted_depth": mu,
+            "log_variance": log_var,
+            "variance": torch.exp(log_var),
             "std": torch.exp(0.5 * log_var),
         }

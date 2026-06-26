@@ -80,7 +80,7 @@ def train_one_epoch(
         with torch.autocast(device_type=device.type, enabled=amp):
             out = model(
                 pixel_values,
-                context=condition,
+                condition,
                 target_size=target_size,
             )
             if prefix_head == "relative":
@@ -100,7 +100,7 @@ def train_one_epoch(
                 aligned_mean = out["predicted_depth"]
                 aligned_log_var = out["log_variance"]
                 aligned_std = torch.exp(0.5 * aligned_log_var)
-            uncertainty_map = relative_uncertainty if prefix_head == "relative" else aligned_std 
+            uncertainty_map = aligned_std if prefix_head == "metric" else relative_uncertainty
             
             nll_loss = gaussian_nll_depth_loss(
                 aligned_mean,

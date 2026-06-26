@@ -207,7 +207,7 @@ def validate(
         with torch.autocast(device_type=device.type, enabled=amp):
             out = model(
                 pixel_values,
-                context=condition,
+                condition,
                 target_size=target_size,
             )
             if prefix_head == "relative":
@@ -216,6 +216,7 @@ def validate(
                     depth,
                     valid_mask,
                     log_var=out["log_variance"],
+                    sigma=out["std"],
                     align_mode=relative_align_mode,
                 )
                 aligned_mean = aligned["depth"]
@@ -226,7 +227,7 @@ def validate(
                 aligned_mean = out["predicted_depth"]
                 aligned_log_var = out["log_variance"]
                 aligned_std = torch.exp(0.5 * aligned_log_var)
-            uncertainty_map = relative_uncertainty if prefix_head == "relative" else aligned_std 
+            uncertainty_map = aligned_std if prefix_head == "metric" else relative_uncertainty
             
             nll_loss = gaussian_nll_depth_loss(
                 aligned_mean,
