@@ -212,21 +212,21 @@ def validate(
             )
             if prefix_head == "relative":
                 aligned = align_relative_prediction_to_depth_space(
-                    out["predicted_depth"],
+                    out["base_depth"],
                     depth,
                     valid_mask,
                     log_var=out["log_variance"],
                     sigma=out["std"],
                     align_mode=relative_align_mode,
                 )
-                aligned_mean = aligned["depth"]
+                aligned_mean = aligned["depth"] + out["camera_bias"]
                 aligned_log_var = aligned["log_var"]
                 aligned_std = aligned["std"]
                 relative_uncertainty = aligned_std / ensure_bchw(depth).clamp_min(min_depth)
             else:
-                aligned_mean = out["predicted_depth"]
+                aligned_mean = out["corrected_depth"]
                 aligned_log_var = out["log_variance"]
-                aligned_std = torch.exp(0.5 * aligned_log_var)
+                aligned_std = out["std"]
             uncertainty_map = aligned_std if prefix_head == "metric" else relative_uncertainty
             
             nll_loss = gaussian_nll_depth_loss(
@@ -248,7 +248,7 @@ def validate(
 
         mu_aligned = aligned_mean.detach()
         std_aligned = aligned_std.detach()
-        relative_uncertainty = relative_uncertainty.detach()
+        uncertainty_map = uncertainty_map.detach()
 
         batched_metrics = compute_comprehensive_depth_metrics(
             mu=mu_aligned.detach(),

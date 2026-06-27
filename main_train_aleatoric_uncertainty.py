@@ -138,16 +138,16 @@ def main(cfg: DictConfig):
     #     film_hidden_dim=cfg.model.uncertainty_blocks,
     #     detach_uncertainty_feature=cfg.training.detach_uncertainty_feature,
     # ).to(device)
-    model = ConditionedGaussianDepthAnythingV2(
-        model_id=model_id,
-        cond_dim=train_set.condition_dim,
-        freeze_backbone=cfg.training.freeze_backbone,
-        min_log_var=cfg.training.min_log_var,
-        max_log_var=cfg.training.max_log_var,
-        uncertainty_width=cfg.model.uncertainty_width,
-        uncertainty_blocks=cfg.model.uncertainty_blocks,
-        uncertainty_dropout=cfg.model.uncertainty_dropout,
-    ).to(device)
+    # model = ConditionedGaussianDepthAnythingV2(
+    #     model_id=model_id,
+    #     cond_dim=train_set.condition_dim,
+    #     freeze_backbone=cfg.training.freeze_backbone,
+    #     min_log_var=cfg.training.min_log_var,
+    #     max_log_var=cfg.training.max_log_var,
+    #     uncertainty_width=cfg.model.uncertainty_width,
+    #     uncertainty_blocks=cfg.model.uncertainty_blocks,
+    #     uncertainty_dropout=cfg.model.uncertainty_dropout,
+    # ).to(device)
     model = FrozenDepthCameraGaussian(
         model_id=model_id,
         context_dim=train_set.condition_dim,
