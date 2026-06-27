@@ -22,7 +22,7 @@ from utils.logger import setup_logger
 
 
 
-@hydra.main(config_path="config", config_name="base_config")
+@hydra.main(config_path="config", config_name="base_mdebias")
 def main(cfg: DictConfig):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     amp = (device.type == "cuda") and (not cfg.training.no_amp)
@@ -135,7 +135,7 @@ def main(cfg: DictConfig):
     #     min_log_variance=cfg.training.min_log_var,
     #     max_log_variance=cfg.training.max_log_var,
     #     uncertainty_channels=cfg.model.uncertainty_width,
-    #     film_hidden_dim=cfg.model.uncertainty_blocks,
+    #     film_hidden_dim=cfg.model.film_layer_width,
     #     detach_uncertainty_feature=cfg.training.detach_uncertainty_feature,
     # ).to(device)
     # model = ConditionedGaussianDepthAnythingV2(
@@ -154,8 +154,8 @@ def main(cfg: DictConfig):
         cache_dir=None,
         feature_channels=cfg.model.uncertainty_width,
         hidden_channels=cfg.model.uncertainty_width,
-        # film_hidden_dim=cfg.model.uncertainty_blocks,
-        # max_bias=cfg.training.max_bias,
+        film_hidden_dim=cfg.model.film_layer_width,
+        max_bias=None if "max_bias" not in cfg.training else cfg.training.max_bias,
         min_log_variance=cfg.training.min_log_var,
         max_log_variance=cfg.training.max_log_var,
     ).to(device)
