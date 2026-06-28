@@ -215,13 +215,11 @@ def validate(
                     out["base_depth"],
                     depth,
                     valid_mask,
-                    log_var=out["log_variance"],
-                    sigma=out["std"],
                     align_mode=relative_align_mode,
                 )
                 aligned_mean = aligned["depth"] + out["camera_bias"]
-                aligned_log_var = aligned["log_var"]
-                aligned_std = aligned["std"]
+                aligned_log_var = out["log_variance"]
+                aligned_std = out["std"]
                 relative_uncertainty = aligned_std / ensure_bchw(depth).clamp_min(min_depth)
             else:
                 aligned_mean = out["corrected_depth"]

@@ -165,10 +165,10 @@ def main(cfg: DictConfig):
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        if name.startswith("uncertainty_head"):
-            uncertainty_params.append(param)
-        else:
+        if name.startswith("depth_model."):
             backbone_params.append(param)
+        else:
+            uncertainty_params.append(param)
     print(
         "trainable params: "
         f"backbone={sum(p.numel() for p in backbone_params):,}, "
