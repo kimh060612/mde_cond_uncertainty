@@ -21,7 +21,7 @@ model:
   model_id: "small"
   image_height: 518
   image_width: 518
-  uncertainty_width: 64
+  uncertainty_width: 96
   film_layer_width: 128
   uncertainty_blocks: 3
   uncertainty_dropout: 0.05
@@ -33,7 +33,7 @@ training:
   lr_uncertainty: 1e-4
   weight_decay: 1e-4
   freeze_backbone: true
-  min_log_var: -2.0
+  min_log_var: -3.0
   max_log_var: 3.0
   listnet_temperature: 0.1
   list_loss_weight: 0.1
@@ -49,3 +49,9 @@ training:
   log_interval: 20
   correlation_max_samples: 100000
   detach_uncertainty_feature: true
+  lr_scheduler_monitor: aggregated_abs_rel_unc_pearson
+  lr_scheduler_factor: 0.5
+  lr_scheduler_patience: 1
+  lr_scheduler_threshold: 1e-4
+  lr_scheduler_cooldown: 0
+  lr_scheduler_min_lr_ratio: 0.05

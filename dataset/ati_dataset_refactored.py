@@ -14,6 +14,8 @@ LIGHT_LEVELS = ("dark", "dim", "normal")
 MOTION_LEVELS = ("stop", "slow", "fast", "rotate", "spin")
 TRAIN_SCENE_PREFIX = "comlab_scene"
 VALIDATION_SCENE_PREFIX = "val_comlab_scene"
+EXPOSURE_SET = [40, 80, 160, 320]
+GAIN_SET = [16, 32, 64, 128]
 
 V_STOP = 0.03
 W_STOP = 0.05
@@ -212,6 +214,8 @@ class ATIRealWorldUncertaintyBaseDataset(Dataset):
                     continue
 
                 exposure, gain = parsed_exposure
+                if exposure not in EXPOSURE_SET or gain not in GAIN_SET:
+                    continue
                 for lap_dir in sorted(exposure_dir.iterdir()):
                     if (
                         not lap_dir.is_dir()

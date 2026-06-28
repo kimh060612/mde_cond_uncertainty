@@ -1,3 +1,4 @@
+import math
 import torch
 from torch.utils.data import DataLoader, Subset
 import wandb
@@ -183,6 +184,20 @@ def main(cfg: DictConfig):
     if not param_groups:
         raise ValueError("No trainable parameters found")
     optimizer = torch.optim.AdamW(param_groups, weight_decay=cfg.training.weight_decay)
+    scheduler_monitor = cfg.training.lr_scheduler_monitor
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="max",
+        factor=cfg.training.lr_scheduler_factor,
+        patience=cfg.training.lr_scheduler_patience,
+        threshold=cfg.training.lr_scheduler_threshold,
+        threshold_mode="rel",
+        cooldown=cfg.training.lr_scheduler_cooldown,
+        min_lr=[
+            group["lr"] * cfg.training.lr_scheduler_min_lr_ratio
+            for group in optimizer.param_groups
+        ],
+    )
     # count_model_param_finetune(model)
     # optimizer = torch.optim.AdamW(
     #     [
@@ -252,6 +267,16 @@ def main(cfg: DictConfig):
         print(f"[epoch {epoch}] val={val_total_metrics}")
         print(f"[epoch {epoch}] seen_val={val_seen_metrics}")
         print(f"[epoch {epoch}] unseen_val={val_unseen_metrics}")
+
+        scheduler_metric = float(val_total_metrics.get(scheduler_monitor, float("nan")))
+        if math.isfinite(scheduler_metric):
+            scheduler.step(scheduler_metric)
+        else:
+            logger.warning(
+                "Skipping LR scheduler step because %s is not finite: %s",
+                scheduler_monitor,
+                scheduler_metric,
+            )
         
         is_best = val_total_metrics["aggregated_abs_rel_unc_pearson"] > best_abs_rel_correlation
         if is_best:
@@ -276,6 +301,11 @@ def main(cfg: DictConfig):
             "epoch": epoch,
             "best/abs_rel_correlation": best_abs_rel_correlation,
             "best/is_best": int(is_best),
+            "lr_scheduler/monitor": scheduler_metric,
+            **{
+                f"lr/{group.get('name', group_idx)}": group["lr"]
+                for group_idx, group in enumerate(optimizer.param_groups)
+            },
             **{f"train/{key}": value for key, value in train_metrics.items()},
             **{f"val/{key}": value for key, value in val_total_metrics.items()}, 
             **{f"val_seen/{key}": value for key, value in val_seen_metrics.items()},

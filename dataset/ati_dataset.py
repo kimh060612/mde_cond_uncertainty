@@ -28,6 +28,8 @@ ATI_STATS_LIGHT_LABEL_IDX = 2
 ATI_STATS_SPEED_LABEL_IDX = 3
 ATI_STATS_EXPOSURE_IDX = 4
 ATI_STATS_GAIN_IDX = 5
+EXPOSURE_SET = [40, 80, 160, 320]
+GAIN_SET = [16, 32, 64, 128]
 
 ATISample = Tuple[
     torch.Tensor,
@@ -261,6 +263,8 @@ class ATIRealWorldDepthDataset(Dataset):
                     continue
 
                 exposure, gain = parsed_exposure
+                if exposure not in EXPOSURE_SET or gain not in GAIN_SET:
+                    continue
                 for lap_dir in sorted(exposure_dir.iterdir()):
                     if (
                         not lap_dir.is_dir()
