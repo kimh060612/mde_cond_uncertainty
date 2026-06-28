@@ -30,10 +30,10 @@ training:
   batch_size: 16
   num_epochs: 10
   lr_backbone: 1e-6
-  lr_uncertainty: 5e-4
+  lr_uncertainty: 1e-4
   weight_decay: 1e-4
   freeze_backbone: true
-  min_log_var: -5.0
+  min_log_var: -2.0
   max_log_var: 3.0
   listnet_temperature: 0.1
   list_loss_weight: 0.1
