@@ -89,16 +89,17 @@ def train_one_epoch(
                     depth,
                     valid_mask,
                     align_mode=relative_align_mode,
+                    sigma=out["std"],
                 )
                 aligned_mean = aligned["depth"] + out["camera_bias"]
                 aligned_log_var = out["log_variance"]
-                aligned_std = out["std"]
-                relative_uncertainty = aligned_std / ensure_bchw(depth).clamp_min(min_depth)
+                aligned_std = aligned["std"]
+                # relative_uncertainty = aligned_std / ensure_bchw(aligned_mean).clamp_min(min_depth)
             else:
                 aligned_mean = out["corrected_depth"]
                 aligned_log_var = out["log_variance"]
                 aligned_std = out["std"]
-            uncertainty_map = aligned_std if prefix_head == "metric" else relative_uncertainty
+            uncertainty_map = aligned_std # if prefix_head == "metric" else relative_uncertainty
             
             nll_loss = gaussian_nll_depth_loss(
                 aligned_mean,
@@ -126,7 +127,7 @@ def train_one_epoch(
         scaler.step(optimizer)
         scaler.update()
 
-        mu_aligned = aligned_mean.detach()
+        mu_aligned = out["base_depth"].detach()
         # std_aligned = aligned_std.detach()
         # relative_uncertainty = relative_uncertainty.detach()
         uncertainty_map = uncertainty_map.detach()

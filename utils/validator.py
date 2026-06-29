@@ -65,7 +65,7 @@ def _accumulate_validation_result(accumulator, result):
     accumulator["running_ause_samples"] += result["ause_metrics"].get("ause_samples", 0)
     accumulator["processed_batches"] += 1
     _extend_metric_values(accumulator, result["batched_metrics"])
-    _extend_metric_values(accumulator, result["uncertainty_mean"])
+    _extend_metric_values(accumulator, result["depth_uncertainty_mean"])
     _extend_metric_values(accumulator, result["correlations"])
     _extend_metric_values(accumulator, result["ause_metrics"])
     _extend_metric_values(accumulator, result["aurg_metrics"])
@@ -87,10 +87,10 @@ def _finalize_validation_accumulator(accumulator):
             else float("nan")
         )
 
-    if accumulator.get("abs_rel") and accumulator.get("uncertainty_mean"):
+    if accumulator.get("abs_rel") and accumulator.get("depth_uncertainty_mean"):
         abs_rel = torch.cat(accumulator["abs_rel"], dim=0)
         a1 = torch.cat(accumulator["a1"], dim=0)
-        uncertainty_mean = torch.cat(accumulator["uncertainty_mean"], dim=0)
+        uncertainty_mean = torch.cat(accumulator["depth_uncertainty_mean"], dim=0)
         a1_uncertainty_correlation = compute_vector_masked_correlations( 
             a1,
             uncertainty_mean,
@@ -216,16 +216,17 @@ def validate(
                     depth,
                     valid_mask,
                     align_mode=relative_align_mode,
+                    sigma=out["std"],
                 )
                 aligned_mean = aligned["depth"] + out["camera_bias"]
                 aligned_log_var = out["log_variance"]
-                aligned_std = out["std"]
-                relative_uncertainty = aligned_std / ensure_bchw(depth).clamp_min(min_depth)
+                aligned_std = aligned["std"]
+                # relative_uncertainty = aligned_std / ensure_bchw(aligned_mean).clamp_min(min_depth)
             else:
                 aligned_mean = out["corrected_depth"]
                 aligned_log_var = out["log_variance"]
                 aligned_std = out["std"]
-            uncertainty_map = aligned_std if prefix_head == "metric" else relative_uncertainty
+            uncertainty_map = aligned_std # if prefix_head == "metric" else relative_uncertainty
             
             nll_loss = gaussian_nll_depth_loss(
                 aligned_mean,
@@ -244,7 +245,7 @@ def validate(
             )
             loss = nll_loss + list_loss_weight * list_loss
 
-        mu_aligned = aligned_mean.detach()
+        mu_aligned = out["base_depth"].detach()
         std_aligned = aligned_std.detach()
         uncertainty_map = uncertainty_map.detach()
 
@@ -290,7 +291,7 @@ def validate(
             min_depth=min_depth,
             max_depth=max_depth,
         )
-        batch_uncertainty_mean = _masked_image_mean(relative_uncertainty, valid_mask)
+        batch_uncertainty_mean = _masked_image_mean(uncertainty_map, valid_mask)
         batch_depth_uncertainty_mean = _masked_image_mean(std_aligned, valid_mask)
         batch_result = {
             "loss": loss.item(),
