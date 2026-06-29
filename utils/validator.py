@@ -65,7 +65,7 @@ def _accumulate_validation_result(accumulator, result):
     accumulator["running_ause_samples"] += result["ause_metrics"].get("ause_samples", 0)
     accumulator["processed_batches"] += 1
     _extend_metric_values(accumulator, result["batched_metrics"])
-    _extend_metric_values(accumulator, result["depth_uncertainty_mean"])
+    _extend_metric_values(accumulator, result["uncertainty_mean"])
     _extend_metric_values(accumulator, result["correlations"])
     _extend_metric_values(accumulator, result["ause_metrics"])
     _extend_metric_values(accumulator, result["aurg_metrics"])
@@ -87,10 +87,10 @@ def _finalize_validation_accumulator(accumulator):
             else float("nan")
         )
 
-    if accumulator.get("abs_rel") and accumulator.get("depth_uncertainty_mean"):
+    if accumulator.get("abs_rel") and accumulator.get("uncertainty_mean"):
         abs_rel = torch.cat(accumulator["abs_rel"], dim=0)
         a1 = torch.cat(accumulator["a1"], dim=0)
-        uncertainty_mean = torch.cat(accumulator["depth_uncertainty_mean"], dim=0)
+        uncertainty_mean = torch.cat(accumulator["uncertainty_mean"], dim=0)
         a1_uncertainty_correlation = compute_vector_masked_correlations( 
             a1,
             uncertainty_mean,
@@ -226,6 +226,7 @@ def validate(
                 aligned_mean = out["corrected_depth"]
                 aligned_log_var = out["log_variance"]
                 aligned_std = out["std"]
+            t_mu_aligned = out["base_depth"] if prefix_head == "metric" else aligned["depth"]
             uncertainty_map = aligned_std # if prefix_head == "metric" else relative_uncertainty
             
             nll_loss = gaussian_nll_depth_loss(
@@ -236,7 +237,7 @@ def validate(
                 lambda_smooth_logvar=lambda_smooth_logvar,
             )
             list_loss = image_level_listnet_loss(
-                aligned_mean,
+                t_mu_aligned,
                 uncertainty_map,
                 depth,
                 valid_mask,

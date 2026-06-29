@@ -9,7 +9,8 @@ from evaluation_utils.eval_utils import (
 from evaluation_utils.eval_metrics import (
     compute_sparsification_ause_metrics,
     compute_sparsification_aurg_metrics,
-    compute_comprehensive_depth_metrics
+    compute_comprehensive_depth_metrics,
+    compute_loss_uncertainty_correlations
 )
 from tqdm.auto import tqdm
 from utils.train_utils import *
@@ -56,6 +57,8 @@ def train_one_epoch(
     running_aurg_abs_rel = []
     running_ause_a1 = []
     running_aurg_a1 = []
+    running_pearson_correlation_l1 = []
+    running_spearman_correlation_l1 = []
     corr_sums = {}
     corr_counts = {}
     condition_sums = {}
@@ -99,7 +102,8 @@ def train_one_epoch(
                 aligned_mean = out["corrected_depth"]
                 aligned_log_var = out["log_variance"]
                 aligned_std = out["std"]
-            uncertainty_map = aligned_std # if prefix_head == "metric" else relative_uncertainty
+            t_mu_aligned = out["base_depth"] if prefix_head == "metric" else aligned["depth"]
+            uncertainty_map = aligned_std
             
             nll_loss = gaussian_nll_depth_loss(
                 aligned_mean,
@@ -109,7 +113,7 @@ def train_one_epoch(
                 lambda_smooth_logvar=lambda_smooth_logvar,
             )
             list_loss = image_level_listnet_loss(
-                aligned_mean,
+                t_mu_aligned,
                 uncertainty_map,
                 depth,
                 valid_mask,
@@ -136,6 +140,15 @@ def train_one_epoch(
             mu=mu_aligned,
             target=depth,
             valid_mask=valid_mask,
+            min_depth=min_depth,
+            max_depth=max_depth,
+        )
+        correlations = compute_loss_uncertainty_correlations(
+            mu_aligned.detach(),
+            depth,
+            valid_mask,
+            uncertainty=uncertainty_map.detach(),
+            max_samples=correlation_max_samples,
             min_depth=min_depth,
             max_depth=max_depth,
         )
@@ -168,6 +181,8 @@ def train_one_epoch(
         running_aurg_abs_rel.append(aurg_metrics["aurg_abs_rel"])
         running_ause_a1.append(ause_metrics["ause_a1"])
         running_aurg_a1.append(aurg_metrics["aurg_a1"])
+        running_pearson_correlation_l1.append(correlations["loss_uncertainty_pearson"])
+        running_spearman_correlation_l1.append(correlations["loss_uncertainty_spearman"])
         processed_batches += 1
 
         progress_bar.set_postfix(
@@ -177,10 +192,12 @@ def train_one_epoch(
             a1=f"{running_a1 / step:.4f}",
             ause_abs_rel=f"{torch.cat(running_ause_abs_rel, dim=0).mean().item():.4f}",
             ause_a1=f"{torch.cat(running_ause_a1, dim=0).mean().item():.4f}",
+            correlation_l1=f"{torch.cat(running_pearson_correlation_l1, dim=0).mean().item():.4f}",
+            spearman_correlation_l1=f"{torch.cat(running_spearman_correlation_l1, dim=0).mean().item():.4f}",
         )
         if log_interval > 0 and step % log_interval == 0:
             logger.info(
-                "epoch=%d step=%d/%d avg_loss=%.6f abs_rel=%.6f a1=%.6f ause_abs_rel=%.6f aurg_abs_rel=%.6f ause_a1=%.6f aurg_a1=%.6f",
+                "epoch=%d step=%d/%d avg_loss=%.6f abs_rel=%.6f a1=%.6f ause_abs_rel=%.6f aurg_abs_rel=%.6f ause_a1=%.6f aurg_a1=%.6f correlation_l1=%.6f",
                 epoch,
                 step,
                 len(loader),
@@ -191,6 +208,8 @@ def train_one_epoch(
                 torch.cat(running_aurg_abs_rel, dim=0).mean().item(),
                 torch.cat(running_ause_a1, dim=0).mean().item(),
                 torch.cat(running_aurg_a1, dim=0).mean().item(),
+                torch.cat(running_pearson_correlation_l1, dim=0).mean().item(),
+                torch.cat(running_spearman_correlation_l1, dim=0).mean().item(),
             )
 
         global_step += 1
@@ -207,6 +226,8 @@ def train_one_epoch(
         "aurg_abs_rel": torch.cat(running_aurg_abs_rel, dim=0).mean().item(),
         "ause_a1": torch.cat(running_ause_a1, dim=0).mean().item(),
         "aurg_a1": torch.cat(running_aurg_a1, dim=0).mean().item(),
+        "correlation_l1": torch.cat(running_pearson_correlation_l1, dim=0).mean().item(),
+        "spearman_correlation_l1": torch.cat(running_spearman_correlation_l1, dim=0).mean().item(),
     }
     epoch_metrics.update({key: value / n for key, value in condition_sums.items()})
     epoch_metrics.update(_mean_finite_metrics(corr_sums, corr_counts))
