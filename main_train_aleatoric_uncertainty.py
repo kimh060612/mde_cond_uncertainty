@@ -156,7 +156,7 @@ def main(cfg: DictConfig):
         feature_channels=cfg.model.uncertainty_width,
         hidden_channels=cfg.model.uncertainty_width,
         film_hidden_dim=cfg.model.film_layer_width,
-        max_bias=None if "max_bias" not in cfg.training else cfg.training.max_bias,
+        max_bias=cfg.training.max_bias,
         min_log_variance=cfg.training.min_log_var,
         max_log_variance=cfg.training.max_log_var,
     ).to(device)

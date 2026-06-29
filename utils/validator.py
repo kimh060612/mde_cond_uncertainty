@@ -219,8 +219,8 @@ def validate(
                     sigma=out["std"],
                 )
                 aligned_mean = aligned["depth"] + out["camera_bias"]
-                aligned_log_var = out["log_variance"]
                 aligned_std = aligned["std"]
+                aligned_log_var = torch.log(aligned_std.square() + 1e-8)
                 # relative_uncertainty = aligned_std / ensure_bchw(aligned_mean).clamp_min(min_depth)
             else:
                 aligned_mean = out["corrected_depth"]

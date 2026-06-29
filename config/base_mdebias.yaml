@@ -35,6 +35,7 @@ training:
   freeze_backbone: true
   min_log_var: -3.0
   max_log_var: 3.0
+  max_bias: 0.5
   listnet_temperature: 0.1
   list_loss_weight: 0.3
   lambda_smooth_logvar: 1e-3
