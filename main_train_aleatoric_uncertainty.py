@@ -159,6 +159,8 @@ def main(cfg: DictConfig):
         max_bias=cfg.training.max_bias,
         min_log_variance=cfg.training.min_log_var,
         max_log_variance=cfg.training.max_log_var,
+        initial_std=cfg.training.initial_std,
+        variance_head_init_std=cfg.training.variance_head_init_std,
     ).to(device)
     
     backbone_params = []

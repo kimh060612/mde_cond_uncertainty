@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Dict, Optional
 
 import torch
@@ -38,6 +39,8 @@ class FrozenDepthCameraGaussian(nn.Module):
         max_bias: Optional[float] = None,
         min_log_variance: float = -10.0,
         max_log_variance: float = 10.0,
+        initial_std: float = 0.5,
+        variance_head_init_std: float = 1e-3,
     ) -> None:
         super().__init__()
 
@@ -52,6 +55,8 @@ class FrozenDepthCameraGaussian(nn.Module):
         self.max_bias = max_bias
         self.min_log_variance = min_log_variance
         self.max_log_variance = max_log_variance
+        self.initial_std = initial_std
+        self.variance_head_init_std = variance_head_init_std
 
         # Freeze the complete foundation model.
         for parameter in self.depth_model.parameters():
@@ -174,10 +179,20 @@ class FrozenDepthCameraGaussian(nn.Module):
         nn.init.zeros_(final_bias.weight)
         nn.init.zeros_(final_bias.bias)
 
-        # Initial raw variance gives variance_floor + softplus(0).
+        # Start near a chosen variance scale while retaining tiny spatial variation.
         final_variance = self.variance_head[-1]
-        nn.init.zeros_(final_variance.weight)
-        nn.init.zeros_(final_variance.bias)
+        nn.init.normal_(
+            final_variance.weight,
+            mean=0.0,
+            std=self.variance_head_init_std,
+        )
+        variance_floor = math.exp(self.min_log_variance)
+        target_variance = max(self.initial_std ** 2, variance_floor + 1e-6)
+        if self.max_log_variance is not None:
+            target_variance = min(target_variance, math.exp(self.max_log_variance))
+        softplus_target = max(target_variance - variance_floor, 1e-6)
+        raw_bias = math.log(math.expm1(softplus_target))
+        nn.init.constant_(final_variance.bias, raw_bias)
 
     def train(
         self,
