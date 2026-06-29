@@ -208,8 +208,7 @@ def train_one_epoch(
                 torch.cat(running_aurg_abs_rel, dim=0).mean().item(),
                 torch.cat(running_ause_a1, dim=0).mean().item(),
                 torch.cat(running_aurg_a1, dim=0).mean().item(),
-                torch.cat(running_pearson_correlation_l1, dim=0).mean().item(),
-                torch.cat(running_spearman_correlation_l1, dim=0).mean().item(),
+                torch.cat(running_pearson_correlation_l1, dim=0).mean().item()
             )
 
         global_step += 1
