@@ -127,7 +127,7 @@ def train_one_epoch(
         scaler.step(optimizer)
         scaler.update()
 
-        mu_aligned = out["base_depth"].detach()
+        mu_aligned = out["base_depth"].detach() if prefix_head == "metric" else aligned["depth"].detach()
         # std_aligned = aligned_std.detach()
         # relative_uncertainty = relative_uncertainty.detach()
         uncertainty_map = uncertainty_map.detach()

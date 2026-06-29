@@ -245,7 +245,7 @@ def validate(
             )
             loss = nll_loss + list_loss_weight * list_loss
 
-        mu_aligned = out["base_depth"].detach()
+        mu_aligned = out["base_depth"].detach() if prefix_head == "metric" else aligned["depth"].detach()
         std_aligned = aligned_std.detach()
         uncertainty_map = uncertainty_map.detach()
 
