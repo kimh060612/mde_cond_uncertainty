@@ -4,4 +4,4 @@ __pycache__/
 .vscode/
 comparison_ae/
 ckpt*
-output/*
+outputs/*

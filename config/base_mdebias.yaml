@@ -33,8 +33,8 @@ training:
   lr_uncertainty: 1e-4
   weight_decay: 1e-4
   freeze_backbone: true
-  min_log_var: -3.0
-  max_log_var: 3.0
+  min_log_var: -2.5
+  max_log_var: 1.0
   max_bias: 0.5
   listnet_temperature: 0.1
   list_loss_weight: 0.1
