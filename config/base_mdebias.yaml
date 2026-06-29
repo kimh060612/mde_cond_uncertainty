@@ -21,7 +21,7 @@ model:
   model_id: "small"
   image_height: 518
   image_width: 518
-  uncertainty_width: 96
+  uncertainty_width: 64
   film_layer_width: 128
   uncertainty_blocks: 3
   uncertainty_dropout: 0.05
@@ -37,7 +37,7 @@ training:
   max_log_var: 3.0
   max_bias: 0.5
   listnet_temperature: 0.1
-  list_loss_weight: 0.3
+  list_loss_weight: 0.1
   lambda_smooth_logvar: 1e-3
   grad_clip: 1.0
   relative_align_mode: scale_shift
