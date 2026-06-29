@@ -1,7 +1,7 @@
 import torch
 from torch.utils.data import DataLoader, Subset
 from utils.train_utils import *
-from model.loss_fn import gaussian_nll_depth_loss, image_level_listnet_loss
+from model.loss_fn import faithful_heteroscedastic_depth_loss, image_level_listnet_loss
 from evaluation_utils.eval_metrics import *
 from evaluation_utils.eval_utils import (
     align_relative_prediction_to_depth_space,
@@ -165,6 +165,7 @@ def validate(
     device,
     amp: bool,
     lambda_smooth_logvar: float,
+    lambda_variance: float,
     listnet_temperature: float,
     uncertainty_mode: str,
     list_loss_weight: float,
@@ -216,26 +217,24 @@ def validate(
                     depth,
                     valid_mask,
                     align_mode=relative_align_mode,
-                    sigma=out["std"],
                 )
                 aligned_mean = aligned["depth"] + out["camera_bias"]
-                aligned_std = aligned["std"]
-                aligned_log_var = torch.log(aligned_std.square() + 1e-8)
+                aligned_std = out["std"]
                 # relative_uncertainty = aligned_std / ensure_bchw(aligned_mean).clamp_min(min_depth)
             else:
                 aligned_mean = out["corrected_depth"]
-                aligned_log_var = out["log_variance"]
                 aligned_std = out["std"]
             t_mu_aligned = out["base_depth"] if prefix_head == "metric" else aligned["depth"]
-            uncertainty_map = aligned_std # if prefix_head == "metric" else relative_uncertainty
+            uncertainty_map = torch.sqrt(out["camera_bias"].square() + aligned_std.square())
             
-            nll_loss = gaussian_nll_depth_loss(
+            mean_loss, variance_loss = faithful_heteroscedastic_depth_loss(
                 aligned_mean,
-                aligned_log_var,
+                out["variance"],
                 depth,
                 valid_mask,
                 lambda_smooth_logvar=lambda_smooth_logvar,
             )
+            nll_loss = mean_loss + lambda_variance * variance_loss
             list_loss = image_level_listnet_loss(
                 t_mu_aligned,
                 uncertainty_map,
@@ -261,7 +260,7 @@ def validate(
             mu_aligned.detach(),
             depth,
             valid_mask,
-            uncertainty=std_aligned.detach(),
+            uncertainty=uncertainty_map.detach(),
             max_samples=correlation_max_samples,
             min_depth=min_depth,
             max_depth=max_depth,
@@ -288,7 +287,7 @@ def validate(
             mu_aligned.detach(),
             depth,
             valid_mask,
-            uncertainty=std_aligned.detach(),
+            uncertainty=uncertainty_map.detach(),
             min_depth=min_depth,
             max_depth=max_depth,
         )

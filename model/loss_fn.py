@@ -31,6 +31,44 @@ def gaussian_nll_depth_loss(
 
     return loss
 
+
+def faithful_heteroscedastic_depth_loss(
+    mu: torch.Tensor,
+    variance: torch.Tensor,
+    target: torch.Tensor,
+    valid_mask: torch.Tensor,
+    lambda_smooth_logvar: float = 0.0,
+):
+    """
+    Separate mean regression from variance regression.
+
+    The mean loss updates only ``mu``. The variance NLL uses a detached mean
+    residual, so variance learning cannot hide mean errors by pushing the mean.
+    """
+    target = target.unsqueeze(1)
+    valid_mask = valid_mask.unsqueeze(1).bool()
+
+    mean_loss = F.smooth_l1_loss(
+        mu[valid_mask],
+        target[valid_mask],
+    )
+
+    safe_variance = variance.clamp_min(1e-8)
+    detached_residual2 = (target - mu.detach()).square()
+    variance_nll = 0.5 * (
+        detached_residual2 / safe_variance
+        + torch.log(safe_variance)
+    )
+    variance_loss = variance_nll[valid_mask].mean()
+
+    if lambda_smooth_logvar > 0.0:
+        log_variance = torch.log(safe_variance)
+        dx = torch.abs(log_variance[:, :, :, 1:] - log_variance[:, :, :, :-1]).mean()
+        dy = torch.abs(log_variance[:, :, 1:, :] - log_variance[:, :, :-1, :]).mean()
+        variance_loss = variance_loss + lambda_smooth_logvar * (dx + dy)
+
+    return mean_loss, variance_loss
+
 def image_absrel_error(mu, depth, valid_mask):
     depth = depth.unsqueeze(1)
     mask = valid_mask.unsqueeze(1).bool()
@@ -153,5 +191,4 @@ def image_level_ranknet_loss(
         return torch.tensor(0.0, device=mu.device)
 
     return torch.stack(losses).mean()
-
 

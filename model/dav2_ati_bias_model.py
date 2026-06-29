@@ -174,7 +174,7 @@ class FrozenDepthCameraGaussian(nn.Module):
         nn.init.zeros_(final_bias.weight)
         nn.init.zeros_(final_bias.bias)
 
-        # Initial variance is exp(0) = 1.
+        # Initial raw variance gives variance_floor + softplus(0).
         final_variance = self.variance_head[-1]
         nn.init.zeros_(final_variance.weight)
         nn.init.zeros_(final_variance.bias)
@@ -303,7 +303,7 @@ class FrozenDepthCameraGaussian(nn.Module):
                 camera_bias
             )
 
-        log_variance = self.variance_head(
+        raw_variance = self.variance_head(
             conditioned_feature
         )
 
@@ -324,26 +324,31 @@ class FrozenDepthCameraGaussian(nn.Module):
             align_corners=False,
         )
 
-        log_variance = F.interpolate(
-            log_variance,
+        raw_variance = F.interpolate(
+            raw_variance,
             size=target_size,
             mode="bilinear",
             align_corners=False,
         )
 
-        log_variance = log_variance.clamp(
-            min=self.min_log_variance,
-            max=self.max_log_variance,
+        variance_floor = torch.exp(
+            raw_variance.new_tensor(self.min_log_variance)
         )
+        variance = variance_floor + F.softplus(raw_variance)
+        if self.max_log_variance is not None:
+            variance = variance.clamp_max(
+                torch.exp(raw_variance.new_tensor(self.max_log_variance))
+            )
 
         corrected_depth = base_depth + camera_bias
-        variance = torch.exp(log_variance)
-        std = torch.exp(0.5 * log_variance)
+        log_variance = torch.log(variance.clamp_min(1e-8))
+        std = torch.sqrt(variance)
 
         return {
             "base_depth": base_depth,
             "camera_bias": camera_bias,
             "corrected_depth": corrected_depth,
+            "raw_variance": raw_variance,
             "log_variance": log_variance,
             "variance": variance,
             "std": std,

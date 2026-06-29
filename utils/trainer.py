@@ -1,6 +1,6 @@
 from typing import Tuple, Dict
 import torch
-from model.loss_fn import gaussian_nll_depth_loss, image_level_listnet_loss
+from model.loss_fn import faithful_heteroscedastic_depth_loss, image_level_listnet_loss
 from evaluation_utils.eval_utils import (
     align_relative_prediction_to_depth_space,
     ensure_bchw,
@@ -27,6 +27,7 @@ def train_one_epoch(
     epoch,
     amp: bool,
     lambda_smooth_logvar: float,
+    lambda_variance: float,
     list_loss_weight: float,
     listnet_temperature: float,
     uncertainty_mode: str,
@@ -49,6 +50,8 @@ def train_one_epoch(
     
     running_loss = 0.0
     running_nll_loss = 0.0
+    running_mean_loss = 0.0
+    running_variance_loss = 0.0
     running_list_loss = 0.0
     running_abs_rel = 0.0
     running_rmse = 0.0
@@ -92,26 +95,24 @@ def train_one_epoch(
                     depth,
                     valid_mask,
                     align_mode=relative_align_mode,
-                    sigma=out["std"],
                 )
                 aligned_mean = aligned["depth"] + out["camera_bias"]
-                aligned_std = aligned["std"]
-                aligned_log_var = torch.log(aligned_std.square() + 1e-8)
+                aligned_std = out["std"]
                 # relative_uncertainty = aligned_std / ensure_bchw(aligned_mean).clamp_min(min_depth)
             else:
                 aligned_mean = out["corrected_depth"]
-                aligned_log_var = out["log_variance"]
                 aligned_std = out["std"]
             t_mu_aligned = out["base_depth"] if prefix_head == "metric" else aligned["depth"]
-            uncertainty_map = aligned_std
+            uncertainty_map = torch.sqrt(out["camera_bias"].square() + aligned_std.square())
             
-            nll_loss = gaussian_nll_depth_loss(
+            mean_loss, variance_loss = faithful_heteroscedastic_depth_loss(
                 aligned_mean,
-                aligned_log_var,
+                out["variance"],
                 depth,
                 valid_mask,
                 lambda_smooth_logvar=lambda_smooth_logvar,
             )
+            nll_loss = mean_loss + lambda_variance * variance_loss
             list_loss = image_level_listnet_loss(
                 t_mu_aligned,
                 uncertainty_map,
@@ -173,6 +174,8 @@ def train_one_epoch(
         
         running_loss += loss.item()
         running_nll_loss += nll_loss.item()
+        running_mean_loss += mean_loss.item()
+        running_variance_loss += variance_loss.item()
         running_list_loss += list_loss.item()
         running_abs_rel += batched_metrics["abs_rel"].mean().item()
         running_rmse += batched_metrics["rmse"].mean().item()
@@ -217,6 +220,8 @@ def train_one_epoch(
     epoch_metrics = {
         "loss": running_loss / n,
         "nll_loss": running_nll_loss / n,
+        "mean_loss": running_mean_loss / n,
+        "variance_loss": running_variance_loss / n,
         "list_loss": running_list_loss / n,
         "abs_rel": running_abs_rel / n,
         "rmse": running_rmse / n,

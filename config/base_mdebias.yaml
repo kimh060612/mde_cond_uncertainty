@@ -38,6 +38,7 @@ training:
   max_bias: 0.5
   listnet_temperature: 0.1
   list_loss_weight: 0.1
+  lambda_variance: 1.0
   lambda_smooth_logvar: 1e-3
   grad_clip: 1.0
   relative_align_mode: scale_shift
