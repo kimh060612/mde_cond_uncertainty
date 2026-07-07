@@ -299,6 +299,8 @@ class FoundationCameraGroupedDataset(Dataset[dict[str, Any]]):
         max_time_diff_sec: float | None = None,
         topologies: Sequence[str] | None = None,
         validate_optional_pair_columns: bool = True,
+        min_depth: float = 1e-3,
+        max_depth: float = 10.0,
         seed: int = 42,
     ) -> None:
         super().__init__()
@@ -330,13 +332,14 @@ class FoundationCameraGroupedDataset(Dataset[dict[str, Any]]):
             frame["_csv_path"] = str(csv_path)
             frames.append(frame)
 
-        self.min_depth = 1e-3
-        self.max_depth = 10.0
+        self.min_depth = min_depth
+        self.max_depth = max_depth
         table = pd.concat(frames, ignore_index=True)
         missing_columns = self.REQUIRED_COLUMNS - set(table.columns)
         if missing_columns:
             raise ValueError("CSV is missing required columns: " + ", ".join(sorted(missing_columns)))
 
+        self.depth_scale = 1000 if camera_model_name.startswith("Orbbec") else 1.0
         _validate_camera_parameter_normalization(
             parameter_range,
             parameter_normalization,
@@ -555,11 +558,11 @@ class FoundationCameraGroupedDataset(Dataset[dict[str, Any]]):
             return image.convert("RGB").copy()
 
     @staticmethod
-    def _load_depth(path: Path) -> torch.Tensor:
+    def _load_depth(path: Path, depth_scale: float=1.0) -> torch.Tensor:
         if not path.is_file():
             raise FileNotFoundError(f"Depth array not found: {path}")
 
-        depth = np.load(path)
+        depth = np.load(path) / depth_scale
         if depth.ndim == 3 and depth.shape[-1] == 1:
             depth = depth[..., 0]
         return torch.from_numpy(np.asarray(depth, dtype=np.float32))
@@ -820,13 +823,13 @@ class FoundationCameraGroupedDataset(Dataset[dict[str, Any]]):
         result["candidate_images"] = torch.stack(candidate_tensors, dim=0)
 
         if self.load_depth:
-            canonical_depth = self._load_depth(canonical_depth_path)
+            canonical_depth = self._load_depth(canonical_depth_path, depth_scale=self.depth_scale)
             result["canonical_depths"] = canonical_depth.unsqueeze(0).expand(
                 self.candidates_per_group, *canonical_depth.shape
             ).clone()
 
             result["candidate_depths"] = torch.stack(
-                [self._load_depth(path) for path in candidate_depth_paths],
+                [self._load_depth(path, depth_scale=self.depth_scale) for path in candidate_depth_paths],
                 dim=0,
             )
             depth = result["candidate_depths"]
