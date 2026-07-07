@@ -14,7 +14,9 @@ from evaluation_utils.eval_metrics import (
     compute_comprehensive_depth_metrics,
     compute_loss_uncertainty_correlations,
     compute_sparsification_ause_metrics,
-    compute_vector_masked_correlations
+    compute_vector_masked_correlations,
+    compute_camera_induced_degradation_values,
+    summarize_camera_induced_degradation_correlations
 )
 from tqdm.auto import tqdm
 from utils.train_utils import *
@@ -90,6 +92,17 @@ def train_one_epoch(
         "a1": [],
     }
     running_uncertainty_mean = []
+    running_degradation_values = {
+        "B2": [],
+        "V": [],
+        "R": [],
+        "sqrt_R": [],
+        "log_R": [],
+        "abs_rel_degradation": [],
+        "delta1_degradation": [],
+        "delta1_error_degradation": [],
+        "group_id": [],
+    }
     corr_sums = {}
     corr_counts = {}
     condition_sums = {}
@@ -105,8 +118,13 @@ def train_one_epoch(
         candidate_imgs = flat_batch["candidate_images"]
         canonical_imgs = flat_batch["canonical_images"]
         candidate_depth = flat_batch["candidate_depths"]
+        canonical_depth = flat_batch["canonical_depths"]
         candidate_valid_mask = flat_batch["candidate_valid_mask"]
+        canonical_valid_mask = torch.isfinite(canonical_depth)
+        canonical_valid_mask &= canonical_depth > min_depth
+        canonical_valid_mask &= canonical_depth < max_depth
         candidate_condition = flat_batch["camera_context"]
+        group_ids = batch["group_index"].to(device=device)[:, None].expand(-1, num_candidates).reshape(-1)
         
         target_size = candidate_depth.shape[-2:]
         optimizer.zero_grad(set_to_none=True)
@@ -125,6 +143,12 @@ def train_one_epoch(
                     out["candidate_depth"],
                     candidate_depth,
                     candidate_valid_mask,
+                    align_mode=relative_align_mode,
+                )
+                canonical_aligned = align_relative_prediction_to_depth_space(
+                    out["canonical_depth"],
+                    canonical_depth,
+                    canonical_valid_mask,
                     align_mode=relative_align_mode,
                 )
                 aligned_std = out["std"]
@@ -177,6 +201,13 @@ def train_one_epoch(
             min_depth=min_depth,
             max_depth=max_depth,
         )
+        canonical_batched_metrics = compute_comprehensive_depth_metrics(
+            mu=canonical_aligned["depth"].detach(),
+            target=canonical_depth,
+            valid_mask=canonical_valid_mask,
+            min_depth=min_depth,
+            max_depth=max_depth,
+        )
         
         correlations = compute_loss_uncertainty_correlations(
             mu_aligned.detach(),
@@ -213,6 +244,16 @@ def train_one_epoch(
         running_batched_metrics["abs_rel"].append(batched_metrics["abs_rel"])
         running_batched_metrics["a1"].append(batched_metrics["a1"])
         running_uncertainty_mean.append(masked_image_mean(uncertainty_map, candidate_valid_mask))
+        degradation_values = compute_camera_induced_degradation_values(
+            candidate_metrics=batched_metrics,
+            canonical_metrics=canonical_batched_metrics,
+            camera_bias=out["camera_bias"],
+            variance=out["variance"],
+            valid_mask=candidate_valid_mask,
+            group_ids=group_ids,
+        )
+        for key, value in degradation_values.items():
+            running_degradation_values[key].append(value.detach().cpu())
         running_a1_unc_corr, running_abs_rel_unc_corr = get_batched_correlations(
             running_batched_metrics,
             running_uncertainty_mean,
@@ -252,6 +293,14 @@ def train_one_epoch(
         running_uncertainty_mean,
         max_samples=correlation_max_samples,
     )
+    degradation_metrics = summarize_camera_induced_degradation_correlations(
+        {
+            key: torch.cat(values, dim=0)
+            for key, values in running_degradation_values.items()
+            if values
+        },
+        max_samples=correlation_max_samples,
+    )
 
     n = max(processed_batches, 1)
     epoch_metrics = {
@@ -272,5 +321,6 @@ def train_one_epoch(
     }
     epoch_metrics.update({key: value / n for key, value in condition_sums.items()})
     epoch_metrics.update(_mean_finite_metrics(corr_sums, corr_counts))
+    epoch_metrics.update(degradation_metrics)
     
     return epoch_metrics, global_step

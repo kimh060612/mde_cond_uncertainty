@@ -365,6 +365,214 @@ def compute_loss_uncertainty_correlations(
         ),
     }
 
+
+@torch.no_grad()
+def compute_camera_induced_degradation_values(
+    candidate_metrics: Dict[str, torch.Tensor],
+    canonical_metrics: Dict[str, torch.Tensor],
+    camera_bias: torch.Tensor,
+    variance: torch.Tensor,
+    valid_mask: torch.Tensor,
+    group_ids: torch.Tensor,
+    eps: float = 1e-8,
+) -> Dict[str, torch.Tensor]:
+    bias = ensure_bchw(camera_bias.detach())
+    variance = ensure_bchw(variance.detach())
+    mask = prepare_bchw_mask(valid_mask, bias)
+
+    counts = mask.flatten(1).sum(dim=1)
+    safe_counts = counts.clamp_min(1).to(dtype=bias.dtype)
+    B2 = torch.where(mask, bias.square(), torch.zeros_like(bias)).flatten(1).sum(dim=1) / safe_counts
+    V = torch.where(mask, variance, torch.zeros_like(variance)).flatten(1).sum(dim=1) / safe_counts
+    B2 = torch.where(counts > 0, B2, B2.new_full(B2.shape, float("nan")))
+    V = torch.where(counts > 0, V, V.new_full(V.shape, float("nan")))
+    R = B2 + V
+
+    abs_rel_degradation = candidate_metrics["abs_rel"] - canonical_metrics["abs_rel"]
+    delta1_degradation = canonical_metrics["a1"] - candidate_metrics["a1"]
+    delta1_error_degradation = (1.0 - candidate_metrics["a1"]) - (1.0 - canonical_metrics["a1"])
+
+    return {
+        "B2": B2.detach(),
+        "V": V.detach(),
+        "R": R.detach(),
+        "sqrt_R": torch.sqrt(R.clamp_min(eps)).detach(),
+        "log_R": torch.log(R.clamp_min(eps)).detach(),
+        "abs_rel_degradation": abs_rel_degradation.detach(),
+        "delta1_degradation": delta1_degradation.detach(),
+        "delta1_error_degradation": delta1_error_degradation.detach(),
+        "group_id": group_ids.detach().flatten(),
+    }
+
+
+@torch.no_grad()
+def summarize_camera_induced_degradation_correlations(
+    values: Dict[str, torch.Tensor],
+    max_samples: Optional[int] = 100_000,
+    relative_tie_margin: float = 0.05,
+    eps: float = 1e-8,
+) -> Dict[str, float]:
+    score_names = ("R", "sqrt_R", "log_R", "B2", "V")
+    target_names = ("abs_rel_degradation", "delta1_degradation", "delta1_error_degradation")
+    group_score_names = ("R", "B2", "V")
+    grouped_target_names = ("abs_rel_degradation", "delta1_degradation", "delta1_error_degradation")
+
+    if not values or "group_id" not in values:
+        return {}
+
+    prepared = {key: tensor.detach().flatten().float().cpu() for key, tensor in values.items()}
+    group_ids = prepared["group_id"]
+    num_total_samples = int(group_ids.numel())
+    primary_valid = torch.isfinite(group_ids)
+    for key in ("R", "abs_rel_degradation", "delta1_degradation", "delta1_error_degradation"):
+        primary_valid = primary_valid & torch.isfinite(prepared[key])
+
+    metrics: Dict[str, float] = {
+        "num_total_samples": float(num_total_samples),
+        "num_valid_samples": float(primary_valid.sum().item()),
+        "num_invalid_samples": float(num_total_samples - int(primary_valid.sum().item())),
+    }
+
+    if primary_valid.any():
+        metrics["negative_abs_rel_degradation_ratio"] = float((prepared["abs_rel_degradation"][primary_valid] < 0).float().mean().item())
+        metrics["negative_delta_degradation_ratio"] = float((prepared["delta1_degradation"][primary_valid] < 0).float().mean().item())
+    else:
+        metrics["negative_abs_rel_degradation_ratio"] = float("nan")
+        metrics["negative_delta_degradation_ratio"] = float("nan")
+
+    for score_name in score_names:
+        for target_name in target_names:
+            score = prepared[score_name]
+            target = prepared[target_name]
+            valid = torch.isfinite(score) & torch.isfinite(target) & torch.isfinite(group_ids)
+            key = f"{score_name}_vs_{target_name}"
+            if valid.sum().item() < 3:
+                metrics[f"pearson_{key}"] = float("nan")
+                metrics[f"spearman_{key}"] = float("nan")
+                metrics[f"num_samples_{key}"] = float(valid.sum().item())
+                continue
+
+            corr = compute_vector_masked_correlations(score, target, valid_mask=valid, max_samples=max_samples, prefix=key)
+            metrics[f"pearson_{key}"] = corr[f"{key}_pearson"]
+            metrics[f"spearman_{key}"] = corr[f"{key}_spearman"]
+            metrics[f"num_samples_{key}"] = float(valid.sum().item())
+
+    for target_name in target_names:
+        r_key = f"R_vs_{target_name}"
+        sqrt_key = f"sqrt_R_vs_{target_name}"
+        r_spearman = metrics.get(f"spearman_{r_key}", float("nan"))
+        sqrt_spearman = metrics.get(f"spearman_{sqrt_key}", float("nan"))
+        if torch.isfinite(torch.tensor(r_spearman)) and torch.isfinite(torch.tensor(sqrt_spearman)):
+            metrics[f"spearman_R_sqrt_R_diff_{target_name}"] = abs(r_spearman - sqrt_spearman)
+
+    for score_name in group_score_names:
+        for target_name in grouped_target_names:
+            score = prepared[score_name]
+            target = prepared[target_name]
+            valid = torch.isfinite(score) & torch.isfinite(target) & torch.isfinite(group_ids)
+            key = f"{score_name}_vs_{target_name}"
+
+            centered_scores = []
+            centered_targets = []
+            group_spearman_values = []
+            num_centered_groups = 0
+            pair_total = 0
+            pair_valid = 0
+            pair_tied = 0
+            pair_correct = 0
+            regrets = []
+            normalized_regrets = []
+            top1_hits = []
+            zero_regret_hits = []
+
+            for group_id in torch.unique(group_ids[valid]):
+                group_mask = valid & (group_ids == group_id)
+                group_score = score[group_mask]
+                group_target = target[group_mask]
+                group_count = int(group_score.numel())
+                if group_count < 2:
+                    continue
+
+                centered_scores.append(group_score - group_score.mean())
+                centered_targets.append(group_target - group_target.mean())
+                num_centered_groups += 1
+
+                if group_count >= 3 and (group_score.max() - group_score.min()).abs() > eps and (group_target.max() - group_target.min()).abs() > eps:
+                    group_spearman = spearman_corr(group_score, group_target)
+                    if torch.isfinite(group_spearman):
+                        group_spearman_values.append(group_spearman)
+
+                for left in range(group_count - 1):
+                    for right in range(left + 1, group_count):
+                        pair_total += 1
+                        target_gap = torch.abs(group_target[left] - group_target[right]) / (torch.abs(group_target[left]) + torch.abs(group_target[right]) + eps)
+                        if target_gap < relative_tie_margin:
+                            pair_tied += 1
+                            continue
+                        pair_valid += 1
+                        if torch.sign(group_score[left] - group_score[right]).item() == torch.sign(group_target[left] - group_target[right]).item():
+                            pair_correct += 1
+
+                predicted_index = torch.argmin(group_score)
+                best_target = group_target.min()
+                regret = group_target[predicted_index] - best_target
+                target_range = group_target.max() - best_target
+                regrets.append(regret)
+                normalized_regrets.append(regret / (target_range + eps))
+                top1_hits.append((group_target[predicted_index] <= best_target + eps).float())
+                zero_regret_hits.append((regret.abs() <= eps).float())
+
+            if centered_scores:
+                centered_score = torch.cat(centered_scores, dim=0)
+                centered_target = torch.cat(centered_targets, dim=0)
+                if centered_score.numel() >= 3:
+                    metrics[f"group_centered_pearson_{key}"] = float(pearson_corr(centered_score, centered_target).item())
+                else:
+                    metrics[f"group_centered_pearson_{key}"] = float("nan")
+                metrics[f"group_centered_num_samples_{key}"] = float(centered_score.numel())
+                metrics[f"group_centered_num_groups_{key}"] = float(num_centered_groups)
+            else:
+                metrics[f"group_centered_pearson_{key}"] = float("nan")
+                metrics[f"group_centered_num_samples_{key}"] = 0.0
+                metrics[f"group_centered_num_groups_{key}"] = 0.0
+
+            if group_spearman_values:
+                group_spearman_tensor = torch.stack(group_spearman_values).float()
+                metrics[f"groupwise_mean_spearman_{key}"] = float(group_spearman_tensor.mean().item())
+                metrics[f"groupwise_median_spearman_{key}"] = float(group_spearman_tensor.median().item())
+                metrics[f"groupwise_std_spearman_{key}"] = float(group_spearman_tensor.std(unbiased=False).item())
+                metrics[f"groupwise_num_valid_groups_{key}"] = float(group_spearman_tensor.numel())
+            else:
+                metrics[f"groupwise_mean_spearman_{key}"] = float("nan")
+                metrics[f"groupwise_median_spearman_{key}"] = float("nan")
+                metrics[f"groupwise_std_spearman_{key}"] = float("nan")
+                metrics[f"groupwise_num_valid_groups_{key}"] = 0.0
+
+            metrics[f"pairwise_num_total_pairs_{key}"] = float(pair_total)
+            metrics[f"pairwise_num_valid_pairs_{key}"] = float(pair_valid)
+            metrics[f"pairwise_num_tied_pairs_{key}"] = float(pair_tied)
+            metrics[f"pairwise_num_correct_pairs_{key}"] = float(pair_correct)
+            metrics[f"pairwise_accuracy_{key}"] = float(pair_correct / pair_valid) if pair_valid > 0 else float("nan")
+
+            if regrets:
+                regret_tensor = torch.stack(regrets).float()
+                normalized_regret_tensor = torch.stack(normalized_regrets).float()
+                top1_tensor = torch.stack(top1_hits).float()
+                zero_regret_tensor = torch.stack(zero_regret_hits).float()
+                metrics[f"selection_mean_regret_{key}"] = float(regret_tensor.mean().item())
+                metrics[f"selection_median_regret_{key}"] = float(regret_tensor.median().item())
+                metrics[f"selection_normalized_mean_regret_{key}"] = float(normalized_regret_tensor.mean().item())
+                metrics[f"selection_top1_setting_accuracy_{key}"] = float(top1_tensor.mean().item())
+                metrics[f"selection_zero_regret_ratio_{key}"] = float(zero_regret_tensor.mean().item())
+            else:
+                metrics[f"selection_mean_regret_{key}"] = float("nan")
+                metrics[f"selection_median_regret_{key}"] = float("nan")
+                metrics[f"selection_normalized_mean_regret_{key}"] = float("nan")
+                metrics[f"selection_top1_setting_accuracy_{key}"] = float("nan")
+                metrics[f"selection_zero_regret_ratio_{key}"] = float("nan")
+
+    return metrics
+
 # @torch.no_grad()
 # def compute_masked_correlations(
 #     x: torch.Tensor,

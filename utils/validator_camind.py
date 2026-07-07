@@ -58,12 +58,15 @@ def _accumulate_validation_result(accumulator, result):
     _extend_metric_values(accumulator, result["ause_metrics"])
     _extend_metric_values(accumulator, result["aurg_metrics"])
     _extend_metric_values(accumulator, result["aru_rmsu"])
+    _extend_metric_values(accumulator, result["degradation_values"])
 
 
 def _finalize_validation_accumulator(accumulator):
     val_metrics = {}
     for key, values in accumulator.items():
         if not isinstance(values, list):
+            continue
+        if key == "group_id":
             continue
         if not values:
             continue
@@ -93,6 +96,24 @@ def _finalize_validation_accumulator(accumulator):
         )
         val_metrics.update(a1_uncertainty_correlation)
         val_metrics.update(abs_rel_uncertainty_correlation)
+    degradation_keys = (
+        "B2",
+        "V",
+        "R",
+        "sqrt_R",
+        "log_R",
+        "abs_rel_degradation",
+        "delta1_degradation",
+        "delta1_error_degradation",
+        "group_id",
+    )
+    if accumulator.get("R") and accumulator.get("group_id"):
+        degradation_values = {
+            key: torch.cat(accumulator[key], dim=0)
+            for key in degradation_keys
+            if accumulator.get(key)
+        }
+        val_metrics.update(summarize_camera_induced_degradation_correlations(degradation_values))
     return val_metrics
 
 
@@ -118,6 +139,7 @@ def _select_batch_result(result, sample_mask):
         "correlations": _select_metric_values(result["correlations"], sample_mask),
         "aru_rmsu": _select_metric_values(result["aru_rmsu"], sample_mask),
         "uncertainty_mean": _select_metric_values(result["uncertainty_mean"], sample_mask),
+        "degradation_values": _select_metric_values(result["degradation_values"], sample_mask),
     }
 
 def __create_accumulator():
@@ -141,7 +163,16 @@ def __create_accumulator():
         "aurg_abs_rel": [],
         "aurg_a1": [],
         "aru": [],
-        "rmsu": []
+        "rmsu": [],
+        "B2": [],
+        "V": [],
+        "R": [],
+        "sqrt_R": [],
+        "log_R": [],
+        "abs_rel_degradation": [],
+        "delta1_degradation": [],
+        "delta1_error_degradation": [],
+        "group_id": [],
     }
 
 @torch.no_grad()
@@ -187,10 +218,15 @@ def validate(
         candidate_imgs = flat_batch["candidate_images"]
         canonical_imgs = flat_batch["canonical_images"]
         candidate_depth = flat_batch["candidate_depths"]
+        canonical_depth = flat_batch["canonical_depths"]
         candidate_valid_mask = flat_batch["candidate_valid_mask"]
+        canonical_valid_mask = torch.isfinite(canonical_depth)
+        canonical_valid_mask &= canonical_depth > min_depth
+        canonical_valid_mask &= canonical_depth < max_depth
         candidate_condition = flat_batch["camera_context"]
 
         target_size = candidate_depth.shape[-2:]
+        group_ids = batch["group_index"].to(device=device)[:, None].expand(-1, num_candidates).reshape(-1)
         topology_number = batch["info"][:, 6].to(device=device).long() # The topology number is stored in the 7th column of the info tensor
         topology_number = topology_number[:, None].expand(-1, num_candidates)
         topology_number = topology_number.reshape(-1)      # [G*K]
@@ -208,6 +244,12 @@ def validate(
                     out["candidate_depth"],
                     candidate_depth,
                     candidate_valid_mask,
+                    align_mode=relative_align_mode,
+                )
+                canonical_aligned = align_relative_prediction_to_depth_space(
+                    out["canonical_depth"],
+                    canonical_depth,
+                    canonical_valid_mask,
                     align_mode=relative_align_mode,
                 )
                 aligned_std = out["std"]
@@ -253,6 +295,13 @@ def validate(
             min_depth=min_depth,
             max_depth=max_depth,
         )
+        canonical_batched_metrics = compute_comprehensive_depth_metrics(
+            mu=canonical_aligned["depth"].detach(),
+            target=canonical_depth,
+            valid_mask=canonical_valid_mask,
+            min_depth=min_depth,
+            max_depth=max_depth,
+        )
         correlations = compute_loss_uncertainty_correlations(
             mu_aligned.detach(),
             candidate_depth,
@@ -290,6 +339,14 @@ def validate(
         )
         batch_uncertainty_mean = masked_image_mean(uncertainty_map, candidate_valid_mask)
         batch_depth_uncertainty_mean = masked_image_mean(std_aligned, candidate_valid_mask)
+        degradation_values = compute_camera_induced_degradation_values(
+            candidate_metrics=batched_metrics,
+            canonical_metrics=canonical_batched_metrics,
+            camera_bias=out["camera_bias"],
+            variance=out["variance"],
+            valid_mask=candidate_valid_mask,
+            group_ids=group_ids,
+        )
         batch_result = {
             "loss": loss.item(),
             "prefix_head": prefix_head,
@@ -301,7 +358,8 @@ def validate(
             "uncertainty_mean": {
                 "uncertainty_mean": batch_uncertainty_mean,
                 "depth_uncertainty_mean": batch_depth_uncertainty_mean,
-            }
+            },
+            "degradation_values": degradation_values,
         }
         _accumulate_validation_result(total_accumulator, batch_result)
         if seen_topology_numbers is not None:
