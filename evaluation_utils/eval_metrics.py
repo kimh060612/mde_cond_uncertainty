@@ -412,6 +412,13 @@ def summarize_camera_induced_degradation_correlations(
     relative_tie_margin: float = 0.05,
     eps: float = 1e-8,
 ) -> Dict[str, float]:
+    logged_metric_names = (
+        "selection_mean_regret_R_vs_abs_rel_degradation",
+        "pairwise_accuracy_R_vs_abs_rel_degradation",
+        "groupwise_mean_spearman_R_vs_abs_rel_degradation",
+        "pearson_R_vs_abs_rel_degradation",
+        "spearman_R_vs_abs_rel_degradation",
+    )
     score_names = ("R", "sqrt_R", "log_R", "B2", "V")
     target_names = ("abs_rel_degradation", "delta1_degradation", "delta1_error_degradation")
     group_score_names = ("R", "B2", "V")
@@ -571,7 +578,11 @@ def summarize_camera_induced_degradation_correlations(
                 metrics[f"selection_top1_setting_accuracy_{key}"] = float("nan")
                 metrics[f"selection_zero_regret_ratio_{key}"] = float("nan")
 
-    return metrics
+    return {
+        key: metrics[key]
+        for key in logged_metric_names
+        if key in metrics
+    }
 
 # @torch.no_grad()
 # def compute_masked_correlations(
