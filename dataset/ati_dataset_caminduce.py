@@ -869,7 +869,7 @@ def flatten_group_batch(batch: Mapping[str, Any]) -> dict[str, Any]:
     candidates = batch["candidate_images"]
     canonicals = batch["canonical_images"]
 
-    if candidates.ndim != 6:
+    if candidates.ndim != 5:
         raise ValueError("candidate_images must have shape [G, K, C, H, W].")
 
     if canonicals.shape != candidates.shape:
