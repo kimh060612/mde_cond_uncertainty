@@ -1,4 +1,5 @@
 from scipy.fftpack import shift
+from typing import Dict
 
 from dataset.ati_dataset_refactored import (
     ATIRealWorldUncertaintyBaseDataset
@@ -6,6 +7,50 @@ from dataset.ati_dataset_refactored import (
 import torch
 import os
 from evaluation_utils.eval_utils import compute_relative_alignment, ensure_bchw
+import random
+import numpy as np
+
+
+def seed_everything(
+    seed: int = 42,
+    deterministic: bool = True,
+) -> None:
+    """
+    Fix random seeds for reproducible Python, NumPy, and PyTorch experiments.
+
+    Args:
+        seed:
+            Random seed value.
+
+        deterministic:
+            If True, enables deterministic PyTorch algorithms where possible.
+            This can reduce performance and may raise errors for operations
+            without deterministic implementations.
+    """
+    os.environ["PYTHONHASHSEED"] = str(seed)
+
+    # cuBLAS reproducibility. Must be set before relevant CUDA operations.
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+
+    random.seed(seed)
+    np.random.seed(seed)
+
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    if deterministic:
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+
+        torch.use_deterministic_algorithms(
+            True,
+            warn_only=True,
+        )
+    else:
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = False
+        torch.use_deterministic_algorithms(False)
 
 def prefix_metrics(prefix, metrics):
     return {f"{prefix}/{key}": value for key, value in metrics.items()}
@@ -123,3 +168,41 @@ def compute_align_scale_shift(pred, gt, valid_mask, eps=1e-8):
         align_mode="scale_shift",
         eps=eps,
     )
+
+def reshape_group_batch(tensor: torch.Tensor, num_groups: int, num_candidates: int) -> torch.Tensor:
+    return tensor.reshape(
+        num_groups,
+        num_candidates,
+        *tensor.shape[1:],
+    )
+    
+def masked_image_mean(values, valid_mask):
+    mask = valid_mask.bool()
+    if mask.ndim == 3:
+        mask = mask.unsqueeze(1)
+    if mask.shape != values.shape:
+        mask = mask.expand_as(values)
+    counts = mask.flatten(1).sum(dim=1)
+    means = (
+        torch.where(mask, values, torch.zeros_like(values))
+        .flatten(1)
+        .sum(dim=1)
+        / counts.clamp_min(1).to(dtype=values.dtype)
+    )
+    return torch.where(
+        counts > 0,
+        means,
+        means.new_full(means.shape, float("nan")),
+    )
+    
+def tensor_device(
+    tensor_dict: Dict[str, torch.Tensor], 
+    device: torch.device
+) -> Dict[str, torch.Tensor]:
+    
+    t_dict = { key: tensor.to(device) for key, tensor in tensor_dict.items() if isinstance(tensor, torch.Tensor) }
+    non_tensor_dict = { key: tensor for key, tensor in tensor_dict.items() if not isinstance(tensor, torch.Tensor) }
+    return {
+        **t_dict, 
+        **non_tensor_dict
+    }

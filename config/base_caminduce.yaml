@@ -1,51 +1,65 @@
 dataset:
   name: ati_dataset
-  dataset_root: /home/kimh060612/ati_workspace/realworld_dataset
+  dataset_root: /home/kimh060612/ati_workspace/orbbec_realworld_dataset
+  csv_path: /home/kimh060612/ati_workspace/orbbec_csv_matched_realworld_dataset
   min_depth: 1e-3
   max_depth: 10.0
   min_valid_depth_ratio: 0.9
   output_dir: ./da2_ati_cond_uncertainty_ckpt
   num_workers: 8
+  exposure_min: 4000
+  exposure_max: 32000
+  gain_min: 16
+  gain_max: 128
   train_topologies:
     - "topology1"
-    - "topology2"
-    - "topology4"
   seen_val_topologies:
-    - "topology2"
-    - "topology4"
+    - "topology1"
   unseen_val_topologies:
-    - "topology3"
-    - "topology5"
+    - "topology2"
 
 model:
   model_id: "small"
+  camera_model_name: "Orbbec-Gemini-336L"
   image_height: 518
   image_width: 518
-  uncertainty_width: 32
+  uncertainty_width: 64
+  film_layer_width: 128
   uncertainty_blocks: 3
   uncertainty_dropout: 0.05
   
 training:
   seed: 2026
-  batch_size: 16
+  batch_size: 8
+  candidates_per_group: 4
   num_epochs: 10
   lr_backbone: 1e-6
   lr_uncertainty: 1e-4
   weight_decay: 1e-4
   freeze_backbone: true
-  min_log_var: -5.0
-  max_log_var: 3.0
+  min_log_var: -2.5
+  max_log_var: 1.0
+  initial_std: 0.5
+  variance_head_init_std: 1e-3
+  max_bias: 0.5
   listnet_temperature: 0.1
   list_loss_weight: 0.1
+  lambda_variance: 1.0
   lambda_smooth_logvar: 1e-3
   grad_clip: 1.0
   relative_align_mode: scale_shift
   wandb_entity: artificial_tripartite_intelligence_team
   wandb_project: mde_uncertainty_measure
   wandb_name: dav2_cond_uncertainty
-  uncertainty_mode: "top20"
+  uncertainty_mode: "mean"
   disable_wandb: false
   no_amp: false
   log_interval: 20
   correlation_max_samples: 100000
   detach_uncertainty_feature: true
+  lr_scheduler_monitor: aggregated_abs_rel_unc_pearson
+  lr_scheduler_factor: 0.5
+  lr_scheduler_patience: 1
+  lr_scheduler_threshold: 1e-4
+  lr_scheduler_cooldown: 0
+  lr_scheduler_min_lr_ratio: 0.05

@@ -27,6 +27,7 @@ model:
   uncertainty_dropout: 0.05
   
 training:
+  seed: 2026
   batch_size: 16
   num_epochs: 10
   lr_backbone: 1e-6

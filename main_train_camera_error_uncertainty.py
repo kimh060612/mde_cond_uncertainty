@@ -2,28 +2,30 @@ import math
 import torch
 from torch.utils.data import DataLoader, Subset
 import wandb
+import hydra
+import logging
+from glob import glob
 from transformers import AutoImageProcessor
-from dataset.ati_dataset_refactored import (
-    ATIRealWorldUncertaintyDataset,
-    ATIRealWorldUncertaintyValidationDataset,
-    ati_collate_fn,
+from dataset.ati_dataset_caminduce import (
+    CameraParameterRange,
+    PairedResizeToTensor,
     LIGHT_LEVELS,
     MOTION_LEVELS,
+    FoundationCameraGroupedDataset
 )
-from model.dav2_ati_model import ConditionedGaussianDepthAnythingV2, MODEL_IDS
-from model.dav2_unccond_model import DepthAnythingFiLMUncertainty, MODEL_IDS
-from model.dav2_ati_bias_model import FrozenDepthCameraGaussian
+from dataset.ati_dataset_caminduce import *
+from model.dav2_ati_model import MODEL_IDS
+from model.dav2_camerror_model import CameraInducedErrorModel
 from omegaconf import DictConfig, OmegaConf
-import hydra
 from utils.train_utils import *
-from utils.trainer import train_one_epoch
-from utils.validator import validate
-import logging
+from utils.trainer_camind import train_one_epoch
+from utils.validator_camind import validate
 from utils.logger import setup_logger
 
+from torch.utils.data import DataLoader
 
 
-@hydra.main(config_path="config", config_name="base_mdebias")
+@hydra.main(config_path="config", config_name="base_caminduce")
 def main(cfg: DictConfig):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     amp = (device.type == "cuda") and (not cfg.training.no_amp)
@@ -50,16 +52,6 @@ def main(cfg: DictConfig):
         )
         
     image_processor = AutoImageProcessor.from_pretrained(model_id, cache_dir=None)
-    dataset_kwargs = {
-        "root_dir": cfg.dataset.dataset_root,
-        "image_processor": image_processor,
-        "image_size": (cfg.model.image_height, cfg.model.image_width),
-        "min_depth": cfg.dataset.min_depth,
-        "max_depth": cfg.dataset.max_depth,
-        "min_valid_depth_ratio": cfg.dataset.min_valid_depth_ratio,
-        "light_levels": LIGHT_LEVELS,
-        "speed_levels": MOTION_LEVELS,
-    }
     
     seen_val_topologies = [ str(topology).strip() for topology in cfg.dataset.seen_val_topologies ]
     unseen_val_topologies = [ str(topology).strip() for topology in cfg.dataset.unseen_val_topologies ]
@@ -69,48 +61,88 @@ def main(cfg: DictConfig):
     unseen_topology_idx = torch.Tensor(list(unseen_val_topology_ids)).long()
     print("[Training] Seen validation topologies:", seen_topology_idx)
     print("[Training] Unseen validation topologies:", unseen_topology_idx)
-    
-    train_set = ATIRealWorldUncertaintyDataset(
+
+    csv_paths = glob(f"{cfg.dataset.csv_path}/*.csv")
+    if len(csv_paths) == 0:
+        raise ValueError(f"No CSV files found in {cfg.dataset.csv_path}")
+        
+    train_set = FoundationCameraGroupedDataset(
+        csv_paths=csv_paths,
+        foundation_model_name=cfg.model.model_id,
+        camera_model_name=cfg.model.camera_model_name,
+        parameter_range=CameraParameterRange(
+            exposure_min=cfg.dataset.exposure_min,
+            exposure_max=cfg.dataset.exposure_max,
+            gain_min=cfg.dataset.gain_min,
+            gain_max=cfg.dataset.gain_max,
+        ),
+        candidates_per_group=cfg.training.candidates_per_group,
+        candidate_sampling="parameter_diverse",
+        parameter_normalization="linear",
+        context_output_range="zero_one",
+        path_replacements={
+            "/media/michael/ssd1/AIoT_ATI/orbbec_realworld_dataset":
+            cfg.dataset.dataset_root,
+        },
+        pair_transform=PairedResizeToTensor(size=(cfg.model.image_height, cfg.model.image_width)),
         topologies=cfg.dataset.train_topologies,
-        **dataset_kwargs,
+        load_images=True,
+        load_depth=True,
+        seed=cfg.training.seed,
     )
-    val_set = ATIRealWorldUncertaintyValidationDataset(
-        **dataset_kwargs,
+    val_set = FoundationCameraGroupedDataset(
+        csv_paths=csv_paths,
+        foundation_model_name=cfg.model.model_id,
+        camera_model_name=cfg.model.camera_model_name,
+        parameter_range=train_set.parameter_range,
+        candidates_per_group=cfg.training.candidates_per_group,
+        candidate_sampling="parameter_diverse",
+        parameter_normalization="linear",
+        context_output_range="zero_one",
+        path_replacements={
+            "/media/michael/ssd1/AIoT_ATI/orbbec_realworld_dataset":
+            cfg.dataset.dataset_root,
+        },
+        pair_transform=PairedResizeToTensor(size=(cfg.model.image_height, cfg.model.image_width)),
+        topologies=list(cfg.dataset.seen_val_topologies) + list(cfg.dataset.unseen_val_topologies),
+        load_images=True,
+        load_depth=True,
+        seed=cfg.training.seed,
     )
-    copy_condition_normalization(val_set, train_set)
-    validation_topology_counts = count_items_by_topology(val_set)
-    seen_val_indices = topology_subset_indices(val_set, seen_val_topology_ids)
-    unseen_val_indices = topology_subset_indices(val_set, unseen_val_topology_ids)
-    seen_val_count = len(seen_val_indices)
-    unseen_val_count = len(unseen_val_indices)
+    # copy_condition_normalization(val_set, train_set)
+    # validation_topology_counts = count_items_by_topology(val_set)
+    # seen_val_indices = topology_subset_indices(val_set, seen_val_topology_ids)
+    # unseen_val_indices = topology_subset_indices(val_set, unseen_val_topology_ids)
+    # seen_val_count = len(seen_val_indices)
+    # unseen_val_count = len(unseen_val_indices)
     
     dataset_metadata = {
-        "condition_names": list(train_set.condition_names),
+        "condition_names": list(train_set.camera_context_names),
         "light_levels": list(train_set.light_levels),
-        "speed_levels": list(train_set.speed_levels),
-        "exposure_min": train_set.exposure_min,
-        "exposure_max": train_set.exposure_max,
-        "gain_min": train_set.gain_min,
-        "gain_max": train_set.gain_max,
+        "speed_levels": list(train_set.motion_levels),
+        "exposure_min": train_set.parameter_range.exposure_min,
+        "exposure_max": train_set.parameter_range.exposure_max,
+        "gain_min": train_set.parameter_range.gain_min,
+        "gain_max": train_set.parameter_range.gain_max,
         "min_valid_depth_ratio": cfg.dataset.min_valid_depth_ratio,
-        "train_scan_stats": dict(train_set.scan_stats),
-        "validation_scan_stats": dict(val_set.scan_stats),
-        "validation_topology_counts": dict(validation_topology_counts),
+        # "train_scan_stats": dict(train_set.scan_stats),
+        # "validation_scan_stats": dict(val_set.scan_stats),
+        # "validation_topology_counts": dict(validation_topology_counts),
         "seen_validation_topologies": list(seen_val_topologies),
-        "seen_validation_samples": seen_val_count,
+        # "seen_validation_samples": seen_val_count,
         "unseen_validation_topologies": list(unseen_val_topologies),
-        "unseen_validation_samples": unseen_val_count,
+        # "unseen_validation_samples": unseen_val_count,
     }
     print(
         f"train samples: {len(train_set):,}, "
         f"val samples: {len(val_set):,}, "
-        f"seen val samples: {seen_val_count:,}, "
-        f"unseen val samples: {unseen_val_count:,}"
+        # f"seen val samples: {seen_val_count:,}, "
+        # f"unseen val samples: {unseen_val_count:,}"
     )
-    print(f"condition dim: {train_set.condition_dim}, names={list(train_set.condition_names)}")
-    print(f"train scan stats: {train_set.scan_stats}")
-    print(f"validation scan stats: {val_set.scan_stats}")
-    print(f"validation topology counts: {validation_topology_counts}")
+    print(f"condition dim: {train_set.condition_dim}, names={list(train_set.camera_context_names)}")
+    # print(f"train scan stats: {train_set.scan_stats}")
+    # print(f"validation scan stats: {val_set.scan_stats}")
+    # print(f"validation topology counts: {validation_topology_counts}")
     
     if wandb_run is not None:
         wandb_run.config.update(dataset_metadata, allow_val_change=True)
@@ -122,7 +154,6 @@ def main(cfg: DictConfig):
         shuffle=True,
         num_workers=cfg.dataset.num_workers,
         pin_memory=pin_memory,
-        collate_fn=ati_collate_fn,
     )
     val_loader = DataLoader(
         val_set,
@@ -130,29 +161,9 @@ def main(cfg: DictConfig):
         shuffle=False,
         num_workers=cfg.dataset.num_workers,
         pin_memory=pin_memory,
-        collate_fn=ati_collate_fn,
     )
 
-    # model = DepthAnythingFiLMUncertainty(
-    #     model_id=model_id,
-    #     context_dim=train_set.condition_dim,
-    #     min_log_variance=cfg.training.min_log_var,
-    #     max_log_variance=cfg.training.max_log_var,
-    #     uncertainty_channels=cfg.model.uncertainty_width,
-    #     film_hidden_dim=cfg.model.film_layer_width,
-    #     detach_uncertainty_feature=cfg.training.detach_uncertainty_feature,
-    # ).to(device)
-    # model = ConditionedGaussianDepthAnythingV2(
-    #     model_id=model_id,
-    #     cond_dim=train_set.condition_dim,
-    #     freeze_backbone=cfg.training.freeze_backbone,
-    #     min_log_var=cfg.training.min_log_var,
-    #     max_log_var=cfg.training.max_log_var,
-    #     uncertainty_width=cfg.model.uncertainty_width,
-    #     uncertainty_blocks=cfg.model.uncertainty_blocks,
-    #     uncertainty_dropout=cfg.model.uncertainty_dropout,
-    # ).to(device)
-    model = FrozenDepthCameraGaussian(
+    model = CameraInducedErrorModel(
         model_id=model_id,
         context_dim=train_set.condition_dim,
         cache_dir=None,
@@ -203,17 +214,6 @@ def main(cfg: DictConfig):
             for group in optimizer.param_groups
         ],
     )
-    # count_model_param_finetune(model)
-    # optimizer = torch.optim.AdamW(
-    #     [
-    #         { "params": model.depth_model.neck.parameters(), "lr": cfg.training.lr_backbone },
-    #         { "params": model.depth_model.head.parameters(), "lr": cfg.training.lr_backbone },
-    #         { "params": model.uncertainty_projection.parameters(), "lr": cfg.training.lr_uncertainty },
-    #         { "params": model.film_generator.parameters(), "lr": cfg.training.lr_uncertainty },
-    #         { "params": model.uncertainty_head.parameters(), "lr": cfg.training.lr_uncertainty },
-    #     ],
-    #     weight_decay=cfg.training.weight_decay,
-    # )
 
     scaler = torch.amp.GradScaler("cuda", enabled=amp)
 

@@ -3,5 +3,6 @@ wandb/
 __pycache__/
 .vscode/
 comparison_ae/
+evaluation_models/*
 ckpt*
 outputs/*
