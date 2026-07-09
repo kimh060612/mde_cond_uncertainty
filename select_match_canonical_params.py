@@ -949,7 +949,7 @@ def _find_best_canonical_match(source_record, source_lap_records, canonical_entr
             registration_status = "registration_overlap_too_low"
         elif registered_depth_mean_abs_diff > DEPTH_MATCH_MAX_MEAN_ABS_DIFF:
             registration_status = "registered_depth_diff_too_large"
-        elif registered_ecc_scores > DEPTH_MATCH_MIN_ECC_SCORE:
+        elif registered_ecc_scores < DEPTH_MATCH_MIN_ECC_SCORE:
             registration_status = "registered_ecc_score_is_too_low"
         else:
             registration_status = "registered"
