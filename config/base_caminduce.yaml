@@ -13,8 +13,10 @@ dataset:
   gain_max: 128
   train_topologies:
     - "topology1"
+    # - "topology3"
   seen_val_topologies:
     - "topology1"
+    # - "topology3"
   unseen_val_topologies:
     - "topology2"
 

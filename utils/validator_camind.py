@@ -266,7 +266,7 @@ def validate(
             group_canonical_depth = reshape_group_batch(out["canonical_depth"], num_groups, num_candidates)
             group_candidate_depth = reshape_group_batch(out["candidate_depth"], num_groups, num_candidates)
             cam_bias = reshape_group_batch(out["camera_bias"], num_groups, num_candidates)
-            cam_variance = reshape_group_batch(out["raw_variance"], num_groups, num_candidates)
+            cam_variance = reshape_group_batch(out["variance"], num_groups, num_candidates)
             predicted_risk, target_risk = camera_risk_scores(
                 bias=cam_bias,
                 variance=cam_variance,
