@@ -375,6 +375,19 @@ REGISTRATION_ECC_EPS = 1e-4
 DEPTH_MATCH_MIN_ECC_SCORE = 0.9
 REGISTRATION_SCORE_TIME_WEIGHT = 0.02
 NO_MATCH_VALUE = -1
+DEPTH_PERFORMANCE_METRICS = ("abs_rel", "sq_rel", "rmse", "rmse_log", "a1", "a2", "a3")
+LOWER_IS_BETTER_PERFORMANCE_METRICS = {"abs_rel", "sq_rel", "rmse", "rmse_log"}
+HIGHER_IS_BETTER_PERFORMANCE_METRICS = {"a1", "a2", "a3"}
+PERFORMANCE_ANALYSIS_OUTPUT_DIR = CANONICAL_MATCH_OUTPUT_DIR / "performance_degradation_analysis"
+PERFORMANCE_KL_OUTPUT_CSV = PERFORMANCE_ANALYSIS_OUTPUT_DIR / "performance_degradation_kl_divergence.csv"
+PERFORMANCE_DISTRIBUTION_PLOT_DIR = PERFORMANCE_ANALYSIS_OUTPUT_DIR / "distribution_plots"
+KL_DISTRIBUTION_BINS = int(os.environ.get("KL_DISTRIBUTION_BINS", "50"))
+KL_MIN_SAMPLES_PER_DISTRIBUTION = int(os.environ.get("KL_MIN_SAMPLES_PER_DISTRIBUTION", "5"))
+KL_PLOT_METRICS = tuple(
+    metric.strip()
+    for metric in os.environ.get("KL_PLOT_METRICS", ",".join(DEPTH_PERFORMANCE_METRICS)).split(",")
+    if metric.strip()
+)
 
 def _pair_dir_by_exposure_gain():
     return {
@@ -401,6 +414,7 @@ CSV_COLUMNS = [
     "source_motion_label",
     "source_rgb_path",
     "source_depth_path",
+    *[f"source_metric_{metric}" for metric in DEPTH_PERFORMANCE_METRICS],
     "canonical_exposure",
     "canonical_gain",
     "canonical_pair_index",
@@ -433,6 +447,8 @@ CSV_COLUMNS = [
     "rgb_max_abs_diff",
     "matched_rgb_path",
     "matched_depth_path",
+    *[f"canonical_metric_{metric}" for metric in DEPTH_PERFORMANCE_METRICS],
+    *[f"performance_degradation_{metric}" for metric in DEPTH_PERFORMANCE_METRICS],
     "match_status",
 ]
 
@@ -1001,8 +1017,87 @@ def _find_best_canonical_match(source_record, source_lap_records, canonical_entr
     return best_match
 
 
+performance_metric_lookup_cache = {}
+
+
+def _empty_performance_metric_fields():
+    fields = {}
+    for metric in DEPTH_PERFORMANCE_METRICS:
+        fields[f"source_metric_{metric}"] = NO_MATCH_VALUE
+        fields[f"canonical_metric_{metric}"] = NO_MATCH_VALUE
+        fields[f"performance_degradation_{metric}"] = NO_MATCH_VALUE
+    return fields
+
+
+def _valid_performance_value(value):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return False
+    return np.isfinite(value) and value >= 0.0
+
+
+def _safe_performance_value(metric_record, metric_name):
+    if not metric_record:
+        return NO_MATCH_VALUE
+    try:
+        value = float(metric_record.get(metric_name, NO_MATCH_VALUE))
+    except (TypeError, ValueError):
+        return NO_MATCH_VALUE
+    if not _valid_performance_value(value):
+        return NO_MATCH_VALUE
+    return value
+
+
+def _scene_performance_metric_lookup(scene_name):
+    if scene_name not in performance_metric_lookup_cache:
+        lookup = {}
+        for motion_metrics_by_pair in metric_list.get(scene_name, {}).values():
+            for metric_records in motion_metrics_by_pair.values():
+                for metric_record in metric_records:
+                    rgb_path = metric_record.get("rgb_path")
+                    if rgb_path:
+                        lookup[str(rgb_path)] = metric_record
+        performance_metric_lookup_cache[scene_name] = lookup
+    return performance_metric_lookup_cache[scene_name]
+
+
+def _performance_metric_record(frame_record):
+    if frame_record is None:
+        return None
+    scene_lookup = _scene_performance_metric_lookup(frame_record["scene"])
+    return scene_lookup.get(str(frame_record.get("rgb_path")))
+
+
+def _performance_degradation(metric_name, source_value, canonical_value):
+    if not (_valid_performance_value(source_value) and _valid_performance_value(canonical_value)):
+        return NO_MATCH_VALUE
+    if metric_name in LOWER_IS_BETTER_PERFORMANCE_METRICS:
+        return float(source_value - canonical_value)
+    if metric_name in HIGHER_IS_BETTER_PERFORMANCE_METRICS:
+        return float(canonical_value - source_value)
+    return float(source_value - canonical_value)
+
+
+def _performance_metric_fields(source_record=None, canonical_record=None):
+    fields = _empty_performance_metric_fields()
+    source_metrics = _performance_metric_record(source_record)
+    canonical_metrics = _performance_metric_record(canonical_record)
+    for metric in DEPTH_PERFORMANCE_METRICS:
+        source_value = _safe_performance_value(source_metrics, metric)
+        canonical_value = _safe_performance_value(canonical_metrics, metric)
+        fields[f"source_metric_{metric}"] = source_value
+        fields[f"canonical_metric_{metric}"] = canonical_value
+        fields[f"performance_degradation_{metric}"] = _performance_degradation(
+            metric,
+            source_value,
+            canonical_value,
+        )
+    return fields
+
+
 def _source_row_base(source_record):
-    return {
+    row = {
         "scene": source_record["scene"],
         "source_pair_index": source_record["pair_index"],
         "source_pair_dir": source_record["pair_dir"],
@@ -1015,6 +1110,8 @@ def _source_row_base(source_record):
         "source_rgb_path": source_record["rgb_path"],
         "source_depth_path": source_record["depth_path"],
     }
+    row.update(_performance_metric_fields(source_record=source_record))
+    return row
 
 
 def _no_match_fields(match_status, canonical_param=None):
@@ -1057,7 +1154,7 @@ def _no_match_fields(match_status, canonical_param=None):
     return row
 
 
-def _match_fields(best_match, canonical_param):
+def _match_fields(best_match, canonical_param, source_record):
     exposure, gain, pair_index, pair_dir = canonical_param
     matched_record = best_match["record"]
     return {
@@ -1093,6 +1190,7 @@ def _match_fields(best_match, canonical_param):
         "rgb_max_abs_diff": best_match["rgb_max_abs_diff"],
         "matched_rgb_path": matched_record["rgb_path"],
         "matched_depth_path": matched_record["depth_path"],
+        **_performance_metric_fields(source_record=source_record, canonical_record=matched_record),
         "match_status": "matched",
     }
 
@@ -1153,9 +1251,10 @@ def _match_row_for_source_record(source_record, source_lap_records, canonical_fr
             "rgb_rmse_diff": best_match["rgb_rmse_diff"],
             "rgb_max_abs_diff": best_match["rgb_max_abs_diff"],
         })
+        row.update(_performance_metric_fields(source_record=source_record, canonical_record=best_match["record"]))
         return row
 
-    row.update(_match_fields(best_match, canonical_param))
+    row.update(_match_fields(best_match, canonical_param, source_record))
     return row
 
 
@@ -1164,6 +1263,27 @@ def _reset_canonical_match_outputs():
     with open(CANONICAL_MATCH_OUTPUT_CSV, "w", newline="") as csv_file:
         writer = csv.DictWriter(csv_file, fieldnames=CSV_COLUMNS)
         writer.writeheader()
+
+
+def _csv_has_columns(csv_path, required_columns):
+    csv_path = Path(csv_path)
+    if not csv_path.exists():
+        return False
+    with open(csv_path, "r", newline="") as csv_file:
+        reader = csv.DictReader(csv_file)
+        return set(required_columns).issubset(set(reader.fieldnames or []))
+
+
+def _append_existing_scene_matches_to_global(scene_csv_path):
+    scene_csv_path = Path(scene_csv_path)
+    if not _csv_has_columns(scene_csv_path, CSV_COLUMNS):
+        return False
+    with open(scene_csv_path, "r", newline="") as scene_csv_file, open(CANONICAL_MATCH_OUTPUT_CSV, "a", newline="") as global_csv_file:
+        reader = csv.DictReader(scene_csv_file)
+        writer = csv.DictWriter(global_csv_file, fieldnames=CSV_COLUMNS)
+        for row in reader:
+            writer.writerow({column: row.get(column, NO_MATCH_VALUE) for column in CSV_COLUMNS})
+    return True
 
 
 def _write_canonical_matches_for_scene(scene_name, canonical_frame_index=None, append_global=True):
@@ -1237,6 +1357,246 @@ def _write_canonical_matches_for_scene(scene_name, canonical_frame_index=None, a
         "output_csv": scene_output_csv,
     }
 
+
+
+def _parse_scene_name(scene_name):
+    prefix = f"{SCENE_PREFIX}_"
+    if not scene_name.startswith(prefix):
+        return None
+    parts = scene_name[len(prefix):].split("_")
+    if len(parts) < 3:
+        return None
+    return {
+        "light": "_".join(parts[:-2]),
+        "speed": parts[-2],
+        "topology": parts[-1],
+    }
+
+
+def _as_finite_float(value):
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(value) or value == NO_MATCH_VALUE:
+        return None
+    return value
+
+
+def _load_enriched_match_rows(match_csv_path=CANONICAL_MATCH_OUTPUT_CSV):
+    match_csv_path = Path(match_csv_path)
+    if not match_csv_path.exists():
+        return []
+    with open(match_csv_path, "r", newline="") as csv_file:
+        return list(csv.DictReader(csv_file))
+
+
+def _scene_name(light, speed, topology):
+    return f"{SCENE_PREFIX}_{light}_{speed}_{topology}"
+
+
+def _degradation_values(rows, scene_name, motion_label, metric_name):
+    column = f"performance_degradation_{metric_name}"
+    values = []
+    for row in rows:
+        if row.get("scene") != scene_name or row.get("source_motion_label") != motion_label:
+            continue
+        value = _as_finite_float(row.get(column))
+        if value is not None:
+            values.append(value)
+    return np.asarray(values, dtype=np.float64)
+
+
+def _pooled_degradation_values(rows, light, speed, topologies, motion_label, metric_name):
+    arrays = [
+        _degradation_values(rows, _scene_name(light, speed, topology), motion_label, metric_name)
+        for topology in topologies
+    ]
+    arrays = [values for values in arrays if values.size]
+    if not arrays:
+        return np.asarray([], dtype=np.float64)
+    return np.concatenate(arrays)
+
+
+def _kl_divergence_from_samples(left_values, right_values, bins=KL_DISTRIBUTION_BINS):
+    left_values = np.asarray(left_values, dtype=np.float64)
+    right_values = np.asarray(right_values, dtype=np.float64)
+    left_values = left_values[np.isfinite(left_values)]
+    right_values = right_values[np.isfinite(right_values)]
+    if left_values.size < KL_MIN_SAMPLES_PER_DISTRIBUTION or right_values.size < KL_MIN_SAMPLES_PER_DISTRIBUTION:
+        return None
+
+    combined = np.concatenate([left_values, right_values])
+    lo = float(np.min(combined))
+    hi = float(np.max(combined))
+    if not np.isfinite(lo) or not np.isfinite(hi):
+        return None
+    if hi <= lo:
+        return {
+            "kl_left_to_right": 0.0,
+            "kl_right_to_left": 0.0,
+            "symmetric_kl": 0.0,
+            "js_divergence": 0.0,
+            "histogram_min": lo,
+            "histogram_max": hi,
+        }
+
+    eps = 1e-10
+    left_counts, bin_edges = np.histogram(left_values, bins=bins, range=(lo, hi))
+    right_counts, _ = np.histogram(right_values, bins=bin_edges)
+    left_prob = left_counts.astype(np.float64) + eps
+    right_prob = right_counts.astype(np.float64) + eps
+    left_prob /= left_prob.sum()
+    right_prob /= right_prob.sum()
+    kl_left_to_right = float(np.sum(left_prob * np.log(left_prob / right_prob)))
+    kl_right_to_left = float(np.sum(right_prob * np.log(right_prob / left_prob)))
+    mixture = 0.5 * (left_prob + right_prob)
+    js_divergence = float(
+        0.5 * np.sum(left_prob * np.log(left_prob / mixture))
+        + 0.5 * np.sum(right_prob * np.log(right_prob / mixture))
+    )
+    return {
+        "kl_left_to_right": kl_left_to_right,
+        "kl_right_to_left": kl_right_to_left,
+        "symmetric_kl": 0.5 * (kl_left_to_right + kl_right_to_left),
+        "js_divergence": js_divergence,
+        "histogram_min": lo,
+        "histogram_max": hi,
+    }
+
+
+def _kl_comparison_specs():
+    return [
+        ("topology1_vs_topology3", ("topology1",), ("topology3",), "train_train"),
+        ("topology1_vs_topology2", ("topology1",), ("topology2",), "train_unseen"),
+        ("topology3_vs_topology2", ("topology3",), ("topology2",), "train_unseen"),
+        ("topology1_3_vs_topology2", ("topology1", "topology3"), ("topology2",), "pooled_train_unseen"),
+    ]
+
+
+def _safe_filename(value):
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value)).strip("_")
+
+
+def _load_pyplot():
+    try:
+        mpl_config_dir = Path(os.environ.get("MPLCONFIGDIR", "/tmp/matplotlib"))
+        mpl_config_dir.mkdir(parents=True, exist_ok=True)
+        os.environ.setdefault("MPLCONFIGDIR", str(mpl_config_dir))
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        return plt
+    except Exception as exc:
+        print(f"Skip distribution plots because matplotlib could not be loaded: {exc}")
+        return None
+
+
+def _plot_degradation_distribution(rows, light, speed, motion_label, metric_name):
+    if metric_name not in KL_PLOT_METRICS:
+        return None
+    topology_values = {
+        topology: _degradation_values(rows, _scene_name(light, speed, topology), motion_label, metric_name)
+        for topology in TARGET_TOPOLOGY
+    }
+    topology_values = {
+        topology: values
+        for topology, values in topology_values.items()
+        if values.size >= KL_MIN_SAMPLES_PER_DISTRIBUTION
+    }
+    if len(topology_values) < 2:
+        return None
+
+    combined = np.concatenate(list(topology_values.values()))
+    lo = float(np.min(combined))
+    hi = float(np.max(combined))
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        return None
+
+    plt = _load_pyplot()
+    if plt is None:
+        return None
+
+    PERFORMANCE_DISTRIBUTION_PLOT_DIR.mkdir(parents=True, exist_ok=True)
+    bins = np.linspace(lo, hi, KL_DISTRIBUTION_BINS + 1)
+    plt.figure(figsize=(9, 5))
+    for topology, values in topology_values.items():
+        plt.hist(values, bins=bins, density=True, alpha=0.35, label=f"{topology} (n={values.size})")
+        plt.axvline(float(np.mean(values)), linestyle="--", linewidth=1)
+    plt.title(f"{light}/{speed}/{motion_label} performance degradation: {metric_name}")
+    plt.xlabel(f"performance_degradation_{metric_name}")
+    plt.ylabel("density")
+    plt.legend()
+    plt.tight_layout()
+    output_path = PERFORMANCE_DISTRIBUTION_PLOT_DIR / (
+        f"{_safe_filename(light)}_{_safe_filename(speed)}_{_safe_filename(motion_label)}_{_safe_filename(metric_name)}.png"
+    )
+    plt.savefig(output_path, dpi=160)
+    plt.close()
+    return output_path
+
+
+def _write_performance_degradation_analysis():
+    rows = _load_enriched_match_rows(CANONICAL_MATCH_OUTPUT_CSV)
+    if not rows:
+        print(f"Skip KL analysis: no rows in {CANONICAL_MATCH_OUTPUT_CSV}")
+        return None
+
+    PERFORMANCE_ANALYSIS_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    kl_columns = [
+        "light_state",
+        "speed",
+        "motion_label",
+        "metric",
+        "comparison",
+        "comparison_type",
+        "left_topologies",
+        "right_topologies",
+        "left_count",
+        "right_count",
+        "kl_left_to_right",
+        "kl_right_to_left",
+        "symmetric_kl",
+        "js_divergence",
+        "histogram_min",
+        "histogram_max",
+        "distribution_plot_path",
+    ]
+    written = 0
+    with open(PERFORMANCE_KL_OUTPUT_CSV, "w", newline="") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=kl_columns)
+        writer.writeheader()
+        for light, speed, motion_label in product(LIGHT_PREFIX, SPEED_PREFIX, MOTION_SET):
+            plot_paths = {
+                metric: _plot_degradation_distribution(rows, light, speed, motion_label, metric)
+                for metric in KL_PLOT_METRICS
+            }
+            for metric in DEPTH_PERFORMANCE_METRICS:
+                for comparison, left_topologies, right_topologies, comparison_type in _kl_comparison_specs():
+                    left_values = _pooled_degradation_values(rows, light, speed, left_topologies, motion_label, metric)
+                    right_values = _pooled_degradation_values(rows, light, speed, right_topologies, motion_label, metric)
+                    kl_values = _kl_divergence_from_samples(left_values, right_values)
+                    if kl_values is None:
+                        continue
+                    writer.writerow({
+                        "light_state": light,
+                        "speed": speed,
+                        "motion_label": motion_label,
+                        "metric": metric,
+                        "comparison": comparison,
+                        "comparison_type": comparison_type,
+                        "left_topologies": "+".join(left_topologies),
+                        "right_topologies": "+".join(right_topologies),
+                        "left_count": int(left_values.size),
+                        "right_count": int(right_values.size),
+                        "distribution_plot_path": str(plot_paths.get(metric) or ""),
+                        **kl_values,
+                    })
+                    written += 1
+    print(f"Saved {written} KL divergence rows to {PERFORMANCE_KL_OUTPUT_CSV}")
+    print(f"Saved distribution plots to {PERFORMANCE_DISTRIBUTION_PLOT_DIR}")
+    return PERFORMANCE_KL_OUTPUT_CSV
+
 # %% Cell 4
 from tqdm import tqdm
 
@@ -1252,7 +1612,7 @@ PARAM_PAIRS = [
 ]
 LIGHT_PREFIX = ["normal", "dim", "dark"]
 SPEED_PREFIX = ["fast"] # , "normal"
-TARGET_TOPOLOGY = ["topology1", "topology4"]
+TARGET_TOPOLOGY = ["topology1", "topology2", "topology3"]
 MOTION_SET = ["stop", "spin", "rotate", "slow", "fast"]
 
 metric_list = {
@@ -1290,9 +1650,13 @@ print(f"Using device: {device}")
 model, processor = load_depth_anything_metric_indoor(device)
 for light, speed, topology in product(LIGHT_PREFIX, SPEED_PREFIX, TARGET_TOPOLOGY):
     target_path = f"{SCENE_PREFIX}_{light}_{speed}_{topology}"
-    if os.path.exists(f"./{str(CANONICAL_MATCH_OUTPUT_DIR)}/{target_path}_canonical_frame_matches.csv"): 
-        print(f"Already {target_path} exists, skipping....")
+    scene_match_csv = CANONICAL_MATCH_OUTPUT_DIR / f"{target_path}_canonical_frame_matches.csv"
+    if _csv_has_columns(scene_match_csv, CSV_COLUMNS):
+        print(f"Already {target_path} exists with current columns, appending to global CSV and skipping....")
+        _append_existing_scene_matches_to_global(scene_match_csv)
         continue
+    if scene_match_csv.exists():
+        print(f"Existing {scene_match_csv} is missing current columns; regenerating....")
     num_laps = 0
     for i, (e, g, p_prefix) in tqdm(enumerate(PARAM_PAIRS)):
         if e == 2000: continue
@@ -1402,187 +1766,5 @@ for light, speed, topology in product(LIGHT_PREFIX, SPEED_PREFIX, TARGET_TOPOLOG
 
 print("Canonical Parameter per Scene/Motion")
 print(canonical_parameter)
-
-# %% Cell 5
-### Implement HERE
-
-print("Canonical frame matching is now saved per scene inside the main scene loop.")
-print(f"Scene CSV directory: {CANONICAL_MATCH_OUTPUT_DIR}")
-print(f"Global appended CSV: {CANONICAL_MATCH_OUTPUT_CSV}")
-
-# %% Cell 7
-### Implement Video Save HERE
-
-VIDEO_SCENE_NAME = "comlab_scene_normal_fast_topology1"
-VIDEO_MATCH_CSV = CANONICAL_MATCH_OUTPUT_DIR / f"{VIDEO_SCENE_NAME}_canonical_frame_matches.csv"
-VIDEO_OUTPUT_DIR = Path("analysis_videos/canonical_match_videos")
-VIDEO_OUTPUT_PATH = VIDEO_OUTPUT_DIR / f"{VIDEO_SCENE_NAME}_source_vs_canonical.mp4"
-VIDEO_FPS = 15
-VIDEO_FRAME_STRIDE = 1
-VIDEO_MAX_FRAMES = None
-VIDEO_PANEL_WIDTH = 640
-VIDEO_HEADER_HEIGHT = 70
-
-
-def _safe_int(value, default=-1):
-    try:
-        return int(float(value))
-    except (TypeError, ValueError):
-        return default
-
-
-def _safe_float(value, default=float("nan")):
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _source_row_sort_key(row):
-    return (
-        _safe_int(row.get("source_pair_index")),
-        _safe_int(str(row.get("source_lap_dir", "")).replace("lap_", "")),
-        _safe_int(row.get("source_frame_index")),
-    )
-
-
-def _load_match_rows(csv_path, frame_stride=1, max_frames=None):
-    csv_path = Path(csv_path)
-    if not csv_path.exists():
-        raise FileNotFoundError(f"Match CSV not found: {csv_path}")
-
-    with open(csv_path, "r", newline="") as f:
-        rows = list(csv.DictReader(f))
-
-    rows = [row for row in rows if row.get("scene") == VIDEO_SCENE_NAME]
-    rows.sort(key=_source_row_sort_key)
-    if frame_stride and frame_stride > 1:
-        rows = rows[::frame_stride]
-    if max_frames is not None:
-        rows = rows[:max_frames]
-    if not rows:
-        raise ValueError(f"No rows to render for scene {VIDEO_SCENE_NAME} in {csv_path}")
-    return rows
-
-
-def _resize_panel(img_bgr, panel_width=VIDEO_PANEL_WIDTH):
-    if img_bgr is None:
-        img_bgr = np.zeros((480, 640, 3), dtype=np.uint8)
-    height, width = img_bgr.shape[:2]
-    scale = panel_width / max(width, 1)
-    panel_height = max(int(round(height * scale)), 1)
-    return cv2.resize(img_bgr, (panel_width, panel_height), interpolation=cv2.INTER_AREA)
-
-
-def _draw_roi_box(panel_bgr, row, original_shape, color=(0, 255, 255)):
-    x0 = _safe_int(row.get("rgb_patch_x0"))
-    y0 = _safe_int(row.get("rgb_patch_y0"))
-    patch_w = _safe_int(row.get("rgb_patch_width"))
-    patch_h = _safe_int(row.get("rgb_patch_height"))
-    if min(x0, y0, patch_w, patch_h) < 0:
-        return panel_bgr
-
-    orig_h, orig_w = original_shape[:2]
-    scale_x = panel_bgr.shape[1] / max(orig_w, 1)
-    scale_y = panel_bgr.shape[0] / max(orig_h, 1)
-    p0 = (int(round(x0 * scale_x)), int(round(y0 * scale_y)))
-    p1 = (int(round((x0 + patch_w) * scale_x)), int(round((y0 + patch_h) * scale_y)))
-    cv2.rectangle(panel_bgr, p0, p1, color, 2, cv2.LINE_AA)
-    return panel_bgr
-
-
-def _add_header(panel_bgr, title, row, is_source):
-    header = np.zeros((VIDEO_HEADER_HEIGHT, panel_bgr.shape[1], 3), dtype=np.uint8)
-    if is_source:
-        line1 = f"SOURCE | {row.get('source_pair_dir')} | {row.get('source_lap_dir')} frame {row.get('source_frame_index')}"
-        line2 = f"motion={row.get('source_motion_label')} exp={row.get('source_exposure')} gain={row.get('source_gain')}"
-    else:
-        line1 = f"MATCHED CANONICAL | {row.get('canonical_pair_dir')} | {row.get('matched_lap_dir')} frame {row.get('matched_frame_index')}"
-        line2 = (
-            f"exp={row.get('canonical_exposure')} gain={row.get('canonical_gain')} "
-            f"dt={_safe_float(row.get('time_diff_sec')):.3f}s "
-            f"dtw={_safe_float(row.get('matched_lap_dtw_cost')):.2f} "
-            f"regMAD={_safe_float(row.get('registered_depth_mean_abs_diff')):.2f} "
-            f"ov={_safe_float(row.get('registration_overlap_ratio')):.2f} "
-            f"rgbMAD={_safe_float(row.get('rgb_mean_abs_diff')):.2f} "
-            f"status={row.get('match_status')}"
-        )
-    cv2.putText(header, title, (12, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (255, 255, 255), 2, cv2.LINE_AA)
-    cv2.putText(header, line1[:95], (12, 43), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (220, 220, 220), 1, cv2.LINE_AA)
-    cv2.putText(header, line2[:95], (12, 63), cv2.FONT_HERSHEY_SIMPLEX, 0.46, (220, 220, 220), 1, cv2.LINE_AA)
-    return np.vstack([header, panel_bgr])
-
-
-def _placeholder_panel(shape, message):
-    h, w = shape[:2]
-    panel = np.zeros((h, w, 3), dtype=np.uint8)
-    cv2.putText(panel, message, (20, max(h // 2, 30)), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (180, 180, 180), 2, cv2.LINE_AA)
-    return panel
-
-
-def _make_video_frame(row):
-    source_img = cv2.imread(row.get("source_rgb_path", ""), cv2.IMREAD_COLOR)
-    if source_img is None:
-        source_img = np.zeros((480, 640, 3), dtype=np.uint8)
-
-    matched_path = row.get("matched_rgb_path", "")
-    matched_img = None
-    if row.get("match_status") == "matched" and matched_path not in (None, "", str(NO_MATCH_VALUE)):
-        matched_img = cv2.imread(matched_path, cv2.IMREAD_COLOR)
-    if matched_img is None:
-        matched_img = _placeholder_panel(source_img.shape, f"NO MATCH: {row.get('match_status')}")
-
-    source_panel = _resize_panel(source_img)
-    matched_panel = _resize_panel(matched_img)
-    if matched_panel.shape[:2] != source_panel.shape[:2]:
-        matched_panel = cv2.resize(
-            matched_panel,
-            (source_panel.shape[1], source_panel.shape[0]),
-            interpolation=cv2.INTER_AREA,
-        )
-
-    source_panel = _draw_roi_box(source_panel, row, source_img.shape, color=(0, 255, 255))
-    matched_panel = _draw_roi_box(matched_panel, row, matched_img.shape, color=(0, 255, 255))
-    source_panel = _add_header(source_panel, "Source RGB", row, is_source=True)
-    matched_panel = _add_header(matched_panel, "Matched Canonical RGB", row, is_source=False)
-    return np.hstack([source_panel, matched_panel])
-
-
-def make_canonical_match_video(
-    scene_name=VIDEO_SCENE_NAME,
-    match_csv=VIDEO_MATCH_CSV,
-    output_path=VIDEO_OUTPUT_PATH,
-    fps=VIDEO_FPS,
-    frame_stride=VIDEO_FRAME_STRIDE,
-    max_frames=VIDEO_MAX_FRAMES,
-):
-    global VIDEO_SCENE_NAME
-    VIDEO_SCENE_NAME = scene_name
-    rows = _load_match_rows(match_csv, frame_stride=frame_stride, max_frames=max_frames)
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    writer = None
-    try:
-        for frame_idx, row in enumerate(rows):
-            frame = _make_video_frame(row)
-            if writer is None:
-                height, width = frame.shape[:2]
-                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-                writer = cv2.VideoWriter(str(output_path), fourcc, fps, (width, height))
-                if not writer.isOpened():
-                    raise RuntimeError(f"Failed to open video writer: {output_path}")
-            writer.write(frame)
-
-            if frame_idx % 250 == 0 or frame_idx + 1 == len(rows):
-                print(f"[{frame_idx + 1}/{len(rows)}] {row.get('source_lap_dir')} frame {row.get('source_frame_index')}")
-    finally:
-        if writer is not None:
-            writer.release()
-
-    print(f"Wrote video: {output_path.resolve()}")
-    return output_path
-
-
-canonical_match_video_path = make_canonical_match_video()
+performance_kl_summary_csv = _write_performance_degradation_analysis()
 
