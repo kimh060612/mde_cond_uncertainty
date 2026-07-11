@@ -366,6 +366,7 @@ RGB_MATCH_PATCH_SIZE = 256
 DTW_DEPTH_FEATURE_SIZE = (8, 8)
 DTW_MAX_SEQUENCE_LENGTH = 120
 DEPTH_MATCH_MAX_MEAN_ABS_DIFF = 0.05 # 5cm
+DEPTH_PREFILTER_MAX_RAW_MEAN_ABS_DIFF = float(os.environ.get("DEPTH_PREFILTER_MAX_RAW_MEAN_ABS_DIFF", "0.3"))
 DEPTH_AUTO_SCALE_THRESHOLD = 20.0
 DEPTH_RAW_TO_METER_SCALE = 0.001
 REGISTRATION_IMAGE_SIZE = (160, 120)
@@ -677,6 +678,7 @@ def _depth_frame_feature(depth_path):
 
 
 lap_depth_feature_cache = {}
+best_canonical_lap_cache = {}
 
 
 def _lap_cache_key(records):
@@ -732,7 +734,22 @@ def _dtw_distance(seq_a, seq_b):
     return float(prev[m] / max(n + m, 1))
 
 
+def _canonical_lap_selection_cache_key(source_lap_records, candidate_laps):
+    source_key = _lap_cache_key(source_lap_records)
+    if source_key is None:
+        return None
+    candidate_keys = tuple(
+        _lap_cache_key(lap_info.get("records", []))
+        for lap_info in candidate_laps
+    )
+    return source_key, candidate_keys
+
+
 def _select_best_canonical_lap(source_lap_records, candidate_laps):
+    cache_key = _canonical_lap_selection_cache_key(source_lap_records, candidate_laps)
+    if cache_key in best_canonical_lap_cache:
+        return best_canonical_lap_cache[cache_key]
+
     source_seq = _lap_depth_feature_sequence(source_lap_records)
     best_lap = None
     best_cost = float("inf")
@@ -742,7 +759,11 @@ def _select_best_canonical_lap(source_lap_records, candidate_laps):
         if dtw_cost < best_cost:
             best_cost = dtw_cost
             best_lap = lap_info
-    return best_lap, best_cost
+
+    result = (best_lap, best_cost)
+    if cache_key is not None:
+        best_canonical_lap_cache[cache_key] = result
+    return result
 
 
 def _nearest_time_record(records, times, source_time_sec):
@@ -951,6 +972,12 @@ def _find_best_canonical_match(source_record, source_lap_records, canonical_entr
             source_record["depth_path"],
             candidate_record["depth_path"],
         )
+        if (
+            raw_depth_mean_abs_diff is None
+            or raw_depth_mean_abs_diff > DEPTH_PREFILTER_MAX_RAW_MEAN_ABS_DIFF
+        ):
+            continue
+
         registration_metrics = _registered_depth_difference(
             source_record["depth_path"],
             candidate_record["depth_path"],
