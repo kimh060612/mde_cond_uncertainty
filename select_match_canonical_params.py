@@ -48,7 +48,7 @@ MODEL_IDS = {
 MODEL_ID = MODEL_IDS["small"]
 HF_CACHE_DIR = os.environ.get("HF_HOME") or None
 LOCAL_FILES_ONLY = os.environ.get("DEPTH_ANYTHING_LOCAL_FILES_ONLY", "1") != "0"
-EVAL_BATCH_SIZE = int(os.environ.get("DEPTH_EVAL_BATCH_SIZE", "16"))
+EVAL_BATCH_SIZE = int(os.environ.get("DEPTH_EVAL_BATCH_SIZE", "64"))
 
 
 def assign_motion_label(
@@ -362,6 +362,10 @@ import math
 CANONICAL_MATCH_OUTPUT_CSV = Path("canonical_parameter_frame_matches.csv")
 CANONICAL_MATCH_OUTPUT_DIR = Path("orbbec_canonical_parameter_frame_matches_by_scene")
 CANONICAL_TOPK_TIME_CANDIDATES = 5
+ORACLE_TOPK_METRIC_CANDIDATES = int(os.environ.get("ORACLE_TOPK_METRIC_CANDIDATES", "8"))
+ORACLE_PRIMARY_METRIC = "abs_rel"
+ORACLE_TIEBREAKER_METRIC = "a1"
+MATCH_POLICY = f"oracle_{ORACLE_PRIMARY_METRIC}_primary_{ORACLE_TIEBREAKER_METRIC}_tiebreak"
 RGB_MATCH_PATCH_SIZE = 256
 DTW_DEPTH_FEATURE_SIZE = (8, 8)
 DTW_MAX_SEQUENCE_LENGTH = 120
@@ -450,6 +454,7 @@ CSV_COLUMNS = [
     "matched_depth_path",
     *[f"canonical_metric_{metric}" for metric in DEPTH_PERFORMANCE_METRICS],
     *[f"performance_degradation_{metric}" for metric in DEPTH_PERFORMANCE_METRICS],
+    "match_policy",
     "match_status",
 ]
 
@@ -543,62 +548,109 @@ def _get_pair_records(scene_name, exposure, gain, pair_index, pair_dir):
     return pair_record_cache[cache_key]
 
 
-def _build_canonical_frame_index(scene_names=None):
+def _record_param_tuple(record):
+    try:
+        exposure = int(record["exposure"])
+        gain = int(record["gain"])
+        pair_index = int(record["pair_index"])
+        pair_dir = str(record["pair_dir"])
+    except (TypeError, ValueError, KeyError):
+        return None
+    return exposure, gain, pair_index, pair_dir
+
+
+def _oracle_score_for_record(record):
+    metric_record = _performance_metric_record(record)
+    primary_value = _safe_performance_value(metric_record, ORACLE_PRIMARY_METRIC)
+    tiebreaker_value = _safe_performance_value(metric_record, ORACLE_TIEBREAKER_METRIC)
+    if not (_valid_performance_value(primary_value) and _valid_performance_value(tiebreaker_value)):
+        return None
+    return float(primary_value), -float(tiebreaker_value)
+
+
+def _same_frame_record(left_record, right_record):
+    return str(left_record.get("rgb_path")) == str(right_record.get("rgb_path"))
+
+
+def _build_oracle_frame_index(scene_names=None):
     if scene_names is None:
-        scene_names = list(canonical_parameter.keys())
+        scene_names = list(metric_list.keys())
     elif isinstance(scene_names, str):
         scene_names = [scene_names]
 
     index = {
-        scene_name: {motion_label: {"times": [], "records": [], "laps": []} for motion_label in MOTION_SET}
+        scene_name: {
+            motion_label: {"records": [], "times": [], "candidate_lap_groups": []}
+            for motion_label in MOTION_SET
+        }
         for scene_name in scene_names
     }
 
     for scene_name in scene_names:
-        motion_params = canonical_parameter.get(scene_name, {})
-        for motion_label in MOTION_SET:
-            canonical_param = _canonical_param_tuple(motion_params.get(motion_label))
-            if canonical_param is None:
+        for pair_index, (exposure, gain, p_prefix) in enumerate(PARAM_PAIRS):
+            if exposure == 2000:
                 continue
 
-            exposure, gain, pair_index, pair_dir = canonical_param
+            pair_dir = f"pair_{pair_index:03d}_{p_prefix}"
             pair_records = _get_pair_records(scene_name, exposure, gain, pair_index, pair_dir)
             pair_records = [
                 record for record in pair_records
                 if Path(record["rgb_path"]).exists() and Path(record["depth_path"]).exists()
             ]
+            if not pair_records:
+                continue
+
             records_by_lap = {}
             for record in pair_records:
                 records_by_lap.setdefault(record["lap_dir_name"], []).append(record)
 
-            lap_infos = []
+            pair_lap_infos = []
+            pair_has_motion_candidates = {motion_label: False for motion_label in MOTION_SET}
             for lap_dir_name, lap_records in records_by_lap.items():
                 lap_records.sort(key=lambda record: record["time_sec"])
                 motion_records_by_label = {
-                    m: [record for record in lap_records if record["motion_label"] == m]
-                    for m in MOTION_SET
+                    motion_label: [
+                        record for record in lap_records
+                        if record["motion_label"] == motion_label and _oracle_score_for_record(record) is not None
+                    ]
+                    for motion_label in MOTION_SET
                 }
-                lap_infos.append({
+                for motion_label, motion_records in motion_records_by_label.items():
+                    if motion_records:
+                        pair_has_motion_candidates[motion_label] = True
+
+                pair_lap_infos.append({
                     "lap_dir_name": lap_dir_name,
                     "records": lap_records,
                     "times": [record["time_sec"] for record in lap_records],
                     "motion_records": motion_records_by_label,
                     "motion_times": {
-                        m: [record["time_sec"] for record in records]
-                        for m, records in motion_records_by_label.items()
+                        motion_label: [record["time_sec"] for record in records]
+                        for motion_label, records in motion_records_by_label.items()
                     },
                 })
 
-            motion_records = [
-                record for record in pair_records
-                if record["motion_label"] == motion_label
-            ]
+            if not pair_lap_infos:
+                continue
+
+            for motion_label in MOTION_SET:
+                if not pair_has_motion_candidates[motion_label]:
+                    continue
+                index[scene_name][motion_label]["candidate_lap_groups"].append(pair_lap_infos)
+                motion_records = [
+                    record
+                    for lap_info in pair_lap_infos
+                    for record in lap_info["motion_records"][motion_label]
+                ]
+                index[scene_name][motion_label]["records"].extend(motion_records)
+
+        for motion_label in MOTION_SET:
+            motion_records = index[scene_name][motion_label]["records"]
             motion_records.sort(key=lambda record: record["time_sec"])
-            index[scene_name][motion_label]["records"] = motion_records
             index[scene_name][motion_label]["times"] = [
                 record["time_sec"] for record in motion_records
             ]
-            index[scene_name][motion_label]["laps"] = lap_infos
+
     return index
 
 
@@ -945,86 +997,24 @@ def _nearest_time_candidate_records(records, times, source_time_sec):
     ]
 
 
-def _find_best_canonical_match(source_record, source_lap_records, canonical_entry):
-    canonical_lap, dtw_cost = _select_best_canonical_lap(
-        source_lap_records,
-        canonical_entry.get("laps", []),
-    )
-    if canonical_lap is None:
-        return None
+def _zero_rgb_difference_metrics():
+    return {
+        "rgb_patch_x0": NO_MATCH_VALUE,
+        "rgb_patch_y0": NO_MATCH_VALUE,
+        "rgb_patch_width": NO_MATCH_VALUE,
+        "rgb_patch_height": NO_MATCH_VALUE,
+        "rgb_patch_mean_abs_diff": 0.0,
+        "rgb_patch_rmse_diff": 0.0,
+        "rgb_patch_max_abs_diff": 0.0,
+        "rgb_mean_abs_diff": 0.0,
+        "rgb_rmse_diff": 0.0,
+        "rgb_max_abs_diff": 0.0,
+    }
 
-    motion_label = source_record["motion_label"]
-    candidate_records = canonical_lap["motion_records"].get(motion_label, [])
-    candidate_times = canonical_lap["motion_times"].get(motion_label, [])
-    candidate_records = _nearest_time_candidate_records(
-        candidate_records,
-        candidate_times,
-        source_record["time_sec"],
-    )
-    if not candidate_records:
-        return None
 
-    best_match = None
-    best_score = float("inf")
-    for candidate_record in candidate_records:
-        time_diff_sec = abs(source_record["time_sec"] - candidate_record["time_sec"])
-        raw_depth_mean_abs_diff = _depth_mean_abs_difference(
-            source_record["depth_path"],
-            candidate_record["depth_path"],
-        )
-        if (
-            raw_depth_mean_abs_diff is None
-            or raw_depth_mean_abs_diff > DEPTH_PREFILTER_MAX_RAW_MEAN_ABS_DIFF
-        ):
-            continue
-
-        registration_metrics = _registered_depth_difference(
-            source_record["depth_path"],
-            candidate_record["depth_path"],
-        )
-        if registration_metrics is None:
-            continue
-
-        registration_overlap_ratio = registration_metrics["registration_overlap_ratio"]
-        registered_depth_mean_abs_diff = registration_metrics["registered_depth_mean_abs_diff"]
-        registered_ecc_scores = registration_metrics["registration_ecc_score"]
-        if registration_overlap_ratio < REGISTRATION_MIN_OVERLAP_RATIO:
-            registration_status = "registration_overlap_too_low"
-        elif registered_depth_mean_abs_diff > DEPTH_MATCH_MAX_MEAN_ABS_DIFF:
-            registration_status = "registered_depth_diff_too_large"
-        elif registered_ecc_scores < DEPTH_MATCH_MIN_ECC_SCORE:
-            registration_status = "registered_ecc_score_is_too_low"
-        else:
-            registration_status = "registered"
-
-        score = (
-            registered_depth_mean_abs_diff
-            + REGISTRATION_SCORE_TIME_WEIGHT * float(time_diff_sec)
-        )
-        candidate_match = {
-            "record": candidate_record,
-            "time_diff_sec": float(time_diff_sec),
-            "matched_lap_dtw_cost": float(dtw_cost),
-            "raw_depth_mean_abs_diff": (
-                NO_MATCH_VALUE if raw_depth_mean_abs_diff is None else float(raw_depth_mean_abs_diff)
-            ),
-            "depth_mean_abs_diff": float(registered_depth_mean_abs_diff),
-            "depth_rejected": registration_status != "registered",
-            **registration_metrics,
-            "registration_status": registration_status,
-        }
-        if score < best_score:
-            best_score = score
-            best_match = candidate_match
-
-    if best_match is None:
-        return {
-            "registration_failed": True,
-            "matched_lap_dtw_cost": float(dtw_cost),
-        }
-
+def _attach_rgb_difference_metrics(match, source_record):
     source_img = cv2.imread(source_record["rgb_path"], cv2.IMREAD_COLOR)
-    candidate_img = _read_rgb_cached(best_match["record"]["rgb_path"])
+    candidate_img = _read_rgb_cached(match["record"]["rgb_path"])
     rgb_metrics = _rgb_patch_difference(source_img, candidate_img)
     if rgb_metrics is None:
         rgb_metrics = {
@@ -1039,9 +1029,125 @@ def _find_best_canonical_match(source_record, source_lap_records, canonical_entr
             "rgb_rmse_diff": NO_MATCH_VALUE,
             "rgb_max_abs_diff": NO_MATCH_VALUE,
         }
+    match.update(rgb_metrics)
+    return match
 
-    best_match.update(rgb_metrics)
-    return best_match
+
+def _self_oracle_match(source_record):
+    return {
+        "record": source_record,
+        "time_diff_sec": 0.0,
+        "matched_lap_dtw_cost": 0.0,
+        "raw_depth_mean_abs_diff": 0.0,
+        "depth_mean_abs_diff": 0.0,
+        "depth_rejected": False,
+        "registered_depth_mean_abs_diff": 0.0,
+        "registered_depth_rmse_diff": 0.0,
+        "registered_depth_max_abs_diff": 0.0,
+        "registration_overlap_ratio": 1.0,
+        "registration_ecc_score": 1.0,
+        "registration_dx_px": 0.0,
+        "registration_dy_px": 0.0,
+        "registration_status": "self_oracle",
+        **_zero_rgb_difference_metrics(),
+    }
+
+
+def _registered_oracle_candidate_match(source_record, candidate_record, dtw_cost):
+    time_diff_sec = abs(source_record["time_sec"] - candidate_record["time_sec"])
+    raw_depth_mean_abs_diff = _depth_mean_abs_difference(
+        source_record["depth_path"],
+        candidate_record["depth_path"],
+    )
+    if (
+        raw_depth_mean_abs_diff is None
+        or raw_depth_mean_abs_diff > DEPTH_PREFILTER_MAX_RAW_MEAN_ABS_DIFF
+    ):
+        return None
+
+    registration_metrics = _registered_depth_difference(
+        source_record["depth_path"],
+        candidate_record["depth_path"],
+    )
+    if registration_metrics is None:
+        return None
+
+    registration_overlap_ratio = registration_metrics["registration_overlap_ratio"]
+    registered_depth_mean_abs_diff = registration_metrics["registered_depth_mean_abs_diff"]
+    registered_ecc_scores = registration_metrics["registration_ecc_score"]
+    if registration_overlap_ratio < REGISTRATION_MIN_OVERLAP_RATIO:
+        return None
+    if registered_depth_mean_abs_diff > DEPTH_MATCH_MAX_MEAN_ABS_DIFF:
+        return None
+    if registered_ecc_scores < DEPTH_MATCH_MIN_ECC_SCORE:
+        return None
+
+    match = {
+        "record": candidate_record,
+        "time_diff_sec": float(time_diff_sec),
+        "matched_lap_dtw_cost": float(dtw_cost),
+        "raw_depth_mean_abs_diff": float(raw_depth_mean_abs_diff),
+        "depth_mean_abs_diff": float(registered_depth_mean_abs_diff),
+        "depth_rejected": False,
+        **registration_metrics,
+        "registration_status": "registered",
+    }
+    return _attach_rgb_difference_metrics(match, source_record)
+
+
+def _oracle_candidate_records_for_source(source_record, source_lap_records, oracle_entry):
+    source_score = _oracle_score_for_record(source_record)
+    if source_score is None:
+        return []
+
+    motion_label = source_record["motion_label"]
+    metric_candidates = []
+    for candidate_laps in oracle_entry.get("candidate_lap_groups", []):
+        candidate_lap, dtw_cost = _select_best_canonical_lap(
+            source_lap_records,
+            candidate_laps,
+        )
+        if candidate_lap is None:
+            continue
+
+        candidate_records = _nearest_time_candidate_records(
+            candidate_lap["motion_records"].get(motion_label, []),
+            candidate_lap["motion_times"].get(motion_label, []),
+            source_record["time_sec"],
+        )
+        for candidate_record in candidate_records:
+            if _same_frame_record(source_record, candidate_record):
+                continue
+            candidate_score = _oracle_score_for_record(candidate_record)
+            if candidate_score is None or candidate_score >= source_score:
+                continue
+            metric_candidates.append((
+                candidate_score,
+                abs(source_record["time_sec"] - candidate_record["time_sec"]),
+                float(dtw_cost),
+                candidate_record,
+            ))
+
+    metric_candidates.sort(key=lambda item: (item[0], item[1], item[2]))
+    return metric_candidates
+
+
+def _find_best_oracle_match(source_record, source_lap_records, oracle_entry):
+    metric_candidates = _oracle_candidate_records_for_source(
+        source_record,
+        source_lap_records,
+        oracle_entry,
+    )
+    candidates_to_check = (
+        metric_candidates
+        if ORACLE_TOPK_METRIC_CANDIDATES <= 0
+        else metric_candidates[:ORACLE_TOPK_METRIC_CANDIDATES]
+    )
+    for _candidate_score, _time_diff, dtw_cost, candidate_record in candidates_to_check:
+        match = _registered_oracle_candidate_match(source_record, candidate_record, dtw_cost)
+        if match is not None:
+            return match
+    return _self_oracle_match(source_record)
 
 
 performance_metric_lookup_cache = {}
@@ -1167,6 +1273,7 @@ def _no_match_fields(match_status, canonical_param=None):
         "rgb_max_abs_diff": NO_MATCH_VALUE,
         "matched_rgb_path": NO_MATCH_VALUE,
         "matched_depth_path": NO_MATCH_VALUE,
+        "match_policy": MATCH_POLICY,
         "match_status": match_status,
         **_registration_default_metrics("not_run"),
     }
@@ -1218,70 +1325,26 @@ def _match_fields(best_match, canonical_param, source_record):
         "matched_rgb_path": matched_record["rgb_path"],
         "matched_depth_path": matched_record["depth_path"],
         **_performance_metric_fields(source_record=source_record, canonical_record=matched_record),
+        "match_policy": MATCH_POLICY,
         "match_status": "matched",
     }
 
 
-def _match_row_for_source_record(source_record, source_lap_records, canonical_frame_index):
+def _match_row_for_source_record(source_record, source_lap_records, oracle_frame_index):
     row = _source_row_base(source_record)
     motion_label = source_record["motion_label"]
-    canonical_param = _canonical_param_tuple(
-        canonical_parameter.get(source_record["scene"], {}).get(motion_label)
-    )
+    oracle_entry = oracle_frame_index.get(source_record["scene"], {}).get(motion_label)
+    if oracle_entry is None:
+        best_match = _self_oracle_match(source_record)
+    else:
+        best_match = _find_best_oracle_match(source_record, source_lap_records, oracle_entry)
 
-    if canonical_param is None:
-        row.update(_no_match_fields("no_canonical_parameter"))
+    oracle_param = _record_param_tuple(best_match["record"])
+    if oracle_param is None:
+        row.update(_no_match_fields("invalid_oracle_parameter"))
         return row
 
-    canonical_entry = canonical_frame_index[source_record["scene"]][motion_label]
-    if not canonical_entry["records"]:
-        row.update(_no_match_fields("no_canonical_rgb_candidates", canonical_param))
-        return row
-
-    best_match = _find_best_canonical_match(source_record, source_lap_records, canonical_entry)
-    if best_match is None:
-        row.update(_no_match_fields("no_canonical_frame_after_dtw", canonical_param))
-        return row
-
-    if best_match.get("registration_failed"):
-        row.update(_no_match_fields("depth_registration_failed", canonical_param))
-        row.update({
-            "matched_lap_dtw_cost": best_match["matched_lap_dtw_cost"],
-            "registration_status": "failed",
-        })
-        return row
-
-    if best_match.get("depth_rejected"):
-        reject_status = best_match.get("registration_status") or "depth_diff_too_large"
-        row.update(_no_match_fields(reject_status, canonical_param))
-        row.update({
-            "matched_lap_dtw_cost": best_match["matched_lap_dtw_cost"],
-            "raw_depth_mean_abs_diff": best_match["raw_depth_mean_abs_diff"],
-            "depth_mean_abs_diff": best_match["depth_mean_abs_diff"],
-            "depth_diff_threshold": DEPTH_MATCH_MAX_MEAN_ABS_DIFF,
-            "registered_depth_mean_abs_diff": best_match["registered_depth_mean_abs_diff"],
-            "registered_depth_rmse_diff": best_match["registered_depth_rmse_diff"],
-            "registered_depth_max_abs_diff": best_match["registered_depth_max_abs_diff"],
-            "registration_overlap_ratio": best_match["registration_overlap_ratio"],
-            "registration_ecc_score": best_match["registration_ecc_score"],
-            "registration_dx_px": best_match["registration_dx_px"],
-            "registration_dy_px": best_match["registration_dy_px"],
-            "registration_status": best_match["registration_status"],
-            "rgb_patch_x0": best_match["rgb_patch_x0"],
-            "rgb_patch_y0": best_match["rgb_patch_y0"],
-            "rgb_patch_width": best_match["rgb_patch_width"],
-            "rgb_patch_height": best_match["rgb_patch_height"],
-            "rgb_patch_mean_abs_diff": best_match["rgb_patch_mean_abs_diff"],
-            "rgb_patch_rmse_diff": best_match["rgb_patch_rmse_diff"],
-            "rgb_patch_max_abs_diff": best_match["rgb_patch_max_abs_diff"],
-            "rgb_mean_abs_diff": best_match["rgb_mean_abs_diff"],
-            "rgb_rmse_diff": best_match["rgb_rmse_diff"],
-            "rgb_max_abs_diff": best_match["rgb_max_abs_diff"],
-        })
-        row.update(_performance_metric_fields(source_record=source_record, canonical_record=best_match["record"]))
-        return row
-
-    row.update(_match_fields(best_match, canonical_param, source_record))
+    row.update(_match_fields(best_match, oracle_param, source_record))
     return row
 
 
@@ -1313,14 +1376,14 @@ def _append_existing_scene_matches_to_global(scene_csv_path):
     return True
 
 
-def _write_canonical_matches_for_scene(scene_name, canonical_frame_index=None, append_global=True):
+def _write_canonical_matches_for_scene(scene_name, oracle_frame_index=None, append_global=True):
     scene_path = Path(DATA_PATH) / scene_name
     if not scene_path.exists():
         print(f"Skip missing scene: {scene_path}")
         return {"scene": scene_name, "rows_written": 0, "rows_without_match": 0, "output_csv": None}
 
-    if canonical_frame_index is None:
-        canonical_frame_index = _build_canonical_frame_index(scene_name)
+    if oracle_frame_index is None:
+        oracle_frame_index = _build_oracle_frame_index(scene_name)
 
     CANONICAL_MATCH_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     scene_output_csv = CANONICAL_MATCH_OUTPUT_DIR / f"{scene_name}_canonical_frame_matches.csv"
@@ -1360,7 +1423,7 @@ def _write_canonical_matches_for_scene(scene_name, canonical_frame_index=None, a
                         row = _match_row_for_source_record(
                             source_record,
                             source_lap_records,
-                            canonical_frame_index,
+                            oracle_frame_index,
                         )
                         if row["match_status"] != "matched":
                             rows_without_match += 1
@@ -1764,34 +1827,18 @@ for light, speed, topology in product(LIGHT_PREFIX, SPEED_PREFIX, TARGET_TOPOLOG
                         **metric_vals
                     })
         num_laps += len(lap_dirs)
-    ## 해당 scene에서 가장 성능이 높은 canonical parameter를 결정한다.
-    for m in MOTION_SET:
-        for i, (e, g, p_prefix) in enumerate(PARAM_PAIRS):
-            if e == 2000: continue
-            subdir_name = f"pair_{i:03d}_{p_prefix}"        
-            metrics = metric_list[target_path][subdir_name][m]
-            np_abs_rel = np.array([ metric["abs_rel"] for metric in metrics ])
-            np_a1 = np.array([ metric["a1"] for metric in metrics ])
-            mean_abs_rel = np.mean(np_abs_rel)
-            mean_a1 = np.mean(np_a1)
-            if best_performance[target_path][m][0] > mean_abs_rel and best_performance[target_path][m][1] < mean_a1:
-                best_performance[target_path][m][0] = mean_abs_rel
-                best_performance[target_path][m][1] = mean_a1
-                canonical_parameter[target_path][m][0] = e
-                canonical_parameter[target_path][m][1] = g    
-    ### 해당 scene의 모든 timestep에서 가장 canonical parameter 기준으로 비슷한 RGB image를 selection한다.    
+    ### 해당 scene의 모든 timestep에서 oracle best parameter 기준으로 비슷한 RGB image를 selection한다.
     #### Things to save:
     ##### Most closest timestep, RGB Image, Depth Image를 기록 후, csv로 작성.
-    scene_canonical_frame_index = _build_canonical_frame_index(target_path)
+    scene_oracle_frame_index = _build_oracle_frame_index(target_path)
     canonical_match_summaries.append(
         _write_canonical_matches_for_scene(
             target_path,
-            canonical_frame_index=scene_canonical_frame_index,
+            oracle_frame_index=scene_oracle_frame_index,
             append_global=True,
         )
     )
 
-print("Canonical Parameter per Scene/Motion")
-print(canonical_parameter)
+print(f"Match policy: {MATCH_POLICY}")
+print(f"Oracle candidate ECC top-K: {ORACLE_TOPK_METRIC_CANDIDATES}")
 performance_kl_summary_csv = _write_performance_degradation_analysis()
-
