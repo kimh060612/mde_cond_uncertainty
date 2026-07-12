@@ -5,7 +5,6 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from dataset.ati_dataset_caminduce import flatten_group_batch
-from evaluation_utils.eval_metrics import compute_vector_masked_correlations
 from model.loss_fn import (
     scalar_heteroscedastic_loss,
     scale_shift_invariant_depth_loss,
@@ -63,6 +62,7 @@ def _new_accumulator() -> dict:
             "candidate_abs_rel": [],
             "canonical_abs_rel": [],
             "abs_rel_degradation": [],
+            "group_id": [],
         },
     }
 
@@ -73,7 +73,9 @@ def _append_vectors(
     **items: torch.Tensor,
 ) -> None:
     for key, value in items.items():
-        value = value.detach().float().flatten()
+        value = value.detach().flatten()
+        if key != "group_id":
+            value = value.float()
         if sample_mask is not None:
             value = value[sample_mask]
         if value.numel() > 0:
@@ -89,10 +91,98 @@ def _add_rank_accuracy(
         accumulator["q_rank_accuracy_count"] += 1
 
 
+def _corr_from_centered(
+    x: torch.Tensor,
+    y: torch.Tensor,
+) -> float:
+    denom = torch.sqrt(x.square().sum() * y.square().sum())
+    if x.numel() < 2 or denom <= 0:
+        return float("nan")
+    return float((x * y).sum().div(denom).item())
+
+
+def _average_ranks(values: torch.Tensor) -> torch.Tensor:
+    sorted_values, order = torch.sort(values)
+    ranks = torch.empty_like(values, dtype=torch.float32)
+    start = 0
+
+    while start < values.numel():
+        end = start + 1
+        while end < values.numel() and sorted_values[end] == sorted_values[start]:
+            end += 1
+        ranks[order[start:end]] = 0.5 * (start + end - 1)
+        start = end
+
+    return ranks
+
+
+def _groupwise_correlations(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    group_ids: torch.Tensor,
+    prefix: str,
+) -> Dict[str, float]:
+    x = x.detach().float().flatten()
+    y = y.detach().float().flatten()
+    group_ids = group_ids.detach().flatten()
+
+    valid_mask = torch.isfinite(x) & torch.isfinite(y) & torch.isfinite(group_ids.float())
+    x = x[valid_mask]
+    y = y[valid_mask]
+    group_ids = group_ids[valid_mask]
+
+    pearson_x = []
+    pearson_y = []
+    spearman_x = []
+    spearman_y = []
+    num_groups = 0
+
+    for group_id in torch.unique(group_ids):
+        group_mask = group_ids == group_id
+        if group_mask.sum() < 2:
+            continue
+
+        group_x = x[group_mask]
+        group_y = y[group_mask]
+        if group_x.std(unbiased=False) <= 0 or group_y.std(unbiased=False) <= 0:
+            continue
+
+        pearson_x.append(group_x - group_x.mean())
+        pearson_y.append(group_y - group_y.mean())
+
+        rank_x = _average_ranks(group_x)
+        rank_y = _average_ranks(group_y)
+        spearman_x.append(rank_x - rank_x.mean())
+        spearman_y.append(rank_y - rank_y.mean())
+        num_groups += 1
+
+    if not pearson_x:
+        return {
+            f"{prefix}_pearson": float("nan"),
+            f"{prefix}_spearman": float("nan"),
+            f"{prefix}_groups": 0,
+            f"{prefix}_samples": 0,
+        }
+
+    pearson_x = torch.cat(pearson_x)
+    pearson_y = torch.cat(pearson_y)
+    spearman_x = torch.cat(spearman_x)
+    spearman_y = torch.cat(spearman_y)
+
+    return {
+        f"{prefix}_pearson": _corr_from_centered(pearson_x, pearson_y),
+        f"{prefix}_spearman": _corr_from_centered(spearman_x, spearman_y),
+        f"{prefix}_groups": num_groups,
+        f"{prefix}_samples": int(pearson_x.numel()),
+    }
+
+
 def _finalize_accumulator(
     accumulator: dict,
     max_samples: int,
 ) -> Dict[str, float]:
+    del max_samples
+
     metrics: Dict[str, float] = {}
     processed_batches = accumulator["processed_batches"]
     if processed_batches > 0:
@@ -108,39 +198,40 @@ def _finalize_accumulator(
         for key, values in accumulator["vectors"].items()
     }
     for key, value in cat_vectors.items():
-        if value is not None:
+        if value is not None and key != "group_id":
             metrics[key] = _finite_mean(value)
 
     target_loss = cat_vectors.get("target_ssi_loss")
     camera_bias = cat_vectors.get("camera_bias")
     abs_rel_degradation = cat_vectors.get("abs_rel_degradation")
     q_score = cat_vectors.get("q_score")
+    group_id = cat_vectors.get("group_id")
 
-    if target_loss is not None and camera_bias is not None:
+    if target_loss is not None and camera_bias is not None and group_id is not None:
         metrics.update(
-            compute_vector_masked_correlations(
+            _groupwise_correlations(
                 target_loss,
                 camera_bias,
+                group_id,
                 prefix="bias_vs_ssi_loss",
-                max_samples=max_samples,
             )
         )
-    if abs_rel_degradation is not None and camera_bias is not None:
+    if abs_rel_degradation is not None and camera_bias is not None and group_id is not None:
         metrics.update(
-            compute_vector_masked_correlations(
+            _groupwise_correlations(
                 abs_rel_degradation,
                 camera_bias,
+                group_id,
                 prefix="bias_vs_abs_rel_degradation",
-                max_samples=max_samples,
             )
         )
-    if abs_rel_degradation is not None and q_score is not None:
+    if abs_rel_degradation is not None and q_score is not None and group_id is not None:
         metrics.update(
-            compute_vector_masked_correlations(
+            _groupwise_correlations(
                 abs_rel_degradation,
                 q_score,
+                group_id,
                 prefix="q_vs_abs_rel_degradation",
-                max_samples=max_samples,
             )
         )
     return metrics
@@ -231,6 +322,7 @@ def validate(
             "candidate_abs_rel": flat_batch["candidate_abs_rel"],
             "canonical_abs_rel": flat_batch["canonical_abs_rel"],
             "abs_rel_degradation": abs_rel_degradation,
+            "group_id": batch["group_index"].to(device=device)[:, None].expand(-1, num_candidates).reshape(-1),
         }
         rank_accuracy = _pairwise_rank_accuracy(group_q, group_degradation)
 
