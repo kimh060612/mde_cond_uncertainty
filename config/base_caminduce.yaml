@@ -1,7 +1,7 @@
 dataset:
   name: ati_dataset
   dataset_root: /home/kimh060612/ati_workspace/orbbec_realworld_dataset
-  csv_path: /home/kimh060612/ati_workspace/orbbec_csv_matched_realworld_dataset
+  csv_path: /home/kimh060612/ati_workspace/mde_cond_uncertainty/orbbec_canonical_parameter_frame_matches_by_scene/
   min_depth: 1e-3
   max_depth: 10.0
   min_valid_depth_ratio: 0.9
@@ -13,10 +13,10 @@ dataset:
   gain_max: 128
   train_topologies:
     - "topology1"
-    # - "topology3"
+    - "topology3"
   seen_val_topologies:
     - "topology1"
-    # - "topology3"
+    - "topology3"
   unseen_val_topologies:
     - "topology2"
 

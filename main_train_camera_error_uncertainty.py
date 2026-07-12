@@ -1,10 +1,10 @@
 import math
 import torch
 from torch.utils.data import DataLoader, Subset
-import wandb
 import hydra
 import logging
 from glob import glob
+from pathlib import Path
 from transformers import AutoImageProcessor
 from dataset.ati_dataset_caminduce import (
     CameraParameterRange,
@@ -23,6 +23,11 @@ from utils.validator_camind import validate
 from utils.logger import setup_logger
 
 from torch.utils.data import DataLoader
+
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 
 @hydra.main(config_path="config", config_name="base_caminduce")
@@ -62,7 +67,11 @@ def main(cfg: DictConfig):
     print("[Training] Seen validation topologies:", seen_topology_idx)
     print("[Training] Unseen validation topologies:", unseen_topology_idx)
 
-    csv_paths = glob(f"{cfg.dataset.csv_path}/*.csv")
+    csv_root = Path(cfg.dataset.csv_path)
+    if csv_root.is_file():
+        csv_paths = [str(csv_root)]
+    else:
+        csv_paths = sorted(glob(f"{cfg.dataset.csv_path}/*.csv"))
     if len(csv_paths) == 0:
         raise ValueError(f"No CSV files found in {cfg.dataset.csv_path}")
         
@@ -87,7 +96,7 @@ def main(cfg: DictConfig):
         pair_transform=PairedResizeToTensor(size=(cfg.model.image_height, cfg.model.image_width)),
         topologies=cfg.dataset.train_topologies,
         load_images=True,
-        load_depth=True,
+        load_depth=False,
         seed=cfg.training.seed,
     )
     val_set = FoundationCameraGroupedDataset(
@@ -106,7 +115,7 @@ def main(cfg: DictConfig):
         pair_transform=PairedResizeToTensor(size=(cfg.model.image_height, cfg.model.image_width)),
         topologies=list(cfg.dataset.seen_val_topologies) + list(cfg.dataset.unseen_val_topologies),
         load_images=True,
-        load_depth=True,
+        load_depth=False,
         seed=cfg.training.seed,
     )
     # copy_condition_normalization(val_set, train_set)
@@ -200,7 +209,8 @@ def main(cfg: DictConfig):
     if not param_groups:
         raise ValueError("No trainable parameters found")
     optimizer = torch.optim.AdamW(param_groups, weight_decay=cfg.training.weight_decay)
-    scheduler_monitor = cfg.training.lr_scheduler_monitor
+    fallback_monitor = "q_vs_abs_rel_degradation_spearman"
+    scheduler_monitor = cfg.training.get("lr_scheduler_monitor", fallback_monitor)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer,
         mode="max",
@@ -247,6 +257,7 @@ def main(cfg: DictConfig):
             min_depth=cfg.dataset.min_depth,
             max_depth=cfg.dataset.max_depth,
             relative_align_mode=cfg.training.relative_align_mode,
+            uncertainty_alpha=cfg.training.get("uncertainty_alpha", 1.0),
             global_step=global_step,
             log_interval=cfg.training.log_interval,
         )
@@ -268,6 +279,7 @@ def main(cfg: DictConfig):
             min_depth=cfg.dataset.min_depth,
             max_depth=cfg.dataset.max_depth,
             relative_align_mode=cfg.training.relative_align_mode,
+            uncertainty_alpha=cfg.training.get("uncertainty_alpha", 1.0),
         )
         
         print(f"[epoch {epoch}] train={train_metrics}")
@@ -275,7 +287,12 @@ def main(cfg: DictConfig):
         print(f"[epoch {epoch}] seen_val={val_seen_metrics}")
         print(f"[epoch {epoch}] unseen_val={val_unseen_metrics}")
 
-        scheduler_metric = float(val_total_metrics.get(scheduler_monitor, float("nan")))
+        scheduler_metric = float(
+            val_total_metrics.get(
+                scheduler_monitor,
+                val_total_metrics.get(fallback_monitor, float("nan")),
+            )
+        )
         if math.isfinite(scheduler_metric):
             scheduler.step(scheduler_metric)
         else:
@@ -285,9 +302,10 @@ def main(cfg: DictConfig):
                 scheduler_metric,
             )
         
-        is_best = val_total_metrics["aggregated_abs_rel_unc_pearson"] > best_abs_rel_correlation
+        best_metric = float(val_total_metrics.get(fallback_monitor, float("-inf")))
+        is_best = best_metric > best_abs_rel_correlation
         if is_best:
-            best_abs_rel_correlation = val_total_metrics["aggregated_abs_rel_unc_pearson"]
+            best_abs_rel_correlation = best_metric
             checkpoint_val_metrics = {
                 **val_total_metrics,
                 **prefix_metrics("val_seen", val_seen_metrics),
@@ -301,23 +319,25 @@ def main(cfg: DictConfig):
                 checkpoint_val_metrics,
                 dataset_metadata,
             )
-            wandb_run.summary["best_abs_rel_correlation"] = best_abs_rel_correlation
-            wandb_run.summary["best_epoch"] = epoch
+            if wandb_run is not None:
+                wandb_run.summary["best_q_abs_rel_degradation_spearman"] = best_abs_rel_correlation
+                wandb_run.summary["best_epoch"] = epoch
 
-        wandb_run.log({
-            "epoch": epoch,
-            "best/abs_rel_correlation": best_abs_rel_correlation,
-            "best/is_best": int(is_best),
-            "lr_scheduler/monitor": scheduler_metric,
-            **{
-                f"lr/{group.get('name', group_idx)}": group["lr"]
-                for group_idx, group in enumerate(optimizer.param_groups)
-            },
-            **{f"train/{key}": value for key, value in train_metrics.items()},
-            **{f"val/{key}": value for key, value in val_total_metrics.items()}, 
-            **{f"val_seen/{key}": value for key, value in val_seen_metrics.items()},
-            **{f"val_unseen/{key}": value for key, value in val_unseen_metrics.items()}
-        }, step=epoch, commit=True)
+        if wandb_run is not None:
+            wandb_run.log({
+                "epoch": epoch,
+                "best/q_abs_rel_degradation_spearman": best_abs_rel_correlation,
+                "best/is_best": int(is_best),
+                "lr_scheduler/monitor": scheduler_metric,
+                **{
+                    f"lr/{group.get('name', group_idx)}": group["lr"]
+                    for group_idx, group in enumerate(optimizer.param_groups)
+                },
+                **{f"train/{key}": value for key, value in train_metrics.items()},
+                **{f"val/{key}": value for key, value in val_total_metrics.items()},
+                **{f"val_seen/{key}": value for key, value in val_seen_metrics.items()},
+                **{f"val_unseen/{key}": value for key, value in val_unseen_metrics.items()}
+            }, step=epoch, commit=True)
     
     if wandb_run is not None:
         wandb_run.finish()

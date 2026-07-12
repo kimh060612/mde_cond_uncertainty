@@ -233,6 +233,7 @@ class FoundationCameraGroupedDataset(Dataset[dict[str, Any]]):
         camera_context:       [K, 10]
         candidate_exposure:   [K]
         candidate_gain:       [K]
+        abs_rel_degradation:  [K]
 
     camera_context:
         [light one-hot, motion one-hot, normalized exposure, normalized gain].
@@ -253,6 +254,9 @@ class FoundationCameraGroupedDataset(Dataset[dict[str, Any]]):
         "matched_frame_index",
         "matched_rgb_path",
         "matched_depth_path",
+        "source_metric_abs_rel",
+        "canonical_metric_abs_rel",
+        "performance_degradation_abs_rel",
         "match_status",
         "registration_status",
     }
@@ -778,6 +782,18 @@ class FoundationCameraGroupedDataset(Dataset[dict[str, Any]]):
 
         canonical_exposure = float(reference_row["canonical_exposure"])
         canonical_gain = float(reference_row["canonical_gain"])
+        candidate_abs_rel = torch.tensor(
+            [float(row["source_metric_abs_rel"]) for row in selected_rows],
+            dtype=torch.float32,
+        )
+        canonical_abs_rel = torch.tensor(
+            [float(row["canonical_metric_abs_rel"]) for row in selected_rows],
+            dtype=torch.float32,
+        )
+        abs_rel_degradation = torch.tensor(
+            [float(row["performance_degradation_abs_rel"]) for row in selected_rows],
+            dtype=torch.float32,
+        )
 
         result: dict[str, Any] = {
             "group_index": torch.tensor(group_index, dtype=torch.long),
@@ -788,6 +804,9 @@ class FoundationCameraGroupedDataset(Dataset[dict[str, Any]]):
             "scene": str(reference_row["scene"]),
             "candidate_exposure": exposures,
             "candidate_gain": gains,
+            "candidate_abs_rel": candidate_abs_rel,
+            "canonical_abs_rel": canonical_abs_rel,
+            "abs_rel_degradation": abs_rel_degradation,
             "camera_context": camera_context,
             "canonical_exposure": torch.tensor(canonical_exposure, dtype=torch.float32),
             "canonical_gain": torch.tensor(canonical_gain, dtype=torch.float32),
@@ -884,12 +903,20 @@ def flatten_group_batch(batch: Mapping[str, Any]) -> dict[str, Any]:
 
     flattened["candidate_images"] = candidates.reshape(num_groups * num_candidates, *candidates.shape[2:])
     flattened["canonical_images"] = canonicals.reshape(num_groups * num_candidates, *canonicals.shape[2:])
-    flattened["candidate_depths"] = batch["candidate_depths"].reshape(num_groups * num_candidates, *batch["candidate_depths"].shape[2:])
-    flattened["candidate_valid_mask"] = batch["candidate_valid_mask"].reshape(num_groups * num_candidates, *batch["candidate_valid_mask"].shape[2:])
-    flattened["canonical_depths"] = batch["canonical_depths"].reshape(num_groups * num_candidates, *batch["canonical_depths"].shape[2:])
     flattened["camera_context"] = batch["camera_context"].reshape(num_groups * num_candidates, -1)
     flattened["candidate_exposure"] = batch["candidate_exposure"].reshape(num_groups * num_candidates)
     flattened["candidate_gain"] = batch["candidate_gain"].reshape(num_groups * num_candidates)
+
+    for key in (
+        "candidate_depths",
+        "candidate_valid_mask",
+        "canonical_depths",
+        "candidate_abs_rel",
+        "canonical_abs_rel",
+        "abs_rel_degradation",
+    ):
+        if key in batch:
+            flattened[key] = batch[key].reshape(num_groups * num_candidates, *batch[key].shape[2:])
 
     flattened["num_groups"] = num_groups
     flattened["num_candidates"] = num_candidates

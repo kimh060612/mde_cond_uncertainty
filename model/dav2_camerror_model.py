@@ -11,18 +11,16 @@ from transformers import AutoModelForDepthEstimation
 
 class CameraInducedErrorModel(nn.Module):
     """
-    Frozen depth foundation model + camera-induced error prediction & uncertainty.
+    Frozen depth foundation model + image-level camera-induced error prediction.
 
     Probability model:
-        y | x, c ~ N(
-            mu_base(x) + bias_camera(x, c),
-            var_camera(x, c)
-        )
+        scale_shift_loss(candidate_depth, canonical_depth) | x, c
+            ~ N(camera_bias(x, c), var_camera(x, c))
 
     Outputs:
-        base_depth
+        candidate_depth
+        canonical_depth
         camera_bias
-        corrected_depth
         log_variance
         variance
         std
@@ -97,7 +95,7 @@ class CameraInducedErrorModel(nn.Module):
             ),
         )
 
-        # Camera-induced mean correction.
+        # Image-level camera-induced loss mean.
         self.bias_head = nn.Sequential(
             nn.Conv2d(
                 hidden_channels,
@@ -125,7 +123,7 @@ class CameraInducedErrorModel(nn.Module):
             ),
         )
 
-        # Camera-induced log variance.
+        # Image-level camera-induced loss variance.
         self.variance_head = nn.Sequential(
             nn.Conv2d(
                 hidden_channels,
@@ -289,6 +287,22 @@ class CameraInducedErrorModel(nn.Module):
 
         return (1.0 + gamma) * feature + beta
 
+    def _scalar_heads(
+        self,
+        conditioned_feature: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        camera_bias = self.bias_head(conditioned_feature).flatten(1).mean(dim=1)
+        if self.max_bias is not None:
+            camera_bias = self.max_bias * torch.tanh(camera_bias)
+
+        raw_variance = self.variance_head(conditioned_feature).flatten(1).mean(dim=1)
+        variance_floor = torch.exp(raw_variance.new_tensor(self.min_log_variance))
+        variance = variance_floor + F.softplus(raw_variance)
+        if self.max_log_variance is not None:
+            variance = variance.clamp_max(torch.exp(raw_variance.new_tensor(self.max_log_variance)))
+
+        return camera_bias, variance
+
     def forward(
         self,
         candidate_img: torch.Tensor,
@@ -304,23 +318,13 @@ class CameraInducedErrorModel(nn.Module):
         )
         conditioned_feature = self._apply_film(shared_feature, context)
 
-        camera_bias = self.bias_head(conditioned_feature)
-        if self.max_bias is not None:
-            camera_bias = self.max_bias * torch.tanh(camera_bias)
-        raw_variance = self.variance_head(conditioned_feature)
+        camera_bias, variance = self._scalar_heads(conditioned_feature)
 
         if target_size is None:
             target_size = candidate_depth.shape[-2:]
 
         candidate_depth = F.interpolate(candidate_depth, size=target_size, mode="bilinear", align_corners=False)
         canonical_depth = F.interpolate(canonical_depth, size=target_size, mode="bilinear", align_corners=False)
-        camera_bias = F.interpolate(camera_bias, size=target_size, mode="bilinear", align_corners=False)
-        raw_variance = F.interpolate(raw_variance, size=target_size, mode="bilinear", align_corners=False)
-
-        variance_floor = torch.exp(raw_variance.new_tensor(self.min_log_variance))
-        variance = variance_floor + F.softplus(raw_variance)
-        if self.max_log_variance is not None:
-            variance = variance.clamp_max(torch.exp(raw_variance.new_tensor(self.max_log_variance)))
 
         log_variance = torch.log(variance.clamp_min(1e-8))
         std = torch.sqrt(variance)
@@ -328,9 +332,8 @@ class CameraInducedErrorModel(nn.Module):
         return {
             "candidate_depth": candidate_depth,
             "canonical_depth": canonical_depth,
-            "corrected_depth": candidate_depth + camera_bias,
+            "predicted_loss": camera_bias,
             "camera_bias": camera_bias,
-            "raw_variance": raw_variance,
             "log_variance": log_variance,
             "variance": variance,
             "std": std,
@@ -348,31 +351,20 @@ class CameraInducedErrorModel(nn.Module):
         )
         conditioned_feature = self._apply_film(shared_feature, context)
         
-        camera_bias = self.bias_head(conditioned_feature)
-        if self.max_bias is not None:
-            camera_bias = self.max_bias * torch.tanh(camera_bias)
-        raw_variance = self.variance_head(conditioned_feature)
+        camera_bias, variance = self._scalar_heads(conditioned_feature)
 
         if target_size is None:
             target_size = candidate_depth.shape[-2:]
 
         candidate_depth = F.interpolate(candidate_depth, size=target_size, mode="bilinear", align_corners=False)
-        camera_bias = F.interpolate(camera_bias, size=target_size, mode="bilinear", align_corners=False)
-        raw_variance = F.interpolate(raw_variance, size=target_size, mode="bilinear", align_corners=False)
-
-        variance_floor = torch.exp(raw_variance.new_tensor(self.min_log_variance))
-        variance = variance_floor + F.softplus(raw_variance)
-        if self.max_log_variance is not None:
-            variance = variance.clamp_max(torch.exp(raw_variance.new_tensor(self.max_log_variance)))
 
         log_variance = torch.log(variance.clamp_min(1e-8))
         std = torch.sqrt(variance)
 
         return {
             "candidate_depth": candidate_depth,
-            "corrected_depth": candidate_depth + camera_bias,
+            "predicted_loss": camera_bias,
             "camera_bias": camera_bias,
-            "raw_variance": raw_variance,
             "log_variance": log_variance,
             "variance": variance,
             "std": std,

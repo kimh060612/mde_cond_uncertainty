@@ -99,6 +99,94 @@ def fheteroscedastic_caminduced_depth_loss(
     return mean_loss, variance_loss
 
 
+def _ensure_bchw(x: torch.Tensor) -> torch.Tensor:
+    if x.ndim == 3:
+        return x.unsqueeze(1)
+    if x.ndim == 4:
+        return x
+    raise ValueError(f"Expected [B, H, W] or [B, 1, H, W], got {tuple(x.shape)}")
+
+
+def scale_shift_invariant_depth_loss(
+    candidate_depth: torch.Tensor,
+    canonical_depth: torch.Tensor,
+    valid_mask: torch.Tensor | None = None,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """
+    Image-level scale-shift invariant L1 distance between two relative depth maps.
+    The candidate map is linearly aligned to the canonical map per image.
+    """
+    candidate_depth = _ensure_bchw(candidate_depth).float()
+    canonical_depth = _ensure_bchw(canonical_depth).float()
+    if candidate_depth.shape != canonical_depth.shape:
+        raise ValueError("candidate_depth and canonical_depth must have the same shape.")
+
+    if valid_mask is None:
+        mask = torch.ones_like(candidate_depth, dtype=torch.bool)
+    else:
+        mask = _ensure_bchw(valid_mask).bool()
+        if mask.shape != candidate_depth.shape:
+            mask = mask.expand_as(candidate_depth)
+
+    mask = mask & torch.isfinite(candidate_depth) & torch.isfinite(canonical_depth)
+    mask = mask & (candidate_depth > 0) & (canonical_depth > 0)
+    mask_f = mask.to(candidate_depth.dtype)
+
+    valid_counts = mask_f.flatten(1).sum(dim=1)
+    safe_counts = valid_counts.clamp_min(1.0)
+    x = torch.where(mask, candidate_depth, torch.zeros_like(candidate_depth))
+    y = torch.where(mask, canonical_depth, torch.zeros_like(canonical_depth))
+
+    sum_x = x.flatten(1).sum(dim=1)
+    sum_y = y.flatten(1).sum(dim=1)
+    sum_xx = (x * x).flatten(1).sum(dim=1)
+    sum_xy = (x * y).flatten(1).sum(dim=1)
+
+    denom = safe_counts * sum_xx - sum_x.square()
+    stable = (valid_counts > 1) & (denom.abs() > eps)
+    scale = torch.where(
+        stable,
+        (safe_counts * sum_xy - sum_x * sum_y) / denom.clamp_min(eps),
+        torch.zeros_like(valid_counts),
+    )
+    shift = torch.where(
+        valid_counts > 0,
+        (sum_y - scale * sum_x) / safe_counts,
+        torch.zeros_like(valid_counts),
+    )
+
+    aligned_candidate = scale.view(-1, 1, 1, 1) * candidate_depth + shift.view(-1, 1, 1, 1)
+    loss_map = torch.abs(aligned_candidate - canonical_depth)
+    loss = (loss_map * mask_f).flatten(1).sum(dim=1) / safe_counts
+    return torch.where(valid_counts > 0, loss, loss.new_full(loss.shape, float("nan")))
+
+
+def scalar_heteroscedastic_loss(
+    predicted_mean: torch.Tensor,
+    variance: torch.Tensor,
+    target: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    predicted_mean = predicted_mean.flatten()
+    variance = variance.flatten()
+    target = target.detach().flatten().to(dtype=predicted_mean.dtype)
+
+    valid_mask = (
+        torch.isfinite(predicted_mean)
+        & torch.isfinite(variance)
+        & torch.isfinite(target)
+    )
+    if not valid_mask.any():
+        zero = predicted_mean.sum() * 0.0 + variance.sum() * 0.0
+        return zero, zero
+
+    mean_loss = F.smooth_l1_loss(predicted_mean[valid_mask], target[valid_mask])
+    safe_variance = variance[valid_mask].clamp_min(1e-8)
+    detached_residual2 = (target[valid_mask] - predicted_mean[valid_mask].detach()).square()
+    variance_loss = 0.5 * (detached_residual2 / safe_variance + torch.log(safe_variance))
+    return mean_loss, variance_loss.mean()
+
+
 def image_absrel_error(mu, depth, valid_mask):
     depth = depth.unsqueeze(1)
     mask = valid_mask.unsqueeze(1).bool()
@@ -339,6 +427,51 @@ def gap_weighted_ranknet_loss(
 
     pair_weights = normalized_gap.clamp(max=max_weight)
     pair_loss = F.softplus(-pair_label * pred_diff / temperature)
+    weighted_loss = pair_loss[valid_pairs] * pair_weights[valid_pairs]
+    return weighted_loss.sum() / pair_weights[valid_pairs].sum().clamp_min(eps)
+
+
+def signed_pairwise_ranknet_loss(
+    predicted_score: torch.Tensor,
+    target_score: torch.Tensor,
+    temperature: float = 0.5,
+    tie_margin: float = 0.0,
+    max_weight: float = 1.0,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """
+    Pairwise ranking loss for signed scores such as AbsRel degradation.
+    Higher predicted_score should mean higher target_score.
+    """
+    if predicted_score.shape != target_score.shape:
+        raise ValueError("predicted_score and target_score must have the same shape.")
+
+    _, num_candidates = predicted_score.shape
+    if num_candidates < 2:
+        return predicted_score.new_zeros(())
+
+    pair_i, pair_j = torch.triu_indices(
+        num_candidates,
+        num_candidates,
+        offset=1,
+        device=predicted_score.device,
+    )
+    pred_diff = predicted_score[:, pair_i] - predicted_score[:, pair_j]
+    target_diff = target_score[:, pair_i].detach() - target_score[:, pair_j].detach()
+    pair_label = torch.sign(target_diff)
+    gap = target_diff.abs()
+    valid_pairs = (gap > tie_margin) & (pair_label != 0)
+
+    if not valid_pairs.any():
+        return predicted_score.new_zeros(())
+
+    normalizer = (
+        target_score[:, pair_i].detach().abs()
+        + target_score[:, pair_j].detach().abs()
+        + eps
+    )
+    pair_weights = (gap / normalizer).clamp(max=max_weight)
+    pair_loss = F.softplus(-pair_label * pred_diff / max(temperature, eps))
     weighted_loss = pair_loss[valid_pairs] * pair_weights[valid_pairs]
     return weighted_loss.sum() / pair_weights[valid_pairs].sum().clamp_min(eps)
 

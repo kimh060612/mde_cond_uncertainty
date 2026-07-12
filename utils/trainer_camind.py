@@ -1,46 +1,111 @@
-from typing import Tuple, Dict
-import torch
-from dataset.ati_dataset_caminduce import flatten_group_batch
-from model.loss_fn import (
-    fheteroscedastic_caminduced_depth_loss, 
-    gap_weighted_ranknet_loss,
-    camera_risk_scores
-) # , image_level_listnet_loss
-from evaluation_utils.eval_utils import (
-    align_relative_prediction_to_depth_space,
-    _mean_finite_metrics,
-)
-from evaluation_utils.eval_metrics import (
-    compute_comprehensive_depth_metrics,
-    compute_loss_uncertainty_correlations,
-    compute_sparsification_ause_metrics,
-    compute_vector_masked_correlations,
-    compute_camera_induced_degradation_values,
-    summarize_camera_induced_degradation_correlations
-)
-from tqdm.auto import tqdm
-from utils.train_utils import *
+from typing import Dict, Tuple
 import logging
 
-def get_batched_correlations(batched_metric, uncertainty, max_samples=100_000):
-    abs_rel = torch.cat(batched_metric["abs_rel"], dim=0)
-    a1 = torch.cat(batched_metric["a1"], dim=0)
-    uncertainty_mean = torch.cat(uncertainty, dim=0)
-    a1_uncertainty_correlation = compute_vector_masked_correlations( 
-        a1,
-        uncertainty_mean,
-        valid_mask=torch.isfinite(a1) & torch.isfinite(uncertainty_mean),
-        prefix="aggregated_a1_unc",
-        max_samples=max_samples
+import torch
+from tqdm.auto import tqdm
+
+from dataset.ati_dataset_caminduce import flatten_group_batch
+from evaluation_utils.eval_metrics import compute_vector_masked_correlations
+from model.loss_fn import (
+    scalar_heteroscedastic_loss,
+    scale_shift_invariant_depth_loss,
+    signed_pairwise_ranknet_loss,
+)
+from utils.train_utils import reshape_group_batch, tensor_device
+
+
+def _finite_mean(values: torch.Tensor) -> float:
+    values = values.detach().float().flatten()
+    finite_mask = torch.isfinite(values)
+    if not finite_mask.any():
+        return float("nan")
+    return float(values[finite_mask].mean().item())
+
+
+def _pairwise_rank_accuracy(
+    predicted_score: torch.Tensor,
+    target_score: torch.Tensor,
+) -> float:
+    _, num_candidates = predicted_score.shape
+    if num_candidates < 2:
+        return float("nan")
+
+    pair_i, pair_j = torch.triu_indices(
+        num_candidates,
+        num_candidates,
+        offset=1,
+        device=predicted_score.device,
     )
-    abs_rel_uncertainty_correlation = compute_vector_masked_correlations(
-        abs_rel,
-        uncertainty_mean,
-        valid_mask=torch.isfinite(abs_rel) & torch.isfinite(uncertainty_mean),
-        prefix="aggregated_abs_rel_unc",
-        max_samples=max_samples
-    )
-    return a1_uncertainty_correlation, abs_rel_uncertainty_correlation
+    pred_diff = predicted_score[:, pair_i] - predicted_score[:, pair_j]
+    target_diff = target_score[:, pair_i] - target_score[:, pair_j]
+    valid_mask = torch.isfinite(pred_diff) & torch.isfinite(target_diff) & (target_diff != 0)
+    if not valid_mask.any():
+        return float("nan")
+    correct = torch.sign(pred_diff[valid_mask]) == torch.sign(target_diff[valid_mask])
+    return float(correct.float().mean().item())
+
+
+def _cat(values: list[torch.Tensor]) -> torch.Tensor | None:
+    if not values:
+        return None
+    return torch.cat(values, dim=0)
+
+
+def _append_epoch_vectors(
+    vectors: dict[str, list[torch.Tensor]],
+    **items: torch.Tensor,
+) -> None:
+    for key, value in items.items():
+        vectors[key].append(value.detach().float().flatten().cpu())
+
+
+def _summarize_epoch_vectors(
+    vectors: dict[str, list[torch.Tensor]],
+    max_samples: int,
+) -> Dict[str, float]:
+    metrics: Dict[str, float] = {}
+    cat_vectors = {
+        key: _cat(value)
+        for key, value in vectors.items()
+    }
+
+    for key, value in cat_vectors.items():
+        if value is not None:
+            metrics[key] = _finite_mean(value)
+
+    target_loss = cat_vectors.get("target_ssi_loss")
+    camera_bias = cat_vectors.get("camera_bias")
+    abs_rel_degradation = cat_vectors.get("abs_rel_degradation")
+    q_score = cat_vectors.get("q_score")
+
+    if target_loss is not None and camera_bias is not None:
+        metrics.update(
+            compute_vector_masked_correlations(
+                target_loss,
+                camera_bias,
+                prefix="bias_vs_ssi_loss",
+                max_samples=max_samples,
+            )
+        )
+    if abs_rel_degradation is not None and camera_bias is not None:
+        metrics.update(
+            compute_vector_masked_correlations(
+                abs_rel_degradation,
+                camera_bias,
+                prefix="bias_vs_abs_rel_degradation",
+                max_samples=max_samples,
+            )
+        )
+    if abs_rel_degradation is not None and q_score is not None:
+        metrics.update(
+            compute_vector_masked_correlations(
+                abs_rel_degradation,
+                q_score,
+                prefix="q_vs_abs_rel_degradation",
+                max_samples=max_samples,
+            )
+        )
+    return metrics
 
 
 def train_one_epoch(
@@ -63,9 +128,15 @@ def train_one_epoch(
     max_depth: float = 80.0,
     correlation_max_samples: int = 100_000,
     relative_align_mode: str = "scale_shift",
+    uncertainty_alpha: float = 1.0,
     global_step: int = 0,
     log_interval: int = 20,
-)-> Tuple[Dict[str, float], int]:
+) -> Tuple[Dict[str, float], int]:
+    del model_id, lambda_smooth_logvar, uncertainty_mode, min_depth, max_depth
+
+    if hasattr(loader.dataset, "set_epoch"):
+        loader.dataset.set_epoch(epoch)
+
     model.train()
     progress_bar = tqdm(
         loader,
@@ -73,113 +144,61 @@ def train_one_epoch(
         dynamic_ncols=True,
         leave=False,
     )
-    
-    running_loss = 0.0
-    running_nll_loss = 0.0
-    running_mean_loss = 0.0
-    running_variance_loss = 0.0
-    running_list_loss = 0.0
-    running_abs_rel = 0.0
-    running_rmse = 0.0
-    running_a1 = 0.0
-    running_ause_abs_rel = []
-    running_ause_a1 = []
-    running_pearson_correlation_l1 = []
-    running_spearman_correlation_l1 = []
-    
-    running_batched_metrics = {
-        "abs_rel": [],
-        "a1": [],
+
+    running = {
+        "loss": 0.0,
+        "nll_loss": 0.0,
+        "mean_loss": 0.0,
+        "variance_loss": 0.0,
+        "ranking_loss": 0.0,
+        "q_rank_accuracy": 0.0,
     }
-    running_uncertainty_mean = []
-    running_degradation_values = {
-        "B2": [],
-        "V": [],
-        "R": [],
-        "sqrt_R": [],
-        "log_R": [],
-        "abs_rel_degradation": [],
-        "delta1_degradation": [],
-        "delta1_error_degradation": [],
-        "group_id": [],
-    }
-    corr_sums = {}
-    corr_counts = {}
-    condition_sums = {}
+    rank_accuracy_count = 0
     processed_batches = 0
+    vectors: dict[str, list[torch.Tensor]] = {
+        "target_ssi_loss": [],
+        "camera_bias": [],
+        "sigma": [],
+        "q_score": [],
+        "candidate_abs_rel": [],
+        "canonical_abs_rel": [],
+        "abs_rel_degradation": [],
+    }
 
     for step, batch in enumerate(progress_bar, start=1):
         if batch is None:
             continue
-        num_groups, num_candidates = (
-            batch["candidate_images"].shape[:2]
-        )
+
+        num_groups, num_candidates = batch["candidate_images"].shape[:2]
         flat_batch = tensor_device(flatten_group_batch(batch), device)
         candidate_imgs = flat_batch["candidate_images"]
         canonical_imgs = flat_batch["canonical_images"]
-        candidate_depth = flat_batch["candidate_depths"]
-        canonical_depth = flat_batch["canonical_depths"]
-        candidate_valid_mask = flat_batch["candidate_valid_mask"]
-        canonical_valid_mask = torch.isfinite(canonical_depth)
-        canonical_valid_mask &= canonical_depth > min_depth
-        canonical_valid_mask &= canonical_depth < max_depth
-        candidate_condition = flat_batch["camera_context"]
-        group_ids = batch["group_index"].to(device=device)[:, None].expand(-1, num_candidates).reshape(-1)
-        
-        target_size = candidate_depth.shape[-2:]
+        camera_context = flat_batch["camera_context"]
+        abs_rel_degradation = flat_batch["abs_rel_degradation"]
+
         optimizer.zero_grad(set_to_none=True)
-        
-        prefix_head = "metric" if model_id.startswith("metric") else "relative"
+
         with torch.autocast(device_type=device.type, enabled=amp):
             out = model(
                 candidate_imgs,
                 canonical_imgs,
-                candidate_condition,
-                target_size=target_size,
+                camera_context,
+                target_size=candidate_imgs.shape[-2:],
             )
-            
-            if prefix_head == "relative":
-                aligned = align_relative_prediction_to_depth_space(
-                    out["candidate_depth"],
-                    candidate_depth,
-                    candidate_valid_mask,
-                    align_mode=relative_align_mode,
-                )
-                canonical_aligned = align_relative_prediction_to_depth_space(
-                    out["canonical_depth"],
-                    canonical_depth,
-                    canonical_valid_mask,
-                    align_mode=relative_align_mode,
-                )
-                aligned_std = out["std"]
-            else:
-                raise NotImplementedError("Metric head is not implemented in this training function.")
-            uncertainty_map = torch.sqrt(out["camera_bias"].square() + aligned_std.square())
-            
-            mean_loss, variance_loss = fheteroscedastic_caminduced_depth_loss(
-                out["corrected_depth"],
-                out["variance"],
+            target_loss = scale_shift_invariant_depth_loss(
+                out["candidate_depth"],
                 out["canonical_depth"],
-                lambda_smooth_logvar=lambda_smooth_logvar,
             )
-            
-            group_canonical_depth = reshape_group_batch(out["canonical_depth"], num_groups, num_candidates)
-            group_candidate_depth = reshape_group_batch(out["candidate_depth"], num_groups, num_candidates)
-            cam_bias = reshape_group_batch(out["camera_bias"], num_groups, num_candidates)
-            cam_variance = reshape_group_batch(out["variance"], num_groups, num_candidates)
-            predicted_risk, target_risk = camera_risk_scores(
-                bias=cam_bias,
-                variance=cam_variance,
-                canonical_delta=group_canonical_depth - group_candidate_depth,
-                valid_mask=torch.ones_like(
-                    group_candidate_depth, dtype=torch.float32
-                ).to(device),
+            mean_loss, variance_loss = scalar_heteroscedastic_loss(
+                out["camera_bias"],
+                out["variance"],
+                target_loss,
             )
-            ranking_loss = gap_weighted_ranknet_loss(
-                predicted_risk,
-                target_risk, 
+            q_score = out["camera_bias"] + uncertainty_alpha * out["std"]
+            ranking_loss = signed_pairwise_ranknet_loss(
+                reshape_group_batch(q_score, num_groups, num_candidates),
+                reshape_group_batch(abs_rel_degradation, num_groups, num_candidates),
                 temperature=listnet_temperature,
-                eps=1e-6
             )
             nll_loss = mean_loss + lambda_variance * variance_loss
             loss = nll_loss + list_loss_weight * ranking_loss
@@ -188,139 +207,67 @@ def train_one_epoch(
         if grad_clip > 0:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-
         scaler.step(optimizer)
         scaler.update()
 
-        mu_aligned = aligned["depth"].detach()
-        uncertainty_map = uncertainty_map.detach()
-        batched_metrics = compute_comprehensive_depth_metrics(
-            mu=mu_aligned,
-            target=candidate_depth,
-            valid_mask=candidate_valid_mask,
-            min_depth=min_depth,
-            max_depth=max_depth,
-        )
-        canonical_batched_metrics = compute_comprehensive_depth_metrics(
-            mu=canonical_aligned["depth"].detach(),
-            target=canonical_depth,
-            valid_mask=canonical_valid_mask,
-            min_depth=min_depth,
-            max_depth=max_depth,
-        )
-        
-        correlations = compute_loss_uncertainty_correlations(
-            mu_aligned.detach(),
-            candidate_depth,
-            candidate_valid_mask,
-            uncertainty=uncertainty_map.detach(),
-            max_samples=correlation_max_samples,
-            min_depth=min_depth,
-            max_depth=max_depth,
-        )
-        ause_metrics = compute_sparsification_ause_metrics(
-            mu_aligned,
-            candidate_depth,
-            candidate_valid_mask,
-            uncertainty=uncertainty_map,
-            max_samples=correlation_max_samples,
-            min_depth=min_depth,
-            max_depth=max_depth,
-        )
-        
-        running_loss += loss.item()
-        running_nll_loss += nll_loss.item()
-        running_mean_loss += mean_loss.item()
-        running_variance_loss += variance_loss.item()
-        running_list_loss += ranking_loss.item()
-        running_abs_rel += batched_metrics["abs_rel"].mean().item()
-        running_rmse += batched_metrics["rmse"].mean().item()
-        running_a1 += batched_metrics["a1"].mean().item()
-        running_ause_abs_rel.append(ause_metrics["ause_abs_rel"])
-        running_ause_a1.append(ause_metrics["ause_a1"])
-        running_pearson_correlation_l1.append(correlations["loss_uncertainty_pearson"])
-        running_spearman_correlation_l1.append(correlations["loss_uncertainty_spearman"])
-        
-        running_batched_metrics["abs_rel"].append(batched_metrics["abs_rel"])
-        running_batched_metrics["a1"].append(batched_metrics["a1"])
-        running_uncertainty_mean.append(masked_image_mean(uncertainty_map, candidate_valid_mask))
-        degradation_values = compute_camera_induced_degradation_values(
-            candidate_metrics=batched_metrics,
-            canonical_metrics=canonical_batched_metrics,
-            camera_bias=out["camera_bias"],
-            variance=out["variance"],
-            valid_mask=candidate_valid_mask,
-            group_ids=group_ids,
-        )
-        for key, value in degradation_values.items():
-            running_degradation_values[key].append(value.detach().cpu())
-        running_a1_unc_corr, running_abs_rel_unc_corr = get_batched_correlations(
-            running_batched_metrics,
-            running_uncertainty_mean,
-            max_samples=correlation_max_samples,
-        )
-        processed_batches += 1
+        with torch.no_grad():
+            group_q = reshape_group_batch(q_score.detach(), num_groups, num_candidates)
+            group_degradation = reshape_group_batch(
+                abs_rel_degradation.detach(),
+                num_groups,
+                num_candidates,
+            )
+            rank_accuracy = _pairwise_rank_accuracy(group_q, group_degradation)
+            if torch.isfinite(torch.tensor(rank_accuracy)):
+                running["q_rank_accuracy"] += rank_accuracy
+                rank_accuracy_count += 1
 
+            _append_epoch_vectors(
+                vectors,
+                target_ssi_loss=target_loss,
+                camera_bias=out["camera_bias"],
+                sigma=out["std"],
+                q_score=q_score,
+                candidate_abs_rel=flat_batch["candidate_abs_rel"],
+                canonical_abs_rel=flat_batch["canonical_abs_rel"],
+                abs_rel_degradation=abs_rel_degradation,
+            )
+
+        running["loss"] += float(loss.item())
+        running["nll_loss"] += float(nll_loss.item())
+        running["mean_loss"] += float(mean_loss.item())
+        running["variance_loss"] += float(variance_loss.item())
+        running["ranking_loss"] += float(ranking_loss.item())
+        processed_batches += 1
+        global_step += 1
+
+        n = max(processed_batches, 1)
         progress_bar.set_postfix(
             loss=f"{loss.item():.4f}",
-            avg=f"{running_loss / step:.4f}",
-            abs_rel=f"{running_abs_rel / step:.4f}",
-            a1=f"{running_a1 / step:.4f}",
-            ause_abs_rel=f"{torch.cat(running_ause_abs_rel, dim=0).mean().item():.4f}",
-            ause_a1=f"{torch.cat(running_ause_a1, dim=0).mean().item():.4f}",
-            correlation_l1=f"{torch.cat(running_pearson_correlation_l1, dim=0).mean().item():.4f}",
-            spearman_correlation_l1=f"{torch.cat(running_spearman_correlation_l1, dim=0).mean().item():.4f}",
+            avg=f"{running['loss'] / n:.4f}",
+            ssi=f"{_finite_mean(target_loss):.4f}",
+            deg=f"{_finite_mean(abs_rel_degradation):.4f}",
+            q_acc=f"{running['q_rank_accuracy'] / max(rank_accuracy_count, 1):.4f}",
         )
+
         if log_interval > 0 and step % log_interval == 0:
             logger.info(
-                "epoch=%d step=%d/%d avg_loss=%.6f abs_rel=%.6f a1=%.6f sample_a1_corr=%.6f sample_abs_rel_corr=%.6f ause_abs_rel=%.6f ause_a1=%.6f correlation_l1=%.6f",
+                "epoch=%d step=%d/%d avg_loss=%.6f mean_loss=%.6f variance_loss=%.6f ranking_loss=%.6f",
                 epoch,
                 step,
                 len(loader),
-                running_loss / step,
-                running_abs_rel / step,
-                running_a1 / step,
-                running_a1_unc_corr["aggregated_a1_unc_pearson"],
-                running_abs_rel_unc_corr["aggregated_abs_rel_unc_pearson"],
-                torch.cat(running_ause_abs_rel, dim=0).mean().item(),
-                torch.cat(running_ause_a1, dim=0).mean().item(),
-                torch.cat(running_pearson_correlation_l1, dim=0).mean().item()
+                running["loss"] / n,
+                running["mean_loss"] / n,
+                running["variance_loss"] / n,
+                running["ranking_loss"] / n,
             )
-        global_step += 1
-
-    total_a1_unc_corr, total_abs_rel_unc_corr = get_batched_correlations(
-        running_batched_metrics,
-        running_uncertainty_mean,
-        max_samples=correlation_max_samples,
-    )
-    degradation_metrics = summarize_camera_induced_degradation_correlations(
-        {
-            key: torch.cat(values, dim=0)
-            for key, values in running_degradation_values.items()
-            if values
-        },
-        max_samples=correlation_max_samples,
-    )
 
     n = max(processed_batches, 1)
     epoch_metrics = {
-        "loss": running_loss / n,
-        "nll_loss": running_nll_loss / n,
-        "mean_loss": running_mean_loss / n,
-        "variance_loss": running_variance_loss / n,
-        "list_loss": running_list_loss / n,
-        "abs_rel": running_abs_rel / n,
-        "rmse": running_rmse / n,
-        "a1": running_a1 / n,
-        "sample_a1_pearson": total_a1_unc_corr["aggregated_a1_unc_pearson"],
-        "sample_abs_rel_pearson": total_abs_rel_unc_corr["aggregated_abs_rel_unc_pearson"],
-        "ause_abs_rel": torch.cat(running_ause_abs_rel, dim=0).mean().item(),
-        "ause_a1": torch.cat(running_ause_a1, dim=0).mean().item(),
-        "correlation_l1": torch.cat(running_pearson_correlation_l1, dim=0).mean().item(),
-        "spearman_correlation_l1": torch.cat(running_spearman_correlation_l1, dim=0).mean().item(),
+        key: value / n
+        for key, value in running.items()
+        if key != "q_rank_accuracy"
     }
-    epoch_metrics.update({key: value / n for key, value in condition_sums.items()})
-    epoch_metrics.update(_mean_finite_metrics(corr_sums, corr_counts))
-    epoch_metrics.update(degradation_metrics)
-    
+    epoch_metrics["q_rank_accuracy"] = running["q_rank_accuracy"] / max(rank_accuracy_count, 1)
+    epoch_metrics.update(_summarize_epoch_vectors(vectors, correlation_max_samples))
     return epoch_metrics, global_step
