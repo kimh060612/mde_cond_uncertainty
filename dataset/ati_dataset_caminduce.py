@@ -382,6 +382,7 @@ class FoundationCameraGroupedDataset(Dataset[dict[str, Any]]):
                 expected_value=camera_model_name,
             )
 
+        table = table.loc[~table["registration_status"].isin({"registration_failed", "failed"})].copy()
         table = table.loc[(table["match_status"] == valid_match_status) & (table["registration_status"] == valid_registration_status)].copy()
 
         if min_overlap_ratio is not None:
