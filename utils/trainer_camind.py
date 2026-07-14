@@ -194,7 +194,7 @@ def train_one_epoch(
                 out["variance"],
                 target_loss,
             )
-            q_score = out["camera_bias"] + uncertainty_alpha * out["std"]
+            q_score = out["camera_bias"] # + uncertainty_alpha * out["std"]
             ranking_loss = signed_pairwise_ranknet_loss(
                 reshape_group_batch(q_score, num_groups, num_candidates),
                 reshape_group_batch(abs_rel_degradation, num_groups, num_candidates),
