@@ -63,6 +63,7 @@ def _new_accumulator() -> dict:
             "candidate_abs_rel": [],
             "canonical_abs_rel": [],
             "abs_rel_degradation": [],
+            "rmse_degradation": [],
         },
     }
 
@@ -108,12 +109,13 @@ def _finalize_accumulator(
         for key, values in accumulator["vectors"].items()
     }
     for key, value in cat_vectors.items():
-        if value is not None:
+        if value is not None and key != "rmse_degradation":
             metrics[key] = _finite_mean(value)
 
     target_loss = cat_vectors.get("target_ssi_loss")
     camera_bias = cat_vectors.get("camera_bias")
     abs_rel_degradation = cat_vectors.get("abs_rel_degradation")
+    rmse_degradation = cat_vectors.get("rmse_degradation")
     q_score = cat_vectors.get("q_score")
 
     if target_loss is not None and camera_bias is not None:
@@ -140,6 +142,15 @@ def _finalize_accumulator(
                 abs_rel_degradation,
                 q_score,
                 prefix="q_vs_abs_rel_degradation",
+                max_samples=max_samples,
+            )
+        )
+    if rmse_degradation is not None and q_score is not None:
+        metrics.update(
+            compute_vector_masked_correlations(
+                rmse_degradation,
+                q_score,
+                prefix="q_vs_rmse_degradation",
                 max_samples=max_samples,
             )
         )
@@ -191,6 +202,7 @@ def validate(
         canonical_imgs = flat_batch["canonical_images"]
         camera_context = flat_batch["camera_context"]
         abs_rel_degradation = flat_batch["abs_rel_degradation"]
+        rmse_degradation = flat_batch["rmse_degradation"]
 
         with torch.autocast(device_type=device.type, enabled=amp):
             out = model(
@@ -231,6 +243,7 @@ def validate(
             "candidate_abs_rel": flat_batch["candidate_abs_rel"],
             "canonical_abs_rel": flat_batch["canonical_abs_rel"],
             "abs_rel_degradation": abs_rel_degradation,
+            "rmse_degradation": rmse_degradation,
         }
         rank_accuracy = _pairwise_rank_accuracy(group_q, group_degradation)
 

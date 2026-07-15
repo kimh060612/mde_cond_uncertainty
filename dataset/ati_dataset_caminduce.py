@@ -257,6 +257,7 @@ class FoundationCameraGroupedDataset(Dataset[dict[str, Any]]):
         "source_metric_abs_rel",
         "canonical_metric_abs_rel",
         "performance_degradation_abs_rel",
+        "performance_degradation_rmse",
         "match_status",
         "registration_status",
     }
@@ -795,6 +796,10 @@ class FoundationCameraGroupedDataset(Dataset[dict[str, Any]]):
             [float(row["performance_degradation_abs_rel"]) for row in selected_rows],
             dtype=torch.float32,
         )
+        rmse_degradation = torch.tensor(
+            [float(row["performance_degradation_rmse"]) for row in selected_rows],
+            dtype=torch.float32,
+        )
 
         result: dict[str, Any] = {
             "group_index": torch.tensor(group_index, dtype=torch.long),
@@ -808,6 +813,7 @@ class FoundationCameraGroupedDataset(Dataset[dict[str, Any]]):
             "candidate_abs_rel": candidate_abs_rel,
             "canonical_abs_rel": canonical_abs_rel,
             "abs_rel_degradation": abs_rel_degradation,
+            "rmse_degradation": rmse_degradation,
             "camera_context": camera_context,
             "canonical_exposure": torch.tensor(canonical_exposure, dtype=torch.float32),
             "canonical_gain": torch.tensor(canonical_gain, dtype=torch.float32),
@@ -915,6 +921,7 @@ def flatten_group_batch(batch: Mapping[str, Any]) -> dict[str, Any]:
         "candidate_abs_rel",
         "canonical_abs_rel",
         "abs_rel_degradation",
+        "rmse_degradation",
     ):
         if key in batch:
             flattened[key] = batch[key].reshape(num_groups * num_candidates, *batch[key].shape[2:])

@@ -70,12 +70,13 @@ def _summarize_epoch_vectors(
     }
 
     for key, value in cat_vectors.items():
-        if value is not None:
+        if value is not None and key != "rmse_degradation":
             metrics[key] = _finite_mean(value)
 
     target_loss = cat_vectors.get("target_ssi_loss")
     camera_bias = cat_vectors.get("camera_bias")
     abs_rel_degradation = cat_vectors.get("abs_rel_degradation")
+    rmse_degradation = cat_vectors.get("rmse_degradation")
     q_score = cat_vectors.get("q_score")
 
     if target_loss is not None and camera_bias is not None:
@@ -102,6 +103,15 @@ def _summarize_epoch_vectors(
                 abs_rel_degradation,
                 q_score,
                 prefix="q_vs_abs_rel_degradation",
+                max_samples=max_samples,
+            )
+        )
+    if rmse_degradation is not None and q_score is not None:
+        metrics.update(
+            compute_vector_masked_correlations(
+                rmse_degradation,
+                q_score,
+                prefix="q_vs_rmse_degradation",
                 max_samples=max_samples,
             )
         )
@@ -163,6 +173,7 @@ def train_one_epoch(
         "candidate_abs_rel": [],
         "canonical_abs_rel": [],
         "abs_rel_degradation": [],
+        "rmse_degradation": [],
     }
 
     for step, batch in enumerate(progress_bar, start=1):
@@ -175,6 +186,7 @@ def train_one_epoch(
         canonical_imgs = flat_batch["canonical_images"]
         camera_context = flat_batch["camera_context"]
         abs_rel_degradation = flat_batch["abs_rel_degradation"]
+        rmse_degradation = flat_batch["rmse_degradation"]
 
         optimizer.zero_grad(set_to_none=True)
 
@@ -222,16 +234,17 @@ def train_one_epoch(
                 running["q_rank_accuracy"] += rank_accuracy
                 rank_accuracy_count += 1
 
-            _append_epoch_vectors(
-                vectors,
-                target_ssi_loss=target_loss,
-                camera_bias=out["camera_bias"],
-                sigma=out["std"],
-                q_score=q_score,
-                candidate_abs_rel=flat_batch["candidate_abs_rel"],
-                canonical_abs_rel=flat_batch["canonical_abs_rel"],
-                abs_rel_degradation=abs_rel_degradation,
-            )
+            batch_vectors = {
+                "target_ssi_loss": target_loss,
+                "camera_bias": out["camera_bias"],
+                "sigma": out["std"],
+                "q_score": q_score,
+                "candidate_abs_rel": flat_batch["candidate_abs_rel"],
+                "canonical_abs_rel": flat_batch["canonical_abs_rel"],
+                "abs_rel_degradation": abs_rel_degradation,
+                "rmse_degradation": rmse_degradation,
+            }
+            _append_epoch_vectors(vectors, **batch_vectors)
 
         running["loss"] += float(loss.item())
         running["nll_loss"] += float(nll_loss.item())
