@@ -186,6 +186,28 @@ def scalar_heteroscedastic_loss(
     variance_loss = 0.5 * (detached_residual2 / safe_variance + torch.log(safe_variance))
     return mean_loss, variance_loss.mean()
 
+def scalar_heteroscedastic_laplace_loss(
+    predicted_mean: torch.Tensor,
+    variance: torch.Tensor,
+    target: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    predicted_mean = predicted_mean.flatten()
+    variance = variance.flatten()
+    target = target.detach().flatten().to(dtype=predicted_mean.dtype)
+    valid_mask = (
+        torch.isfinite(predicted_mean)
+        & torch.isfinite(variance)
+        & torch.isfinite(target)
+    )
+    if not valid_mask.any():
+        zero = predicted_mean.sum() * 0.0 + variance.sum() * 0.0
+        return zero, zero
+
+    mean_loss = F.l1_loss(predicted_mean[valid_mask], target[valid_mask])
+    safe_variance = variance[valid_mask].clamp_min(1e-8)
+    detached_residual = (target[valid_mask] - predicted_mean[valid_mask].detach()).abs()
+    variance_loss = detached_residual / safe_variance + torch.log(safe_variance)
+    return mean_loss, variance_loss.mean()
 
 def image_absrel_error(mu, depth, valid_mask):
     depth = depth.unsqueeze(1)
