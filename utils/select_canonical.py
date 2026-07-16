@@ -149,7 +149,7 @@ class SelectCanonicalandMatchFrames:
         self.exposure_set = list(exposure_set or [2000, 4000, 8000, 16000, 32000])
         self.gain_set = list(gain_set or [16, 32, 64, 128])
         self.light_prefix = list(light_prefix or ["normal", "dim", "dark"])
-        self.speed_prefix = list(speed_prefix or ["fast"])
+        self.speed_prefix = list(speed_prefix or ["fast", "normal"])
         self.motion_label = list(motion_label or ["stop", "spin", "rotate", "slow", "fast"])
         self.target_topology = list(target_topology or ["topology1", "topology2", "topology3"])
         self.data_path = data_path or os.environ.get(
