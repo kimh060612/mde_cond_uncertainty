@@ -1,6 +1,6 @@
 dataset:
   name: ati_dataset
-  dataset_root: /home/kimh060612/ati_workspace/orbbec_realworld_dataset
+  dataset_root: /datasets/ATI/MDE/orbbec_realworld_dataset
   csv_path: /home/kimh060612/ati_workspace/mde_cond_uncertainty/orbbec_canonical_parameter_frame_matches_by_scene/
   min_depth: 1e-3
   max_depth: 10.0
