@@ -701,7 +701,7 @@ class FoundationCameraGroupedDataset(Dataset[dict[str, Any]]):
 
         scene_tokens = str(row["scene"]).split("_")
         matches = [label for label in self.light_levels if label in scene_tokens]
-        if len(matches) != 1:
+        if len(matches) != 1 and not (len(matches) == 2 and matches[1] == "normal"):
             print(f"Scene tokens: {scene_tokens}, Light levels: {self.light_levels}")
             raise ValueError(f"Cannot infer light label from scene: {row['scene']}")
         return matches[0]
