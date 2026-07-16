@@ -7,7 +7,7 @@ import argparse
 parser = argparse.ArgumentParser(description="Convert a sequence of images to a video.")
 parser.add_argument("--dir", 
     type=str, 
-    default="/home/kimh060612/ati_workspace/orbbec_realworld_dataset/val_comlab_scene_normal_fast_topology2/pair_008_exposure_16000_gain_32", 
+    default="/datasets/ATI/MDE/orbbec_realworld_dataset/comlab_scene_dim_normal_topology2/pair_006_exposure_4000_gain_32", 
     help="Path to the folder containing images."
 )
 
