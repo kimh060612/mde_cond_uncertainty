@@ -161,6 +161,81 @@ def scale_shift_invariant_depth_loss(
     loss = (loss_map * mask_f).flatten(1).sum(dim=1) / safe_counts
     return torch.where(valid_counts > 0, loss, loss.new_full(loss.shape, float("nan")))
 
+import torch
+
+
+def log_scale_invariant_depth_difference(
+    candidate_depth: torch.Tensor,
+    canonical_depth: torch.Tensor,
+    valid_mask: torch.Tensor | None = None,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    # Replace these two calls with your existing _ensure_bchw implementation.
+    candidate_depth = _ensure_bchw(candidate_depth).float()
+    canonical_depth = _ensure_bchw(canonical_depth).float()
+    if valid_mask is None:
+        mask = torch.ones_like(candidate_depth, dtype=torch.bool)
+    else:
+        mask = _ensure_bchw(valid_mask).bool()
+        mask = mask.expand_as(candidate_depth)
+        
+    # Only finite, strictly positive depth values are valid in the log domain.
+    mask = (
+        mask
+        & torch.isfinite(candidate_depth)
+        & torch.isfinite(canonical_depth)
+        & (candidate_depth > 0)
+        & (canonical_depth > 0)
+    )
+
+    batch_size = candidate_depth.shape[0]
+    flat_mask = mask.flatten(1)
+    valid_counts = flat_mask.sum(dim=1)
+    safe_counts = valid_counts.clamp_min(1).to(candidate_depth.dtype)
+
+    # eps guards against numerical issues near zero. Values that were actually
+    # non-positive have already been removed by the validity mask.
+    candidate_log = torch.log(candidate_depth.clamp_min(eps))
+    canonical_log = torch.log(canonical_depth.clamp_min(eps))
+
+    # log(candidate / canonical)
+    log_ratio = candidate_log - canonical_log
+    flat_log_ratio = log_ratio.flatten(1)
+
+    # NaN masking allows a per-image median over only valid pixels.
+    masked_log_ratio = torch.where(
+        flat_mask,
+        flat_log_ratio,
+        torch.full_like(flat_log_ratio, float("nan")),
+    )
+
+    # Shape: [B]
+    global_log_scale = torch.nanmedian(masked_log_ratio, dim=1).values
+
+    # Remove the global multiplicative scale difference.
+    centered_log_ratio = (
+        log_ratio
+        - global_log_scale.view(batch_size, 1, 1, 1)
+    )
+
+    absolute_difference = torch.abs(centered_log_ratio)
+
+    loss = (
+        torch.where(
+            mask,
+            absolute_difference,
+            torch.zeros_like(absolute_difference),
+        )
+        .flatten(1)
+        .sum(dim=1)
+        / safe_counts
+    )
+
+    return torch.where(
+        valid_counts > 0,
+        loss,
+        loss.new_full(loss.shape, float("nan")),
+    )
 
 def scalar_heteroscedastic_loss(
     predicted_mean: torch.Tensor,

@@ -3,6 +3,7 @@ import json
 import math
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 from glob import glob
 from tqdm import tqdm
 
@@ -61,10 +62,30 @@ DEPTH_MATCH_MAX_MEAN_ABS_DIFF = 0.08 # 8cm
 DEPTH_PREFILTER_MAX_RAW_MEAN_ABS_DIFF = float(os.environ.get("DEPTH_PREFILTER_MAX_RAW_MEAN_ABS_DIFF", "0.3"))
 DEPTH_AUTO_SCALE_THRESHOLD = 20.0
 DEPTH_RAW_TO_METER_SCALE = 0.001
-REGISTRATION_IMAGE_SIZE = (160, 120)
+REGISTRATION_IMAGE_SIZE = (
+    int(os.environ.get("REGISTRATION_IMAGE_WIDTH", "160")),
+    int(os.environ.get("REGISTRATION_IMAGE_HEIGHT", "120")),
+)
 REGISTRATION_MIN_OVERLAP_RATIO = 0.90
-REGISTRATION_ECC_MAX_ITERS = 60
-REGISTRATION_ECC_EPS = 1e-4
+REGISTRATION_ECC_MAX_ITERS = int(os.environ.get("REGISTRATION_ECC_MAX_ITERS", "60"))
+REGISTRATION_ECC_EPS = float(os.environ.get("REGISTRATION_ECC_EPS", "1e-4"))
+REGISTRATION_ECC_GAUSS_FILTER_SIZE = int(os.environ.get("REGISTRATION_ECC_GAUSS_FILTER_SIZE", "5"))
+REGISTRATION_MOTION_TYPE_NAME = os.environ.get("REGISTRATION_MOTION_TYPE", "affine").strip().lower()
+REGISTRATION_MOTION_TYPES = {
+    "translation": cv2.MOTION_TRANSLATION,
+    "euclidean": cv2.MOTION_EUCLIDEAN,
+    "affine": cv2.MOTION_AFFINE,
+}
+if REGISTRATION_MOTION_TYPE_NAME not in REGISTRATION_MOTION_TYPES:
+    raise ValueError(
+        "REGISTRATION_MOTION_TYPE must be one of "
+        f"{sorted(REGISTRATION_MOTION_TYPES)}, got {REGISTRATION_MOTION_TYPE_NAME!r}"
+    )
+REGISTRATION_MOTION_TYPE = REGISTRATION_MOTION_TYPES[REGISTRATION_MOTION_TYPE_NAME]
+MATCH_WORKERS = max(1, int(os.environ.get("CANONICAL_MATCH_WORKERS", "1")))
+DEPTH_CACHE_SIZE = int(os.environ.get("DEPTH_CACHE_SIZE", "8192"))
+REGISTRATION_INPUT_CACHE_SIZE = int(os.environ.get("REGISTRATION_INPUT_CACHE_SIZE", "8192"))
+REGISTRATION_PAIR_CACHE_SIZE = int(os.environ.get("REGISTRATION_PAIR_CACHE_SIZE", "65536"))
 DEPTH_MATCH_MIN_ECC_SCORE = 0.9
 NO_MATCH_VALUE = -1
 DEPTH_PERFORMANCE_METRICS = ("abs_rel", "sq_rel", "rmse", "rmse_log", "a1", "a2", "a3")
@@ -652,7 +673,7 @@ class SelectCanonicalandMatchFrames:
             "rgb_max_abs_diff": float(full_abs_diff.max()),
         }
 
-    @lru_cache(maxsize=8192)
+    @lru_cache(maxsize=DEPTH_CACHE_SIZE)
     def _load_depth_meters(self, depth_path):
         depth = np.load(depth_path).astype(np.float32) / 1000
         valid = np.isfinite(depth) & (depth > 0)
@@ -660,7 +681,7 @@ class SelectCanonicalandMatchFrames:
             depth = depth * DEPTH_RAW_TO_METER_SCALE
         return depth
 
-    @lru_cache(maxsize=8192)
+    @lru_cache(maxsize=DEPTH_CACHE_SIZE)
     def _depth_frame_feature(self, depth_path):
         depth = self._load_depth_meters(depth_path)
         valid = np.isfinite(depth)
@@ -755,6 +776,7 @@ class SelectCanonicalandMatchFrames:
             self.best_canonical_lap_cache[cache_key] = result
         return result
 
+    @lru_cache(maxsize=REGISTRATION_PAIR_CACHE_SIZE)
     def _depth_mean_abs_difference(self, source_depth_path, candidate_depth_path):
         source_depth = self._load_depth_meters(source_depth_path)
         candidate_depth = self._load_depth_meters(candidate_depth_path)
@@ -808,6 +830,25 @@ class SelectCanonicalandMatchFrames:
         image[finite] = np.clip((depth_small[finite] - lo) / (hi - lo), 0.0, 1.0)
         return image.astype(np.float32), finite
 
+    @lru_cache(maxsize=REGISTRATION_INPUT_CACHE_SIZE)
+    def _cached_depth_registration_image(self, depth_path):
+        depth = self._load_depth_meters(depth_path)
+        valid = np.isfinite(depth) & (depth > MIN_DEPTH) & (depth < MAX_DEPTH)
+        if valid.sum() < 10:
+            return None, None
+        return self._depth_registration_image(depth, valid)
+
+    def _registration_image_for_pair_depth(self, depth_path, depth):
+        cached_depth = self._load_depth_meters(depth_path)
+        if cached_depth.shape == depth.shape:
+            return self._cached_depth_registration_image(depth_path)
+
+        valid = np.isfinite(depth) & (depth > MIN_DEPTH) & (depth < MAX_DEPTH)
+        if valid.sum() < 10:
+            return None, None
+        return self._depth_registration_image(depth, valid)
+
+    @lru_cache(maxsize=REGISTRATION_PAIR_CACHE_SIZE)
     def _registered_depth_difference(self, source_depth_path, candidate_depth_path):
         source_depth = self._load_depth_meters(source_depth_path)
         candidate_depth = self._load_depth_meters(candidate_depth_path)
@@ -823,8 +864,14 @@ class SelectCanonicalandMatchFrames:
         if source_valid.sum() < 10 or candidate_valid.sum() < 10:
             return None
 
-        source_reg, source_reg_valid = self._depth_registration_image(source_depth, source_valid)
-        candidate_reg, _candidate_reg_valid = self._depth_registration_image(candidate_depth, candidate_valid)
+        source_reg, source_reg_valid = self._registration_image_for_pair_depth(
+            source_depth_path,
+            source_depth,
+        )
+        candidate_reg, _candidate_reg_valid = self._registration_image_for_pair_depth(
+            candidate_depth_path,
+            candidate_depth,
+        )
         if source_reg is None or candidate_reg is None:
             return None
 
@@ -839,10 +886,10 @@ class SelectCanonicalandMatchFrames:
                 source_reg,
                 candidate_reg,
                 warp,
-                cv2.MOTION_AFFINE,
+                REGISTRATION_MOTION_TYPE,
                 criteria,
                 source_reg_valid.astype(np.uint8),
-                5,
+                REGISTRATION_ECC_GAUSS_FILTER_SIZE,
             )
         except cv2.error:
             return None
@@ -912,7 +959,7 @@ class SelectCanonicalandMatchFrames:
         }
 
     def _attach_rgb_difference_metrics(self, match, source_record):
-        source_img = cv2.imread(source_record["rgb_path"], cv2.IMREAD_COLOR)
+        source_img = self._read_rgb_cached(source_record["rgb_path"])
         candidate_img = self._read_rgb_cached(match["record"]["rgb_path"])
         rgb_metrics = self._rgb_patch_difference(source_img, candidate_img)
         if rgb_metrics is None:
@@ -930,6 +977,25 @@ class SelectCanonicalandMatchFrames:
             }
         match.update(rgb_metrics)
         return match
+
+    def _match_rows_for_lap(self, source_lap_records, oracle_frame_index, executor=None):
+        if executor is None or len(source_lap_records) <= 1:
+            for source_record in source_lap_records:
+                yield self._match_row_for_source_record(
+                    source_record,
+                    source_lap_records,
+                    oracle_frame_index,
+                )
+            return
+
+        yield from executor.map(
+            lambda source_record: self._match_row_for_source_record(
+                source_record,
+                source_lap_records,
+                oracle_frame_index,
+            ),
+            source_lap_records,
+        )
 
     def _self_oracle_match(self, source_record):
         return {
@@ -1278,6 +1344,11 @@ class SelectCanonicalandMatchFrames:
         rows_written = 0
         rows_without_match = 0
 
+        match_executor = (
+            ThreadPoolExecutor(max_workers=MATCH_WORKERS)
+            if MATCH_WORKERS > 1
+            else None
+        )
         with open(scene_output_csv, "w", newline="") as scene_csv_file:
             scene_writer = csv.DictWriter(scene_csv_file, fieldnames=CSV_COLUMNS)
             scene_writer.writeheader()
@@ -1306,12 +1377,11 @@ class SelectCanonicalandMatchFrames:
                             if Path(record["rgb_path"]).exists() and Path(record["depth_path"]).exists()
                         ]
                         source_lap_records.sort(key=lambda record: record["time_sec"])
-                        for source_record in source_lap_records:
-                            row = self._match_row_for_source_record(
-                                source_record,
-                                source_lap_records,
-                                oracle_frame_index,
-                            )
+                        for row in self._match_rows_for_lap(
+                            source_lap_records,
+                            oracle_frame_index,
+                            executor=match_executor,
+                        ):
                             if row["match_status"] != "matched":
                                 rows_without_match += 1
 
@@ -1322,6 +1392,8 @@ class SelectCanonicalandMatchFrames:
             finally:
                 if global_csv_file is not None:
                     global_csv_file.close()
+                if match_executor is not None:
+                    match_executor.shutdown(wait=True)
 
         print(
             f"Saved {rows_written} rows to {scene_output_csv} "
