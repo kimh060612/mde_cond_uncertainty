@@ -215,7 +215,7 @@ def train_one_epoch(
             q_score = out["camera_bias"] + uncertainty_alpha * out["std"]
             ranking_loss = signed_pairwise_ranknet_loss(
                 reshape_group_batch(q_score, num_groups, num_candidates),
-                reshape_group_batch(target_loss, num_groups, num_candidates), # abs_rel_degradation
+                reshape_group_batch(abs_rel_degradation, num_groups, num_candidates), # target_loss
                 temperature=listnet_temperature,
             )
             nll_loss = mean_loss + lambda_variance * variance_loss
@@ -231,7 +231,7 @@ def train_one_epoch(
         with torch.no_grad():
             group_q = reshape_group_batch(q_score.detach(), num_groups, num_candidates)
             group_degradation = reshape_group_batch(
-                target_loss.detach(),  # abs_rel_degradation
+                abs_rel_degradation.detach(),  # target_loss
                 num_groups,
                 num_candidates,
             )

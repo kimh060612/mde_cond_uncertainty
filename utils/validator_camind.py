@@ -232,7 +232,7 @@ def validate(
             q_score = out["camera_bias"] + uncertainty_alpha * out["std"]
             group_q = reshape_group_batch(q_score, num_groups, num_candidates)
             group_degradation = reshape_group_batch(
-                target_loss,  # abs_rel_degradation,
+                abs_rel_degradation,
                 num_groups,
                 num_candidates,
             )
