@@ -14,11 +14,14 @@ dataset:
   train_topologies:
     - "topology1"
     - "topology3"
+    - "topology4"
   seen_val_topologies:
     - "topology1"
     - "topology3"
+    - "topology4"
   unseen_val_topologies:
     - "topology2"
+    - "topology5"
 
 model:
   model_id: "small"
