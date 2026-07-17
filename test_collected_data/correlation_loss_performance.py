@@ -8,7 +8,10 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import torch
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Subset
 from tqdm.auto import tqdm
+from transformers import AutoImageProcessor, AutoModelForDepthEstimation
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -18,8 +21,10 @@ if str(PROJECT_ROOT) not in sys.path:
 from dataset.ati_dataset_caminduce import (  # noqa: E402
     CameraParameterRange,
     FoundationCameraGroupedDataset,
+    PairedResizeToTensor,
 )
 from evaluation_utils.eval_metrics import compute_vector_masked_correlations  # noqa: E402
+from model.dav2_model import MODEL_IDS  # noqa: E402
 from model.loss_fn import (  # noqa: E402
     log_scale_invariant_depth_difference,
     scale_shift_invariant_depth_loss,
@@ -28,21 +33,27 @@ from model.loss_fn import (  # noqa: E402
 
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config" / "base_caminduce.yaml"
 DEFAULT_OUTPUT_CSV = PROJECT_ROOT / "outputs" / "loss_performance_correlation.csv"
-DEFAULT_DATASET_PATH_PREFIX = "/dataset/ATI/MDE/orbbec_realworld_dataset"
+DEFAULT_DATASET_ROOT = Path("/dataset/ATI/MDE/orbbec_realworld_dataset")
+DEFAULT_REPLACEABLE_DATASET_PREFIXES = (
+    "/dataset/ATI/MDE/orbbec_realworld_dataset",
+    "/datasets/ATI/MDE/orbbec_realworld_dataset",
+    "/media/michael/ssd1/AIoT_ATI/orbbec_realworld_dataset",
+)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Compute correlations between depth-difference losses and "
-            "AbsRel performance degradation from ati_dataset_caminduce data."
+            "Predict candidate/canonical RGB pairs with Depth Anything V2 and "
+            "save correlations between prediction-space losses and AbsRel "
+            "performance degradation."
         )
     )
     parser.add_argument(
         "--config",
         type=Path,
         default=DEFAULT_CONFIG_PATH,
-        help="Config YAML used for default dataset/model parameters.",
+        help="Config YAML used for dataset/model defaults.",
     )
     parser.add_argument(
         "--csv-path",
@@ -53,14 +64,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dataset-root",
         type=Path,
-        default="/dataset/ATI/MDE/orbbec_realworld_dataset",
-        help="Dataset root used to remap stored absolute paths.",
+        default=DEFAULT_DATASET_ROOT,
+        help="Dataset root used to remap RGB paths stored in the CSV.",
     )
     parser.add_argument(
         "--output-csv",
         type=Path,
         default=DEFAULT_OUTPUT_CSV,
         help="Where to save the summary correlation CSV.",
+    )
+    parser.add_argument(
+        "--depth-model",
+        type=str,
+        default=None,
+        help=(
+            "Depth Anything V2 key or Hugging Face model id. "
+            "Defaults to config model.model_id."
+        ),
     )
     parser.add_argument(
         "--foundation-model-name",
@@ -78,70 +98,129 @@ def parse_args() -> argparse.Namespace:
         "--topologies",
         nargs="*",
         default=["topology1", "topology2", "topology3", "topology4", "topology5"],
-        help="Optional topology filter, e.g. topology1 topology2. Default: all.",
+        help="Optional topology filter. Use no values after the flag for all topologies.",
     )
     parser.add_argument(
         "--candidates-per-group",
         type=int,
-        default=2,
-        help=(
-            "Minimum distinct camera settings required for dataset construction. "
-            "Rows are still evaluated individually."
-        ),
+        default=None,
+        help="Candidates per canonical group. Defaults to config training.candidates_per_group.",
     )
     parser.add_argument(
         "--candidate-sampling",
         choices=("random", "parameter_diverse"),
         default="parameter_diverse",
-        help="Sampling mode passed to the dataset constructor.",
+        help="Sampling mode passed to FoundationCameraGroupedDataset.",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=32,
+        help="DataLoader batch size in canonical groups.",
+    )
+    parser.add_argument(
+        "--inference-batch-size",
+        type=int,
+        default=32,
+        help="Depth Anything V2 forward batch size after flattening candidates.",
+    )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=None,
+        help="DataLoader workers. Defaults to config dataset.num_workers.",
+    )
+    parser.add_argument(
+        "--image-height",
+        type=int,
+        default=None,
+        help="RGB resize height. Defaults to config model.image_height.",
+    )
+    parser.add_argument(
+        "--image-width",
+        type=int,
+        default=None,
+        help="RGB resize width. Defaults to config model.image_width.",
     )
     parser.add_argument(
         "--seed",
         type=int,
-        default=42,
-        help="Dataset sampling seed. Correlation uses all filtered table rows.",
+        default=None,
+        help="Dataset sampling seed. Defaults to config training.seed.",
     )
     parser.add_argument(
         "--min-depth",
         type=float,
-        default=1e-3,
-        help="Minimum valid depth. Defaults to config dataset.min_depth.",
+        default=None,
+        help="Dataset min depth metadata. Defaults to config dataset.min_depth.",
     )
     parser.add_argument(
         "--max-depth",
         type=float,
-        default=10.0,
-        help="Maximum valid depth. Defaults to config dataset.max_depth.",
+        default=None,
+        help="Dataset max depth metadata. Defaults to config dataset.max_depth.",
     )
     parser.add_argument(
         "--path-replacement",
         action="append",
         default=[],
         metavar="OLD=NEW",
-        help="Additional path prefix replacement. Can be supplied multiple times.",
+        help="Additional RGB path prefix replacement. Can be supplied multiple times.",
+    )
+    parser.add_argument(
+        "--hf-cache-dir",
+        type=Path,
+        default=None,
+        help="Optional Hugging Face cache directory.",
+    )
+    parser.add_argument(
+        "--local-files-only",
+        action="store_true",
+        help="Load Depth Anything V2 only from local Hugging Face cache.",
     )
     parser.add_argument(
         "--device",
         type=str,
         default="cuda" if torch.cuda.is_available() else "cpu",
-        help="Torch device used for loss computation.",
+        help="Torch device used for Depth Anything V2 inference.",
+    )
+    parser.add_argument(
+        "--no-amp",
+        action="store_true",
+        help="Disable CUDA autocast during Depth Anything V2 inference.",
+    )
+    parser.add_argument(
+        "--no-normalize",
+        action="store_true",
+        help="Feed resized [0, 1] tensors directly without processor mean/std normalization.",
+    )
+    parser.add_argument(
+        "--no-softplus",
+        action="store_true",
+        help="Do not apply softplus to predicted depth before computing positive-depth losses.",
     )
     parser.add_argument(
         "--correlation-max-samples",
         type=int,
         default=100_000,
-        help="Maximum number of row-level samples used by the correlation helper.",
+        help="Maximum number of pair-level samples used by the correlation helper.",
     )
     parser.add_argument(
-        "--max-rows",
+        "--max-groups",
         type=int,
         default=None,
-        help="Optional debug limit for evaluated rows.",
+        help="Optional debug limit for canonical groups.",
+    )
+    parser.add_argument(
+        "--max-batches",
+        type=int,
+        default=None,
+        help="Optional debug limit for DataLoader batches.",
     )
     parser.add_argument(
         "--strict",
         action="store_true",
-        help="Raise on the first row error instead of skipping invalid rows.",
+        help="Raise on the first batch error instead of skipping it.",
     )
     return parser.parse_args()
 
@@ -188,6 +267,16 @@ def resolve_csv_paths(csv_path: Path) -> list[Path]:
     raise FileNotFoundError(f"No CSV files found at {csv_path}")
 
 
+def resolve_model_id(model_name_or_id: str) -> str:
+    return MODEL_IDS.get(model_name_or_id, model_name_or_id)
+
+
+def parse_topologies(raw_topologies: list[str] | None) -> list[str] | None:
+    if raw_topologies == []:
+        return None
+    return raw_topologies
+
+
 def parse_path_replacements(
     replacements: Iterable[str],
     dataset_root: Path | None,
@@ -195,7 +284,8 @@ def parse_path_replacements(
     result: dict[str, str] = {}
 
     if dataset_root is not None:
-        result[DEFAULT_DATASET_PATH_PREFIX] = str(dataset_root)
+        for old_prefix in DEFAULT_REPLACEABLE_DATASET_PREFIXES:
+            result[old_prefix] = str(dataset_root)
 
     for replacement in replacements:
         if "=" not in replacement:
@@ -212,9 +302,14 @@ def parse_path_replacements(
 
 def build_dataset(args: argparse.Namespace, cfg: Any) -> FoundationCameraGroupedDataset:
     csv_path = args.csv_path or Path(str(cfg_get(cfg, "dataset.csv_path")))
-    dataset_root = args.dataset_root or Path(str(cfg_get(cfg, "dataset.dataset_root")))
     min_depth = float(args.min_depth or cfg_get(cfg, "dataset.min_depth", 1e-3))
     max_depth = float(args.max_depth or cfg_get(cfg, "dataset.max_depth", 10.0))
+    image_height = int(args.image_height or cfg_get(cfg, "model.image_height", 518))
+    image_width = int(args.image_width or cfg_get(cfg, "model.image_width", 518))
+    candidates_per_group = int(
+        args.candidates_per_group
+        or cfg_get(cfg, "training.candidates_per_group", 4)
+    )
 
     foundation_model_name = (
         args.foundation_model_name
@@ -225,14 +320,8 @@ def build_dataset(args: argparse.Namespace, cfg: Any) -> FoundationCameraGrouped
         or str(cfg_get(cfg, "model.camera_model_name"))
     )
 
-    csv_paths = resolve_csv_paths(csv_path)
-    path_replacements = parse_path_replacements(
-        args.path_replacement,
-        dataset_root,
-    )
-
     return FoundationCameraGroupedDataset(
-        csv_paths=csv_paths,
+        csv_paths=resolve_csv_paths(csv_path),
         foundation_model_name=foundation_model_name,
         camera_model_name=camera_model_name,
         parameter_range=CameraParameterRange(
@@ -241,39 +330,90 @@ def build_dataset(args: argparse.Namespace, cfg: Any) -> FoundationCameraGrouped
             gain_min=float(cfg_get(cfg, "dataset.gain_min")),
             gain_max=float(cfg_get(cfg, "dataset.gain_max")),
         ),
-        candidates_per_group=max(2, int(args.candidates_per_group)),
+        candidates_per_group=max(2, candidates_per_group),
         candidate_sampling=args.candidate_sampling,
         parameter_normalization="linear",
         context_output_range="zero_one",
-        path_replacements=path_replacements,
-        topologies=args.topologies,
-        load_images=False,
+        path_replacements=parse_path_replacements(
+            args.path_replacement,
+            args.dataset_root,
+        ),
+        pair_transform=PairedResizeToTensor(size=(image_height, image_width)),
+        topologies=parse_topologies(args.topologies),
+        load_images=True,
         load_depth=False,
         min_depth=min_depth,
         max_depth=max_depth,
-        seed=args.seed,
+        seed=int(args.seed or cfg_get(cfg, "training.seed", 42)),
     )
 
 
-def make_valid_mask(
-    candidate_depth: torch.Tensor,
-    canonical_depth: torch.Tensor,
-    min_depth: float,
-    max_depth: float,
+def maybe_subset_dataset(
+    dataset: FoundationCameraGroupedDataset,
+    max_groups: int | None,
+) -> FoundationCameraGroupedDataset | Subset:
+    if max_groups is None:
+        return dataset
+    return Subset(dataset, range(min(max_groups, len(dataset))))
+
+
+def processor_stats(
+    processor: AutoImageProcessor,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    mean = getattr(processor, "image_mean", None) or [0.485, 0.456, 0.406]
+    std = getattr(processor, "image_std", None) or [0.229, 0.224, 0.225]
+    mean_tensor = torch.tensor(mean, device=device, dtype=dtype).view(1, -1, 1, 1)
+    std_tensor = torch.tensor(std, device=device, dtype=dtype).view(1, -1, 1, 1)
+    return mean_tensor, std_tensor
+
+
+def prepare_pixel_values(
+    images: torch.Tensor,
+    processor: AutoImageProcessor,
+    device: torch.device,
+    normalize: bool,
 ) -> torch.Tensor:
-    mask = torch.isfinite(candidate_depth) & torch.isfinite(canonical_depth)
-    mask &= candidate_depth > min_depth
-    mask &= candidate_depth < max_depth
-    mask &= canonical_depth > min_depth
-    mask &= canonical_depth < max_depth
-    return mask
+    images = images.to(device=device, dtype=torch.float32, non_blocking=True)
+    if not normalize:
+        return images
+    mean, std = processor_stats(processor, device=images.device, dtype=images.dtype)
+    return (images - mean) / std.clamp_min(1e-12)
 
 
-def scalar_from_loss(loss: torch.Tensor) -> float:
-    loss = loss.detach().flatten()
-    if loss.numel() != 1:
-        raise ValueError(f"Expected scalar or [1] loss, got shape {tuple(loss.shape)}")
-    return float(loss.item())
+@torch.inference_mode()
+def predict_depth(
+    model: AutoModelForDepthEstimation,
+    pixel_values: torch.Tensor,
+    *,
+    target_size: tuple[int, int],
+    inference_batch_size: int,
+    amp: bool,
+    softplus: bool,
+) -> torch.Tensor:
+    depths: list[torch.Tensor] = []
+    batch_size = max(1, int(inference_batch_size))
+
+    for start in range(0, pixel_values.shape[0], batch_size):
+        chunk = pixel_values[start : start + batch_size]
+        with torch.autocast(device_type=chunk.device.type, enabled=amp):
+            outputs = model(pixel_values=chunk)
+            depth = outputs.predicted_depth
+
+        if depth.ndim == 3:
+            depth = depth.unsqueeze(1)
+        depth = F.interpolate(
+            depth.float(),
+            size=target_size,
+            mode="bicubic",
+            align_corners=False,
+        )
+        if softplus:
+            depth = F.softplus(depth)
+        depths.append(depth)
+
+    return torch.cat(depths, dim=0)
 
 
 def finite_stats(values: torch.Tensor) -> tuple[float, float, float, float]:
@@ -294,10 +434,7 @@ def summarize_loss_correlation(
     loss_name: str,
     loss_values: torch.Tensor,
     degradation_values: torch.Tensor,
-    total_rows: int,
-    skipped_rows: int,
-    shape_mismatch_rows: int,
-    error_rows: int,
+    metadata: dict[str, object],
     max_samples: int,
 ) -> dict[str, object]:
     valid_mask = torch.isfinite(loss_values) & torch.isfinite(degradation_values)
@@ -318,10 +455,6 @@ def summarize_loss_correlation(
         "pearson": correlations[f"{prefix}_pearson"],
         "spearman": correlations[f"{prefix}_spearman"],
         "num_valid_pairs": int(valid_mask.sum().item()),
-        "num_total_rows": int(total_rows),
-        "num_skipped_rows": int(skipped_rows),
-        "num_shape_mismatch_rows": int(shape_mismatch_rows),
-        "num_error_rows": int(error_rows),
         "loss_mean": loss_mean,
         "loss_std": loss_std,
         "loss_min": loss_min,
@@ -330,98 +463,124 @@ def summarize_loss_correlation(
         "abs_rel_degradation_std": deg_std,
         "abs_rel_degradation_min": deg_min,
         "abs_rel_degradation_max": deg_max,
+        **metadata,
     }
 
 
 @torch.inference_mode()
 def collect_loss_values(
-    dataset: FoundationCameraGroupedDataset,
     *,
+    model: AutoModelForDepthEstimation,
+    processor: AutoImageProcessor,
+    loader: DataLoader,
     device: torch.device,
-    max_rows: int | None,
+    inference_batch_size: int,
+    amp: bool,
+    normalize: bool,
+    softplus: bool,
+    max_batches: int | None,
     strict: bool,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, int]]:
-    log_losses: list[float] = []
-    scale_shift_losses: list[float] = []
-    abs_rel_degradations: list[float] = []
-    counters = {
-        "total_rows": 0,
-        "skipped_rows": 0,
-        "shape_mismatch_rows": 0,
-        "error_rows": 0,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, object]]:
+    log_losses: list[torch.Tensor] = []
+    scale_shift_losses: list[torch.Tensor] = []
+    abs_rel_degradations: list[torch.Tensor] = []
+
+    counters: dict[str, object] = {
+        "num_total_groups": 0,
+        "num_total_pairs": 0,
+        "num_processed_batches": 0,
+        "num_skipped_batches": 0,
     }
 
-    table = dataset.table
-    if max_rows is not None:
-        table = table.head(max_rows)
+    progress = tqdm(loader, desc="DA-v2 loss correlation", dynamic_ncols=True)
+    for batch_index, batch in enumerate(progress, start=1):
+        if max_batches is not None and batch_index > max_batches:
+            break
 
-    progress = tqdm(
-        table.iterrows(),
-        total=len(table),
-        desc="Computing losses",
-        dynamic_ncols=True,
-    )
-
-    for _, row in progress:
-        counters["total_rows"] += 1
         try:
-            candidate_depth = dataset._load_depth(
-                dataset._remap_path(row["source_depth_path"]),
-                depth_scale=dataset.depth_scale,
-            )
-            canonical_depth = dataset._load_depth(
-                dataset._remap_path(row["matched_depth_path"]),
-                depth_scale=dataset.depth_scale,
-            )
-
-            if candidate_depth.shape != canonical_depth.shape:
-                counters["shape_mismatch_rows"] += 1
+            candidate_images = batch["candidate_images"]
+            canonical_images = batch["canonical_images"]
+            if candidate_images.ndim != 5:
                 raise ValueError(
-                    "Depth shape mismatch: "
-                    f"candidate={tuple(candidate_depth.shape)}, "
-                    f"canonical={tuple(canonical_depth.shape)}"
+                    "candidate_images must have shape [G, K, C, H, W], "
+                    f"got {tuple(candidate_images.shape)}"
                 )
 
-            candidate_depth = candidate_depth.to(device=device)
-            canonical_depth = canonical_depth.to(device=device)
-            valid_mask = make_valid_mask(
-                candidate_depth,
-                canonical_depth,
-                dataset.min_depth,
-                dataset.max_depth,
+            num_groups, num_candidates = candidate_images.shape[:2]
+            target_size = tuple(candidate_images.shape[-2:])
+            flat_candidates = candidate_images.reshape(
+                num_groups * num_candidates,
+                *candidate_images.shape[2:],
+            )
+            unique_canonicals = canonical_images[:, 0]
+
+            candidate_pixel_values = prepare_pixel_values(
+                flat_candidates,
+                processor=processor,
+                device=device,
+                normalize=normalize,
+            )
+            canonical_pixel_values = prepare_pixel_values(
+                unique_canonicals,
+                processor=processor,
+                device=device,
+                normalize=normalize,
             )
 
-            candidate_depth = candidate_depth.unsqueeze(0)
-            canonical_depth = canonical_depth.unsqueeze(0)
-            valid_mask = valid_mask.unsqueeze(0)
+            candidate_depth = predict_depth(
+                model,
+                candidate_pixel_values,
+                target_size=target_size,
+                inference_batch_size=inference_batch_size,
+                amp=amp,
+                softplus=softplus,
+            )
+            canonical_depth = predict_depth(
+                model,
+                canonical_pixel_values,
+                target_size=target_size,
+                inference_batch_size=inference_batch_size,
+                amp=amp,
+                softplus=softplus,
+            ).repeat_interleave(num_candidates, dim=0)
 
             log_loss = log_scale_invariant_depth_difference(
                 candidate_depth,
                 canonical_depth,
-                valid_mask,
             )
             scale_shift_loss = scale_shift_invariant_depth_loss(
                 candidate_depth,
                 canonical_depth,
-                valid_mask,
             )
+            degradation = batch["abs_rel_degradation"].reshape(-1).float()
 
-            log_losses.append(scalar_from_loss(log_loss))
-            scale_shift_losses.append(scalar_from_loss(scale_shift_loss))
-            abs_rel_degradations.append(float(row["performance_degradation_abs_rel"]))
+            log_losses.append(log_loss.detach().cpu().float())
+            scale_shift_losses.append(scale_shift_loss.detach().cpu().float())
+            abs_rel_degradations.append(degradation.cpu())
+
+            counters["num_total_groups"] = int(counters["num_total_groups"]) + num_groups
+            counters["num_total_pairs"] = int(counters["num_total_pairs"]) + (
+                num_groups * num_candidates
+            )
+            counters["num_processed_batches"] = int(counters["num_processed_batches"]) + 1
+
+            progress.set_postfix(
+                log=f"{finite_stats(log_loss)[0]:.4f}",
+                ssi=f"{finite_stats(scale_shift_loss)[0]:.4f}",
+                deg=f"{finite_stats(degradation)[0]:.4f}",
+            )
         except Exception:
-            counters["skipped_rows"] += 1
-            counters["error_rows"] += 1
+            counters["num_skipped_batches"] = int(counters["num_skipped_batches"]) + 1
             if strict:
                 raise
 
     if not log_losses:
-        raise RuntimeError("No valid rows were evaluated. Check paths and filters.")
+        raise RuntimeError("No valid batches were evaluated. Check dataset paths and filters.")
 
     return (
-        torch.tensor(log_losses, dtype=torch.float32),
-        torch.tensor(scale_shift_losses, dtype=torch.float32),
-        torch.tensor(abs_rel_degradations, dtype=torch.float32),
+        torch.cat(log_losses, dim=0),
+        torch.cat(scale_shift_losses, dim=0),
+        torch.cat(abs_rel_degradations, dim=0),
         counters,
     )
 
@@ -446,30 +605,94 @@ def format_float(value: object) -> str:
 def main() -> None:
     args = parse_args()
     cfg = load_config(args.config)
-    dataset = build_dataset(args, cfg)
     device = torch.device(args.device)
+    amp = device.type == "cuda" and not args.no_amp
+
+    depth_model_name = args.depth_model or str(cfg_get(cfg, "model.model_id"))
+    model_id = resolve_model_id(depth_model_name)
+    cache_dir = None if args.hf_cache_dir is None else str(args.hf_cache_dir)
+
+    processor = AutoImageProcessor.from_pretrained(
+        model_id,
+        cache_dir=cache_dir,
+        local_files_only=args.local_files_only,
+    )
+    model = AutoModelForDepthEstimation.from_pretrained(
+        model_id,
+        cache_dir=cache_dir,
+        local_files_only=args.local_files_only,
+    )
+    model = model.to(device=device)
+    model.eval()
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+
+    dataset = build_dataset(args, cfg)
+    eval_dataset = maybe_subset_dataset(dataset, args.max_groups)
+    num_workers = int(args.num_workers if args.num_workers is not None else cfg_get(cfg, "dataset.num_workers", 0))
+    loader = DataLoader(
+        eval_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=device.type == "cuda",
+        persistent_workers=num_workers > 0,
+    )
+
+    print(f"Using Depth Anything V2 model: {model_id}")
+    print(
+        "Dataset groups: "
+        f"{len(eval_dataset):,} / {len(dataset):,}, "
+        f"batch_size={args.batch_size}, "
+        f"inference_batch_size={args.inference_batch_size}"
+    )
 
     log_losses, scale_shift_losses, degradations, counters = collect_loss_values(
-        dataset,
+        model=model,
+        processor=processor,
+        loader=loader,
         device=device,
-        max_rows=args.max_rows,
+        inference_batch_size=args.inference_batch_size,
+        amp=amp,
+        normalize=not args.no_normalize,
+        softplus=not args.no_softplus,
+        max_batches=args.max_batches,
         strict=args.strict,
     )
+
+    image_height = int(args.image_height or cfg_get(cfg, "model.image_height", 518))
+    image_width = int(args.image_width or cfg_get(cfg, "model.image_width", 518))
+    candidates_per_group = int(
+        args.candidates_per_group
+        or cfg_get(cfg, "training.candidates_per_group", 4)
+    )
+    metadata = {
+        **counters,
+        "depth_model_name": depth_model_name,
+        "depth_model_id": model_id,
+        "batch_size": args.batch_size,
+        "inference_batch_size": args.inference_batch_size,
+        "candidates_per_group": candidates_per_group,
+        "image_height": image_height,
+        "image_width": image_width,
+        "normalized_with_processor_stats": int(not args.no_normalize),
+        "softplus_depth": int(not args.no_softplus),
+    }
 
     rows = [
         summarize_loss_correlation(
             loss_name="log_scale_invariant_depth_difference",
             loss_values=log_losses,
             degradation_values=degradations,
+            metadata=metadata,
             max_samples=args.correlation_max_samples,
-            **counters,
         ),
         summarize_loss_correlation(
             loss_name="scale_shift_invariant_depth_loss",
             loss_values=scale_shift_losses,
             degradation_values=degradations,
+            metadata=metadata,
             max_samples=args.correlation_max_samples,
-            **counters,
         ),
     ]
 
