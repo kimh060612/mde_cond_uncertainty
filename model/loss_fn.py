@@ -237,10 +237,7 @@ def log_scale_invariant_depth_difference(
         loss.new_full(loss.shape, float("nan")),
     )
 
-import torch
-
-
-def log_gradient_depth_difference(
+def sobel_log_gradient_depth_difference(
     candidate_depth: torch.Tensor,
     canonical_depth: torch.Tensor,
     valid_mask: torch.Tensor | None = None,
@@ -258,7 +255,6 @@ def log_gradient_depth_difference(
         mask = torch.ones_like(candidate_depth, dtype=torch.bool)
     else:
         mask = _ensure_bchw(valid_mask).bool()
-
         try:
             mask = mask.expand_as(candidate_depth)
         except RuntimeError as exc:
@@ -266,7 +262,6 @@ def log_gradient_depth_difference(
                 "valid_mask must be broadcast-compatible with the depth maps."
             ) from exc
 
-    # The log domain requires finite, strictly positive predictions.
     mask = (
         mask
         & torch.isfinite(candidate_depth)
@@ -278,47 +273,212 @@ def log_gradient_depth_difference(
     candidate_log = torch.log(candidate_depth.clamp_min(eps))
     canonical_log = torch.log(canonical_depth.clamp_min(eps))
 
-    # Forward horizontal gradients: [B, C, H, W - 1]
-    candidate_dx = candidate_log[..., :, 1:] - candidate_log[..., :, :-1]
-    canonical_dx = canonical_log[..., :, 1:] - canonical_log[..., :, :-1]
+    channels = candidate_depth.shape[1]
 
-    # A horizontal gradient is valid only if both adjacent pixels are valid.
-    mask_dx = mask[..., :, 1:] & mask[..., :, :-1]
+    sobel_x = candidate_depth.new_tensor(
+        [
+            [-1.0, 0.0, 1.0],
+            [-2.0, 0.0, 2.0],
+            [-1.0, 0.0, 1.0],
+        ]
+    ).view(1, 1, 3, 3) / 8.0
 
-    # Forward vertical gradients: [B, C, H - 1, W]
-    candidate_dy = candidate_log[..., 1:, :] - candidate_log[..., :-1, :]
-    canonical_dy = canonical_log[..., 1:, :] - canonical_log[..., :-1, :]
+    sobel_y = candidate_depth.new_tensor(
+        [
+            [-1.0, -2.0, -1.0],
+            [ 0.0,  0.0,  0.0],
+            [ 1.0,  2.0,  1.0],
+        ]
+    ).view(1, 1, 3, 3) / 8.0
 
-    # A vertical gradient is valid only if both adjacent pixels are valid.
-    mask_dy = mask[..., 1:, :] & mask[..., :-1, :]
+    # Apply the same Sobel kernel independently to every channel.
+    sobel_x = sobel_x.expand(channels, 1, 3, 3)
+    sobel_y = sobel_y.expand(channels, 1, 3, 3)
 
-    dx_difference = torch.abs(candidate_dx - canonical_dx)
-    dy_difference = torch.abs(candidate_dy - canonical_dy)
-
-    dx_sum = torch.where(
-        mask_dx,
-        dx_difference,
-        torch.zeros_like(dx_difference),
-    ).flatten(1).sum(dim=1)
-
-    dy_sum = torch.where(
-        mask_dy,
-        dy_difference,
-        torch.zeros_like(dy_difference),
-    ).flatten(1).sum(dim=1)
-
-    valid_dx_counts = mask_dx.flatten(1).sum(dim=1)
-    valid_dy_counts = mask_dy.flatten(1).sum(dim=1)
-    valid_gradient_counts = valid_dx_counts + valid_dy_counts
-
-    safe_counts = valid_gradient_counts.clamp_min(1).to(
-        candidate_depth.dtype
+    candidate_gx = F.conv2d(
+        candidate_log,
+        sobel_x,
+        padding=1,
+        groups=channels,
+    )
+    candidate_gy = F.conv2d(
+        candidate_log,
+        sobel_y,
+        padding=1,
+        groups=channels,
     )
 
-    difference = (dx_sum + dy_sum) / safe_counts
+    canonical_gx = F.conv2d(
+        canonical_log,
+        sobel_x,
+        padding=1,
+        groups=channels,
+    )
+    canonical_gy = F.conv2d(
+        canonical_log,
+        sobel_y,
+        padding=1,
+        groups=channels,
+    )
+
+    # A Sobel output is valid only if all pixels in its 3x3 neighborhood
+    # are valid. Grouped convolution handles each channel independently.
+    validity_kernel = candidate_depth.new_ones(
+        (channels, 1, 3, 3)
+    )
+
+    valid_neighbor_counts = F.conv2d(
+        mask.to(candidate_depth.dtype),
+        validity_kernel,
+        padding=1,
+        groups=channels,
+    )
+
+    gradient_mask = valid_neighbor_counts == 9.0
+
+    difference_map = (
+        torch.abs(candidate_gx - canonical_gx)
+        + torch.abs(candidate_gy - canonical_gy)
+    )
+
+    difference_sum = torch.where(
+        gradient_mask,
+        difference_map,
+        torch.zeros_like(difference_map),
+    ).flatten(1).sum(dim=1)
+
+    valid_counts = gradient_mask.flatten(1).sum(dim=1)
+    safe_counts = valid_counts.clamp_min(1).to(candidate_depth.dtype)
+
+    difference = difference_sum / safe_counts
 
     return torch.where(
-        valid_gradient_counts > 0,
+        valid_counts > 0,
+        difference,
+        difference.new_full(difference.shape, float("nan")),
+    )
+
+
+def sobel_log_gradient_magnitude_difference(
+    candidate_depth: torch.Tensor,
+    canonical_depth: torch.Tensor,
+    valid_mask: torch.Tensor | None = None,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    candidate_depth = _ensure_bchw(candidate_depth).float()
+    canonical_depth = _ensure_bchw(canonical_depth).float()
+
+    if candidate_depth.shape != canonical_depth.shape:
+        raise ValueError(
+            "candidate_depth and canonical_depth must have the same shape."
+        )
+
+    if valid_mask is None:
+        mask = torch.ones_like(candidate_depth, dtype=torch.bool)
+    else:
+        mask = _ensure_bchw(valid_mask).bool()
+        try:
+            mask = mask.expand_as(candidate_depth)
+        except RuntimeError as exc:
+            raise ValueError(
+                "valid_mask must be broadcast-compatible with the depth maps."
+            ) from exc
+
+    mask = (
+        mask
+        & torch.isfinite(candidate_depth)
+        & torch.isfinite(canonical_depth)
+        & (candidate_depth > 0)
+        & (canonical_depth > 0)
+    )
+
+    candidate_log = torch.log(candidate_depth.clamp_min(eps))
+    canonical_log = torch.log(canonical_depth.clamp_min(eps))
+
+    channels = candidate_depth.shape[1]
+
+    sobel_x = candidate_depth.new_tensor(
+        [
+            [-1.0, 0.0, 1.0],
+            [-2.0, 0.0, 2.0],
+            [-1.0, 0.0, 1.0],
+        ]
+    ).view(1, 1, 3, 3) / 8.0
+
+    sobel_y = candidate_depth.new_tensor(
+        [
+            [-1.0, -2.0, -1.0],
+            [ 0.0,  0.0,  0.0],
+            [ 1.0,  2.0,  1.0],
+        ]
+    ).view(1, 1, 3, 3) / 8.0
+
+    sobel_x = sobel_x.expand(channels, 1, 3, 3)
+    sobel_y = sobel_y.expand(channels, 1, 3, 3)
+
+    candidate_gx = F.conv2d(
+        candidate_log,
+        sobel_x,
+        padding=1,
+        groups=channels,
+    )
+    candidate_gy = F.conv2d(
+        candidate_log,
+        sobel_y,
+        padding=1,
+        groups=channels,
+    )
+
+    canonical_gx = F.conv2d(
+        canonical_log,
+        sobel_x,
+        padding=1,
+        groups=channels,
+    )
+    canonical_gy = F.conv2d(
+        canonical_log,
+        sobel_y,
+        padding=1,
+        groups=channels,
+    )
+
+    candidate_magnitude = torch.sqrt(
+        candidate_gx.square() + candidate_gy.square() + eps
+    )
+    canonical_magnitude = torch.sqrt(
+        canonical_gx.square() + canonical_gy.square() + eps
+    )
+
+    validity_kernel = candidate_depth.new_ones(
+        (channels, 1, 3, 3)
+    )
+
+    valid_neighbor_counts = F.conv2d(
+        mask.to(candidate_depth.dtype),
+        validity_kernel,
+        padding=1,
+        groups=channels,
+    )
+
+    gradient_mask = valid_neighbor_counts == 9.0
+
+    difference_map = torch.abs(
+        candidate_magnitude - canonical_magnitude
+    )
+
+    difference_sum = torch.where(
+        gradient_mask,
+        difference_map,
+        torch.zeros_like(difference_map),
+    ).flatten(1).sum(dim=1)
+
+    valid_counts = gradient_mask.flatten(1).sum(dim=1)
+    safe_counts = valid_counts.clamp_min(1).to(candidate_depth.dtype)
+
+    difference = difference_sum / safe_counts
+
+    return torch.where(
+        valid_counts > 0,
         difference,
         difference.new_full(difference.shape, float("nan")),
     )
