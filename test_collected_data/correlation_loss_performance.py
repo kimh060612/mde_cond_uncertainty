@@ -33,7 +33,7 @@ from model.loss_fn import (  # noqa: E402
 
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config" / "base_caminduce.yaml"
 DEFAULT_OUTPUT_CSV = PROJECT_ROOT / "outputs" / "loss_performance_correlation.csv"
-DEFAULT_DATASET_ROOT = Path("/dataset/ATI/MDE/orbbec_realworld_dataset")
+DEFAULT_DATASET_ROOT = Path("/datasets/ATI/MDE/orbbec_realworld_dataset")
 DEFAULT_REPLACEABLE_DATASET_PREFIXES = (
     "/dataset/ATI/MDE/orbbec_realworld_dataset",
     "/datasets/ATI/MDE/orbbec_realworld_dataset",
