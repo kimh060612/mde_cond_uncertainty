@@ -237,6 +237,92 @@ def log_scale_invariant_depth_difference(
         loss.new_full(loss.shape, float("nan")),
     )
 
+import torch
+
+
+def log_gradient_depth_difference(
+    candidate_depth: torch.Tensor,
+    canonical_depth: torch.Tensor,
+    valid_mask: torch.Tensor | None = None,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    candidate_depth = _ensure_bchw(candidate_depth).float()
+    canonical_depth = _ensure_bchw(canonical_depth).float()
+
+    if candidate_depth.shape != canonical_depth.shape:
+        raise ValueError(
+            "candidate_depth and canonical_depth must have the same shape."
+        )
+
+    if valid_mask is None:
+        mask = torch.ones_like(candidate_depth, dtype=torch.bool)
+    else:
+        mask = _ensure_bchw(valid_mask).bool()
+
+        try:
+            mask = mask.expand_as(candidate_depth)
+        except RuntimeError as exc:
+            raise ValueError(
+                "valid_mask must be broadcast-compatible with the depth maps."
+            ) from exc
+
+    # The log domain requires finite, strictly positive predictions.
+    mask = (
+        mask
+        & torch.isfinite(candidate_depth)
+        & torch.isfinite(canonical_depth)
+        & (candidate_depth > 0)
+        & (canonical_depth > 0)
+    )
+
+    candidate_log = torch.log(candidate_depth.clamp_min(eps))
+    canonical_log = torch.log(canonical_depth.clamp_min(eps))
+
+    # Forward horizontal gradients: [B, C, H, W - 1]
+    candidate_dx = candidate_log[..., :, 1:] - candidate_log[..., :, :-1]
+    canonical_dx = canonical_log[..., :, 1:] - canonical_log[..., :, :-1]
+
+    # A horizontal gradient is valid only if both adjacent pixels are valid.
+    mask_dx = mask[..., :, 1:] & mask[..., :, :-1]
+
+    # Forward vertical gradients: [B, C, H - 1, W]
+    candidate_dy = candidate_log[..., 1:, :] - candidate_log[..., :-1, :]
+    canonical_dy = canonical_log[..., 1:, :] - canonical_log[..., :-1, :]
+
+    # A vertical gradient is valid only if both adjacent pixels are valid.
+    mask_dy = mask[..., 1:, :] & mask[..., :-1, :]
+
+    dx_difference = torch.abs(candidate_dx - canonical_dx)
+    dy_difference = torch.abs(candidate_dy - canonical_dy)
+
+    dx_sum = torch.where(
+        mask_dx,
+        dx_difference,
+        torch.zeros_like(dx_difference),
+    ).flatten(1).sum(dim=1)
+
+    dy_sum = torch.where(
+        mask_dy,
+        dy_difference,
+        torch.zeros_like(dy_difference),
+    ).flatten(1).sum(dim=1)
+
+    valid_dx_counts = mask_dx.flatten(1).sum(dim=1)
+    valid_dy_counts = mask_dy.flatten(1).sum(dim=1)
+    valid_gradient_counts = valid_dx_counts + valid_dy_counts
+
+    safe_counts = valid_gradient_counts.clamp_min(1).to(
+        candidate_depth.dtype
+    )
+
+    difference = (dx_sum + dy_sum) / safe_counts
+
+    return torch.where(
+        valid_gradient_counts > 0,
+        difference,
+        difference.new_full(difference.shape, float("nan")),
+    )
+
 def scalar_heteroscedastic_loss(
     predicted_mean: torch.Tensor,
     variance: torch.Tensor,

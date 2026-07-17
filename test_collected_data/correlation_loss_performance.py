@@ -28,6 +28,7 @@ from model.dav2_model import MODEL_IDS  # noqa: E402
 from model.loss_fn import (  # noqa: E402
     log_scale_invariant_depth_difference,
     scale_shift_invariant_depth_loss,
+    log_gradient_depth_difference
 )
 
 
@@ -484,6 +485,7 @@ def collect_loss_values(
     log_losses: list[torch.Tensor] = []
     scale_shift_losses: list[torch.Tensor] = []
     abs_rel_degradations: list[torch.Tensor] = []
+    gradient_losses: list[torch.Tensor] = []
 
     counters: dict[str, object] = {
         "num_total_groups": 0,
@@ -552,11 +554,16 @@ def collect_loss_values(
                 candidate_depth,
                 canonical_depth,
             )
+            gradient_loss = log_gradient_depth_difference(
+                candidate_depth,
+                canonical_depth,
+            )
             degradation = batch["abs_rel_degradation"].reshape(-1).float()
 
             log_losses.append(log_loss.detach().cpu().float())
             scale_shift_losses.append(scale_shift_loss.detach().cpu().float())
             abs_rel_degradations.append(degradation.cpu())
+            gradient_losses.append(gradient_loss.detach().cpu().float())
 
             counters["num_total_groups"] = int(counters["num_total_groups"]) + num_groups
             counters["num_total_pairs"] = int(counters["num_total_pairs"]) + (
@@ -581,6 +588,7 @@ def collect_loss_values(
         torch.cat(log_losses, dim=0),
         torch.cat(scale_shift_losses, dim=0),
         torch.cat(abs_rel_degradations, dim=0),
+        torch.cat(gradient_losses, dim=0),
         counters,
     )
 
@@ -647,7 +655,7 @@ def main() -> None:
         f"inference_batch_size={args.inference_batch_size}"
     )
 
-    log_losses, scale_shift_losses, degradations, counters = collect_loss_values(
+    log_losses, scale_shift_losses, degradations, gradient_losses, counters = collect_loss_values(
         model=model,
         processor=processor,
         loader=loader,
@@ -690,6 +698,13 @@ def main() -> None:
         summarize_loss_correlation(
             loss_name="scale_shift_invariant_depth_loss",
             loss_values=scale_shift_losses,
+            degradation_values=degradations,
+            metadata=metadata,
+            max_samples=args.correlation_max_samples,
+        ),
+        summarize_loss_correlation(
+            loss_name="log_gradient_depth_difference",
+            loss_values=gradient_losses,
             degradation_values=degradations,
             metadata=metadata,
             max_samples=args.correlation_max_samples,
