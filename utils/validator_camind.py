@@ -5,7 +5,6 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from dataset.ati_dataset_caminduce import flatten_group_batch
-from evaluation_utils.eval_metrics import compute_vector_masked_correlations
 from model.loss_fn import (
     scalar_heteroscedastic_loss,
     scale_shift_invariant_depth_loss,
@@ -13,7 +12,7 @@ from model.loss_fn import (
     scalar_heteroscedastic_laplace_loss,
     log_scale_invariant_depth_difference
 )
-from utils.train_utils import reshape_group_batch, tensor_device
+from utils.train_utils import reshape_group_batch, tensor_device, groupwise_correlations
 
 
 def _finite_mean(values: torch.Tensor) -> float:
@@ -66,6 +65,7 @@ def _new_accumulator() -> dict:
             "canonical_abs_rel": [],
             "abs_rel_degradation": [],
             "rmse_degradation": [],
+            "group_id": [],
         },
     }
 
@@ -96,6 +96,8 @@ def _finalize_accumulator(
     accumulator: dict,
     max_samples: int,
 ) -> Dict[str, float]:
+    del max_samples
+
     metrics: Dict[str, float] = {}
     processed_batches = accumulator["processed_batches"]
     if processed_batches > 0:
@@ -111,7 +113,7 @@ def _finalize_accumulator(
         for key, values in accumulator["vectors"].items()
     }
     for key, value in cat_vectors.items():
-        if value is not None and key != "rmse_degradation":
+        if value is not None and key not in ("rmse_degradation", "group_id"):
             metrics[key] = _finite_mean(value)
 
     target_loss = cat_vectors.get("target_ssi_loss")
@@ -119,41 +121,42 @@ def _finalize_accumulator(
     abs_rel_degradation = cat_vectors.get("abs_rel_degradation")
     rmse_degradation = cat_vectors.get("rmse_degradation")
     q_score = cat_vectors.get("q_score")
+    group_id = cat_vectors.get("group_id")
 
-    if target_loss is not None and camera_bias is not None:
+    if target_loss is not None and camera_bias is not None and group_id is not None:
         metrics.update(
-            compute_vector_masked_correlations(
+            groupwise_correlations(
                 target_loss,
                 camera_bias,
+                group_id,
                 prefix="bias_vs_ssi_loss",
-                max_samples=max_samples,
             )
         )
-    if abs_rel_degradation is not None and camera_bias is not None:
+    if abs_rel_degradation is not None and camera_bias is not None and group_id is not None:
         metrics.update(
-            compute_vector_masked_correlations(
+            groupwise_correlations(
                 abs_rel_degradation,
                 camera_bias,
+                group_id,
                 prefix="bias_vs_abs_rel_degradation",
-                max_samples=max_samples,
             )
         )
-    if abs_rel_degradation is not None and q_score is not None:
+    if abs_rel_degradation is not None and q_score is not None and group_id is not None:
         metrics.update(
-            compute_vector_masked_correlations(
+            groupwise_correlations(
                 abs_rel_degradation,
                 q_score,
+                group_id,
                 prefix="q_vs_abs_rel_degradation",
-                max_samples=max_samples,
             )
         )
-    if rmse_degradation is not None and q_score is not None:
+    if rmse_degradation is not None and q_score is not None and group_id is not None:
         metrics.update(
-            compute_vector_masked_correlations(
+            groupwise_correlations(
                 rmse_degradation,
                 q_score,
+                group_id,
                 prefix="q_vs_rmse_degradation",
-                max_samples=max_samples,
             )
         )
     return metrics
@@ -250,6 +253,7 @@ def validate(
             "canonical_abs_rel": flat_batch["canonical_abs_rel"],
             "abs_rel_degradation": abs_rel_degradation,
             "rmse_degradation": rmse_degradation,
+            "group_id": batch["group_index"].to(device=device)[:, None].expand(-1, num_candidates).reshape(-1),
         }
         rank_accuracy = _pairwise_rank_accuracy(group_q, group_degradation)
 

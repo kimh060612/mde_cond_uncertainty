@@ -206,3 +206,86 @@ def tensor_device(
         **t_dict, 
         **non_tensor_dict
     }
+
+def _corr_from_centered(
+    x: torch.Tensor,
+    y: torch.Tensor,
+) -> float:
+    denom = torch.sqrt(x.square().sum() * y.square().sum())
+    if x.numel() < 2 or denom <= 0:
+        return float("nan")
+    return float((x * y).sum().div(denom).item())
+
+def _average_ranks(values: torch.Tensor) -> torch.Tensor:
+    sorted_values, order = torch.sort(values)
+    ranks = torch.empty_like(values, dtype=torch.float32)
+    start = 0
+
+    while start < values.numel():
+        end = start + 1
+        while end < values.numel() and sorted_values[end] == sorted_values[start]:
+            end += 1
+        ranks[order[start:end]] = 0.5 * (start + end - 1)
+        start = end
+
+    return ranks
+
+def groupwise_correlations(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    group_ids: torch.Tensor,
+    prefix: str,
+) -> Dict[str, float]:
+    x = x.detach().float().flatten()
+    y = y.detach().float().flatten()
+    group_ids = group_ids.detach().flatten()
+
+    valid_mask = torch.isfinite(x) & torch.isfinite(y) & torch.isfinite(group_ids.float())
+    x = x[valid_mask]
+    y = y[valid_mask]
+    group_ids = group_ids[valid_mask]
+
+    pearson_x = []
+    pearson_y = []
+    spearman_x = []
+    spearman_y = []
+    num_groups = 0
+
+    for group_id in torch.unique(group_ids):
+        group_mask = group_ids == group_id
+        if group_mask.sum() < 2:
+            continue
+
+        group_x = x[group_mask]
+        group_y = y[group_mask]
+        if group_x.std(unbiased=False) <= 0 or group_y.std(unbiased=False) <= 0:
+            continue
+
+        pearson_x.append(group_x - group_x.mean())
+        pearson_y.append(group_y - group_y.mean())
+
+        rank_x = _average_ranks(group_x)
+        rank_y = _average_ranks(group_y)
+        spearman_x.append(rank_x - rank_x.mean())
+        spearman_y.append(rank_y - rank_y.mean())
+        num_groups += 1
+
+    if not pearson_x:
+        return {
+            f"{prefix}_pearson": float("nan"),
+            f"{prefix}_spearman": float("nan"),
+            f"{prefix}_groups": 0,
+            f"{prefix}_samples": 0,
+        }
+
+    pearson_x = torch.cat(pearson_x)
+    pearson_y = torch.cat(pearson_y)
+    spearman_x = torch.cat(spearman_x)
+    spearman_y = torch.cat(spearman_y)
+
+    return {
+        f"{prefix}_pearson": _corr_from_centered(pearson_x, pearson_y),
+        f"{prefix}_spearman": _corr_from_centered(spearman_x, spearman_y),
+        f"{prefix}_groups": num_groups,
+        f"{prefix}_samples": int(pearson_x.numel()),
+    }
