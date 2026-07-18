@@ -13,7 +13,7 @@ from model.loss_fn import (
     scalar_heteroscedastic_laplace_loss,
     log_scale_invariant_depth_difference
 )
-from utils.train_utils import reshape_group_batch, tensor_device, groupwise_correlations
+from utils.train_utils import reshape_group_batch, tensor_device
 
 
 def _finite_mean(values: torch.Tensor) -> float:
@@ -213,20 +213,20 @@ def validate(
                 camera_context,
                 target_size=candidate_imgs.shape[-2:],
             )
-            # target_loss = scale_shift_invariant_depth_loss(
-            #     out["candidate_depth"],
-            #     out["canonical_depth"],
-            # )
-            target_loss = log_scale_invariant_depth_difference(
+            target_loss = scale_shift_invariant_depth_loss(
                 out["candidate_depth"],
                 out["canonical_depth"],
             )
+            # target_loss = log_scale_invariant_depth_difference(
+            #     out["candidate_depth"],
+            #     out["canonical_depth"],
+            # )
             mean_loss, variance_loss = scalar_heteroscedastic_laplace_loss( # scalar_heteroscedastic_loss(
                 out["camera_bias"],
                 out["variance"],
                 target_loss,
             )
-            q_score = out["camera_bias"] + uncertainty_alpha * out["std"]
+            q_score = out["camera_bias"] # + uncertainty_alpha * out["std"]
             group_q = reshape_group_batch(q_score, num_groups, num_candidates)
             group_degradation = reshape_group_batch(
                 abs_rel_degradation,
