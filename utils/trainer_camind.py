@@ -199,14 +199,14 @@ def train_one_epoch(
                 camera_context,
                 target_size=candidate_imgs.shape[-2:],
             )
-            target_loss = scale_shift_invariant_depth_loss(
-                out["candidate_depth"],
-                out["canonical_depth"],
-            )
-            # target_loss = log_scale_invariant_depth_difference(
+            # target_loss = scale_shift_invariant_depth_loss(
             #     out["candidate_depth"],
             #     out["canonical_depth"],
             # )
+            target_loss = log_scale_invariant_depth_difference(
+                out["candidate_depth"],
+                out["canonical_depth"],
+            )
             mean_loss, variance_loss = scalar_heteroscedastic_laplace_loss( # scalar_heteroscedastic_loss(
                 out["camera_bias"],
                 out["variance"],
