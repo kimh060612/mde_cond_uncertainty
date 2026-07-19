@@ -11,7 +11,6 @@ from model.loss_fn import (
     scalar_heteroscedastic_loss,
     scale_shift_invariant_depth_loss,
     signed_pairwise_ranknet_loss,
-    scalar_heteroscedastic_laplace_loss,
 )
 from model.loss_target import ssi_independent_depth_loss
 from utils.train_utils import reshape_group_batch, tensor_device
@@ -492,13 +491,18 @@ def validate(
                 candidate_gt_depth,
                 canonical_gt_depth,
             )
-            mean_loss, variance_loss = scalar_heteroscedastic_laplace_loss( # scalar_heteroscedastic_loss(
+            mean_loss, variance_loss = scalar_heteroscedastic_loss(
                 out["camera_bias"],
                 out["variance"],
                 target_loss,
             )
-            q_score = out["camera_bias"] # + uncertainty_alpha * out["std"]
+            q_score = out["camera_bias"] + uncertainty_alpha * out["std"]
             group_q = reshape_group_batch(q_score, num_groups, num_candidates)
+            group_target_loss = reshape_group_batch(
+                target_loss,
+                num_groups,
+                num_candidates,
+            )
             group_degradation = reshape_group_batch(
                 abs_rel_degradation,
                 num_groups,
@@ -506,7 +510,7 @@ def validate(
             )
             ranking_loss = signed_pairwise_ranknet_loss(
                 group_q,
-                group_degradation,
+                group_target_loss,
                 temperature=listnet_temperature,
             )
             nll_loss = mean_loss + lambda_variance * variance_loss

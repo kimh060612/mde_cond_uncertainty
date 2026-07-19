@@ -11,7 +11,6 @@ from model.loss_fn import (
     scalar_heteroscedastic_loss,
     scale_shift_invariant_depth_loss,
     signed_pairwise_ranknet_loss,
-    scalar_heteroscedastic_laplace_loss,
 )
 from model.loss_target import ssi_independent_depth_loss
 from utils.train_utils import reshape_group_batch, tensor_device
@@ -302,7 +301,7 @@ def train_one_epoch(
                 candidate_gt_depth,
                 canonical_gt_depth,
             )
-            mean_loss, variance_loss = scalar_heteroscedastic_laplace_loss( # scalar_heteroscedastic_loss(
+            mean_loss, variance_loss = scalar_heteroscedastic_loss(
                 out["camera_bias"],
                 out["variance"],
                 target_loss,
