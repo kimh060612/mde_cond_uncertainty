@@ -1,6 +1,7 @@
 from typing import Dict
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
@@ -11,8 +12,8 @@ from model.loss_fn import (
     scale_shift_invariant_depth_loss,
     signed_pairwise_ranknet_loss,
     scalar_heteroscedastic_laplace_loss,
-    log_scale_invariant_depth_difference
 )
+from model.loss_target import ssi_independent_depth_loss
 from utils.train_utils import reshape_group_batch, tensor_device
 
 
@@ -442,6 +443,7 @@ def validate(
 ):
     del model_id, lambda_smooth_logvar, uncertainty_mode, min_depth, max_depth, relative_align_mode
 
+    loader.dataset.load_depth = True
     model.eval()
     total_accumulator = _new_accumulator()
     seen_accumulator = _new_accumulator()
@@ -466,6 +468,16 @@ def validate(
         camera_context = flat_batch["camera_context"]
         abs_rel_degradation = flat_batch["abs_rel_degradation"]
         rmse_degradation = flat_batch["rmse_degradation"]
+        candidate_gt_depth = F.interpolate(
+            flat_batch["candidate_depths"].unsqueeze(1),
+            size=candidate_imgs.shape[-2:],
+            mode="nearest",
+        )
+        canonical_gt_depth = F.interpolate(
+            flat_batch["canonical_depths"].unsqueeze(1),
+            size=canonical_imgs.shape[-2:],
+            mode="nearest",
+        )
 
         with torch.autocast(device_type=device.type, enabled=amp):
             out = model(
@@ -474,13 +486,11 @@ def validate(
                 camera_context,
                 target_size=candidate_imgs.shape[-2:],
             )
-            # target_loss = scale_shift_invariant_depth_loss(
-            #     out["candidate_depth"],
-            #     out["canonical_depth"],
-            # )
-            target_loss = log_scale_invariant_depth_difference(
+            target_loss = ssi_independent_depth_loss(
                 out["candidate_depth"],
                 out["canonical_depth"],
+                candidate_gt_depth,
+                canonical_gt_depth,
             )
             mean_loss, variance_loss = scalar_heteroscedastic_laplace_loss( # scalar_heteroscedastic_loss(
                 out["camera_bias"],
