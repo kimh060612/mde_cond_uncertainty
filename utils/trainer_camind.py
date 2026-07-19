@@ -16,6 +16,8 @@ from model.loss_fn import (
 from utils.train_utils import reshape_group_batch, tensor_device
 
 
+_DEGRADATION_EPS = 1e-6
+
 def _finite_mean(values: torch.Tensor) -> float:
     values = values.detach().float().flatten()
     finite_mask = torch.isfinite(values)
@@ -27,6 +29,7 @@ def _finite_mean(values: torch.Tensor) -> float:
 def _pairwise_rank_accuracy(
     predicted_score: torch.Tensor,
     target_score: torch.Tensor,
+    valid_mask: torch.Tensor | None = None,
 ) -> float:
     _, num_candidates = predicted_score.shape
     if num_candidates < 2:
@@ -40,11 +43,91 @@ def _pairwise_rank_accuracy(
     )
     pred_diff = predicted_score[:, pair_i] - predicted_score[:, pair_j]
     target_diff = target_score[:, pair_i] - target_score[:, pair_j]
-    valid_mask = torch.isfinite(pred_diff) & torch.isfinite(target_diff) & (target_diff != 0)
-    if not valid_mask.any():
+    pair_valid_mask = (
+        torch.isfinite(pred_diff)
+        & torch.isfinite(target_diff)
+        & (target_diff != 0)
+    )
+    if valid_mask is not None:
+        valid_mask = valid_mask.bool()
+        if valid_mask.shape != predicted_score.shape:
+            raise ValueError(
+                f"valid_mask shape {tuple(valid_mask.shape)} does not match "
+                f"predicted_score shape {tuple(predicted_score.shape)}"
+            )
+        pair_valid_mask &= valid_mask[:, pair_i] & valid_mask[:, pair_j]
+    if not pair_valid_mask.any():
         return float("nan")
-    correct = torch.sign(pred_diff[valid_mask]) == torch.sign(target_diff[valid_mask])
+    correct = torch.sign(pred_diff[pair_valid_mask]) == torch.sign(target_diff[pair_valid_mask])
     return float(correct.float().mean().item())
+
+
+def _abs_rel_degradation_targets(
+    predicted_score: torch.Tensor,
+    candidate_abs_rel: torch.Tensor,
+    canonical_abs_rel: torch.Tensor,
+    eps: float = _DEGRADATION_EPS,
+) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+    """Build all AbsRel degradation targets with one shared validity mask."""
+    predicted_score = predicted_score.detach().float().flatten()
+    candidate_abs_rel = candidate_abs_rel.detach().float().flatten()
+    canonical_abs_rel = canonical_abs_rel.detach().float().flatten()
+
+    if not (predicted_score.shape == candidate_abs_rel.shape == canonical_abs_rel.shape):
+        raise ValueError(
+            "predicted_score, candidate_abs_rel, and canonical_abs_rel must have "
+            "the same flattened shape"
+        )
+
+    # AbsRel is non-negative. Negative values (notably the CSV -1 sentinel)
+    # must not participate in correlations or selection.
+    valid_mask = (
+        torch.isfinite(predicted_score)
+        & torch.isfinite(candidate_abs_rel)
+        & torch.isfinite(canonical_abs_rel)
+        & (candidate_abs_rel >= 0)
+        & (canonical_abs_rel >= 0)
+    )
+
+    absolute = candidate_abs_rel - canonical_abs_rel
+    percentage = absolute / (canonical_abs_rel + eps) * 100.0
+    log_ratio = torch.log(candidate_abs_rel + eps) - torch.log(canonical_abs_rel + eps)
+    valid_mask &= (
+        torch.isfinite(absolute)
+        & torch.isfinite(percentage)
+        & torch.isfinite(log_ratio)
+    )
+
+    return {
+        "abs_rel_degradation": absolute,
+        "abs_rel_degradation_percent": percentage,
+        "abs_rel_degradation_log": log_ratio,
+    }, valid_mask
+
+
+def _degradation_correlation_metrics(
+    predicted_score: torch.Tensor,
+    candidate_abs_rel: torch.Tensor,
+    canonical_abs_rel: torch.Tensor,
+    max_samples: int,
+) -> Dict[str, float]:
+    targets, valid_mask = _abs_rel_degradation_targets(
+        predicted_score,
+        candidate_abs_rel,
+        canonical_abs_rel,
+    )
+    metrics: Dict[str, float] = {}
+    for target_name, target in targets.items():
+        metrics.update(
+            compute_vector_masked_correlations(
+                target,
+                predicted_score,
+                valid_mask=valid_mask,
+                prefix=f"q_vs_{target_name}",
+                max_samples=max_samples,
+            )
+        )
+    return metrics
 
 
 def _cat(values: list[torch.Tensor]) -> torch.Tensor | None:
@@ -99,13 +182,15 @@ def _summarize_epoch_vectors(
                 max_samples=max_samples,
             )
         )
-    if abs_rel_degradation is not None and q_score is not None:
+    candidate_abs_rel = cat_vectors.get("candidate_abs_rel")
+    canonical_abs_rel = cat_vectors.get("canonical_abs_rel")
+    if q_score is not None and candidate_abs_rel is not None and canonical_abs_rel is not None:
         metrics.update(
-            compute_vector_masked_correlations(
-                abs_rel_degradation,
+            _degradation_correlation_metrics(
                 q_score,
-                prefix="q_vs_abs_rel_degradation",
-                max_samples=max_samples,
+                candidate_abs_rel,
+                canonical_abs_rel,
+                max_samples,
             )
         )
     if rmse_degradation is not None and q_score is not None:
@@ -230,12 +315,29 @@ def train_one_epoch(
 
         with torch.no_grad():
             group_q = reshape_group_batch(q_score.detach(), num_groups, num_candidates)
-            group_degradation = reshape_group_batch(
-                abs_rel_degradation.detach(),  # target_loss
+            group_candidate_abs_rel = reshape_group_batch(
+                flat_batch["candidate_abs_rel"].detach(),
                 num_groups,
                 num_candidates,
             )
-            rank_accuracy = _pairwise_rank_accuracy(group_q, group_degradation)
+            group_canonical_abs_rel = reshape_group_batch(
+                flat_batch["canonical_abs_rel"].detach(),
+                num_groups,
+                num_candidates,
+            )
+            group_degradation = group_candidate_abs_rel - group_canonical_abs_rel
+            group_valid_mask = (
+                torch.isfinite(group_q)
+                & torch.isfinite(group_candidate_abs_rel)
+                & torch.isfinite(group_canonical_abs_rel)
+                & (group_candidate_abs_rel >= 0)
+                & (group_canonical_abs_rel >= 0)
+            )
+            rank_accuracy = _pairwise_rank_accuracy(
+                group_q,
+                group_degradation,
+                valid_mask=group_valid_mask,
+            )
             if torch.isfinite(torch.tensor(rank_accuracy)):
                 running["q_rank_accuracy"] += rank_accuracy
                 rank_accuracy_count += 1

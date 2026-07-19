@@ -16,6 +16,10 @@ from model.loss_fn import (
 from utils.train_utils import reshape_group_batch, tensor_device
 
 
+_DEGRADATION_EPS = 1e-6
+_NEAR_ORACLE_THRESHOLDS = (5.0, 10.0, 20.0)
+
+
 def _finite_mean(values: torch.Tensor) -> float:
     values = values.detach().float().flatten()
     finite_mask = torch.isfinite(values)
@@ -27,6 +31,7 @@ def _finite_mean(values: torch.Tensor) -> float:
 def _pairwise_rank_accuracy(
     predicted_score: torch.Tensor,
     target_score: torch.Tensor,
+    valid_mask: torch.Tensor | None = None,
 ) -> float:
     _, num_candidates = predicted_score.shape
     if num_candidates < 2:
@@ -40,11 +45,234 @@ def _pairwise_rank_accuracy(
     )
     pred_diff = predicted_score[:, pair_i] - predicted_score[:, pair_j]
     target_diff = target_score[:, pair_i] - target_score[:, pair_j]
-    valid_mask = torch.isfinite(pred_diff) & torch.isfinite(target_diff) & (target_diff != 0)
-    if not valid_mask.any():
+    pair_valid_mask = (
+        torch.isfinite(pred_diff)
+        & torch.isfinite(target_diff)
+        & (target_diff != 0)
+    )
+    if valid_mask is not None:
+        valid_mask = valid_mask.bool()
+        if valid_mask.shape != predicted_score.shape:
+            raise ValueError(
+                f"valid_mask shape {tuple(valid_mask.shape)} does not match "
+                f"predicted_score shape {tuple(predicted_score.shape)}"
+            )
+        pair_valid_mask &= valid_mask[:, pair_i] & valid_mask[:, pair_j]
+    if not pair_valid_mask.any():
         return float("nan")
-    correct = torch.sign(pred_diff[valid_mask]) == torch.sign(target_diff[valid_mask])
+    correct = torch.sign(pred_diff[pair_valid_mask]) == torch.sign(target_diff[pair_valid_mask])
     return float(correct.float().mean().item())
+
+
+def _abs_rel_degradation_targets(
+    predicted_score: torch.Tensor,
+    candidate_abs_rel: torch.Tensor,
+    canonical_abs_rel: torch.Tensor,
+    eps: float = _DEGRADATION_EPS,
+) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+    """Build all AbsRel degradation targets with one shared validity mask."""
+    predicted_score = predicted_score.detach().float().flatten()
+    candidate_abs_rel = candidate_abs_rel.detach().float().flatten()
+    canonical_abs_rel = canonical_abs_rel.detach().float().flatten()
+
+    if not (predicted_score.shape == candidate_abs_rel.shape == canonical_abs_rel.shape):
+        raise ValueError(
+            "predicted_score, candidate_abs_rel, and canonical_abs_rel must have "
+            "the same flattened shape"
+        )
+
+    # AbsRel is non-negative. Negative values (notably the CSV -1 sentinel)
+    # must not participate in correlations or selection.
+    valid_mask = (
+        torch.isfinite(predicted_score)
+        & torch.isfinite(candidate_abs_rel)
+        & torch.isfinite(canonical_abs_rel)
+        & (candidate_abs_rel >= 0)
+        & (canonical_abs_rel >= 0)
+    )
+
+    absolute = candidate_abs_rel - canonical_abs_rel
+    percentage = absolute / (canonical_abs_rel + eps) * 100.0
+    log_ratio = torch.log(candidate_abs_rel + eps) - torch.log(canonical_abs_rel + eps)
+    valid_mask &= (
+        torch.isfinite(absolute)
+        & torch.isfinite(percentage)
+        & torch.isfinite(log_ratio)
+    )
+
+    return {
+        "abs_rel_degradation": absolute,
+        "abs_rel_degradation_percent": percentage,
+        "abs_rel_degradation_log": log_ratio,
+    }, valid_mask
+
+
+def _degradation_correlation_metrics(
+    predicted_score: torch.Tensor,
+    candidate_abs_rel: torch.Tensor,
+    canonical_abs_rel: torch.Tensor,
+    max_samples: int,
+) -> Dict[str, float]:
+    targets, valid_mask = _abs_rel_degradation_targets(
+        predicted_score,
+        candidate_abs_rel,
+        canonical_abs_rel,
+    )
+    metrics: Dict[str, float] = {}
+    for target_name, target in targets.items():
+        metrics.update(
+            compute_vector_masked_correlations(
+                target,
+                predicted_score,
+                valid_mask=valid_mask,
+                prefix=f"q_vs_{target_name}",
+                max_samples=max_samples,
+            )
+        )
+    return metrics
+
+
+def _condition_groupwise_correlation_metrics(
+    predicted_score: torch.Tensor,
+    candidate_abs_rel: torch.Tensor,
+    canonical_abs_rel: torch.Tensor,
+    scene_id: torch.Tensor,
+    motion_id: torch.Tensor,
+    light_id: torch.Tensor,
+    max_samples: int,
+) -> Dict[str, float]:
+    """Macro-average correlations over (scene, motion, light) conditions."""
+    predicted_score = predicted_score.detach().float().flatten()
+    candidate_abs_rel = candidate_abs_rel.detach().float().flatten()
+    canonical_abs_rel = canonical_abs_rel.detach().float().flatten()
+    conditions = torch.stack(
+        [scene_id.flatten(), motion_id.flatten(), light_id.flatten()],
+        dim=1,
+    )
+    if not (
+        predicted_score.shape
+        == candidate_abs_rel.shape
+        == canonical_abs_rel.shape
+        == conditions[:, 0].shape
+    ):
+        raise ValueError("condition metadata must have the same sample count as predicted_score")
+    condition_valid = torch.isfinite(conditions).all(dim=1)
+    metric_keys = tuple(
+        f"q_vs_{target_name}_{correlation_name}"
+        for target_name in (
+            "abs_rel_degradation",
+            "abs_rel_degradation_percent",
+            "abs_rel_degradation_log",
+        )
+        for correlation_name in ("pearson", "spearman")
+    )
+    correlation_values: dict[str, list[float]] = {key: [] for key in metric_keys}
+
+    for condition in torch.unique(conditions[condition_valid], dim=0):
+        condition_mask = condition_valid & (conditions == condition).all(dim=1)
+        condition_metrics = _degradation_correlation_metrics(
+            predicted_score[condition_mask],
+            candidate_abs_rel[condition_mask],
+            canonical_abs_rel[condition_mask],
+            max_samples,
+        )
+        for key, value in condition_metrics.items():
+            if torch.isfinite(torch.tensor(value)):
+                correlation_values[key].append(value)
+
+    return {
+        f"condition_groupwise_mean_{key}": (
+            float(torch.tensor(values).mean().item()) if values else float("nan")
+        )
+        for key, values in correlation_values.items()
+    }
+
+
+def _selection_metrics(
+    predicted_score: torch.Tensor,
+    candidate_abs_rel: torch.Tensor,
+    canonical_abs_rel: torch.Tensor,
+    group_id: torch.Tensor,
+    eps: float = _DEGRADATION_EPS,
+) -> Dict[str, float]:
+    predicted_score = predicted_score.detach().float().flatten()
+    candidate_abs_rel = candidate_abs_rel.detach().float().flatten()
+    canonical_abs_rel = canonical_abs_rel.detach().float().flatten()
+    targets, valid_mask = _abs_rel_degradation_targets(
+        predicted_score,
+        candidate_abs_rel,
+        canonical_abs_rel,
+        eps=eps,
+    )
+    group_id = group_id.detach().flatten()
+    if group_id.shape != valid_mask.shape:
+        raise ValueError("group_id must have the same flattened shape as predicted_score")
+    valid_mask &= torch.isfinite(group_id.float())
+
+    exact_hits: list[float] = []
+    relative_regrets: list[float] = []
+    near_oracle_hits: dict[float, list[float]] = {
+        threshold: [] for threshold in _NEAR_ORACLE_THRESHOLDS
+    }
+
+    for current_group_id in torch.unique(group_id[valid_mask]):
+        group_mask = valid_mask & (group_id == current_group_id)
+        if int(group_mask.sum().item()) < 2:
+            continue
+
+        group_q = predicted_score[group_mask]
+        group_candidate_abs_rel = candidate_abs_rel[group_mask]
+        group_canonical_abs_rel = canonical_abs_rel[group_mask]
+
+        canonical_spread = group_canonical_abs_rel.max() - group_canonical_abs_rel.min()
+        canonical_tolerance = eps + 1e-6 * group_canonical_abs_rel.abs().max()
+        if canonical_spread > canonical_tolerance:
+            raise RuntimeError(
+                "canonical AbsRel is inconsistent inside one selection group; "
+                "check grouping and canonical matching"
+            )
+
+        selected_index = int(torch.argmin(group_q).item())
+        transformed_hits = []
+        for target in targets.values():
+            group_target = target[group_mask]
+            transformed_hits.append(
+                bool((group_target[selected_index] == group_target.min()).item())
+            )
+        if len(set(transformed_hits)) != 1:
+            raise RuntimeError(
+                "absolute/percentage/log-ratio selection accuracy diverged; "
+                "check grouping, canonical matching, and filtering"
+            )
+
+        selected_abs_rel = group_candidate_abs_rel[selected_index]
+        oracle_abs_rel = group_candidate_abs_rel.min()
+        relative_regret = (selected_abs_rel - oracle_abs_rel) / (oracle_abs_rel + eps) * 100.0
+        relative_regret_value = float(relative_regret.item())
+
+        exact_hits.append(float(transformed_hits[0]))
+        relative_regrets.append(relative_regret_value)
+        for threshold in _NEAR_ORACLE_THRESHOLDS:
+            near_oracle_hits[threshold].append(float(relative_regret_value <= threshold))
+
+    if not exact_hits:
+        return {
+            "selection_exact_accuracy": float("nan"),
+            "selection_relative_regret_percent": float("nan"),
+            **{
+                f"selection_near_oracle_{int(threshold)}pct_rate": float("nan")
+                for threshold in _NEAR_ORACLE_THRESHOLDS
+            },
+        }
+
+    return {
+        "selection_exact_accuracy": sum(exact_hits) / len(exact_hits),
+        "selection_relative_regret_percent": sum(relative_regrets) / len(relative_regrets),
+        **{
+            f"selection_near_oracle_{int(threshold)}pct_rate": sum(hits) / len(hits)
+            for threshold, hits in near_oracle_hits.items()
+        },
+    }
 
 
 def _new_accumulator() -> dict:
@@ -66,6 +294,10 @@ def _new_accumulator() -> dict:
             "canonical_abs_rel": [],
             "abs_rel_degradation": [],
             "rmse_degradation": [],
+            "group_id": [],
+            "scene_id": [],
+            "motion_id": [],
+            "light_id": [],
         },
     }
 
@@ -110,8 +342,9 @@ def _finalize_accumulator(
         key: torch.cat(values, dim=0) if values else None
         for key, values in accumulator["vectors"].items()
     }
+    metadata_keys = {"group_id", "scene_id", "motion_id", "light_id"}
     for key, value in cat_vectors.items():
-        if value is not None and key != "rmse_degradation":
+        if value is not None and key != "rmse_degradation" and key not in metadata_keys:
             metrics[key] = _finite_mean(value)
 
     target_loss = cat_vectors.get("target_ssi_loss")
@@ -138,15 +371,42 @@ def _finalize_accumulator(
                 max_samples=max_samples,
             )
         )
-    if abs_rel_degradation is not None and q_score is not None:
+    candidate_abs_rel = cat_vectors.get("candidate_abs_rel")
+    canonical_abs_rel = cat_vectors.get("canonical_abs_rel")
+    group_id = cat_vectors.get("group_id")
+    scene_id = cat_vectors.get("scene_id")
+    motion_id = cat_vectors.get("motion_id")
+    light_id = cat_vectors.get("light_id")
+    if q_score is not None and candidate_abs_rel is not None and canonical_abs_rel is not None:
         metrics.update(
-            compute_vector_masked_correlations(
-                abs_rel_degradation,
+            _degradation_correlation_metrics(
                 q_score,
-                prefix="q_vs_abs_rel_degradation",
-                max_samples=max_samples,
+                candidate_abs_rel,
+                canonical_abs_rel,
+                max_samples,
             )
         )
+        if group_id is not None:
+            metrics.update(
+                _selection_metrics(
+                    q_score,
+                    candidate_abs_rel,
+                    canonical_abs_rel,
+                    group_id,
+                )
+            )
+        if scene_id is not None and motion_id is not None and light_id is not None:
+            metrics.update(
+                _condition_groupwise_correlation_metrics(
+                    q_score,
+                    candidate_abs_rel,
+                    canonical_abs_rel,
+                    scene_id,
+                    motion_id,
+                    light_id,
+                    max_samples,
+                )
+            )
     if rmse_degradation is not None and q_score is not None:
         metrics.update(
             compute_vector_masked_correlations(
@@ -186,6 +446,7 @@ def validate(
     total_accumulator = _new_accumulator()
     seen_accumulator = _new_accumulator()
     unseen_accumulator = _new_accumulator()
+    scene_ids: dict[str, int] = {}
 
     progress_bar = tqdm(
         loader,
@@ -251,7 +512,46 @@ def validate(
             "abs_rel_degradation": abs_rel_degradation,
             "rmse_degradation": rmse_degradation,
         }
-        rank_accuracy = _pairwise_rank_accuracy(group_q, group_degradation)
+        group_candidate_abs_rel = reshape_group_batch(
+            flat_batch["candidate_abs_rel"],
+            num_groups,
+            num_candidates,
+        )
+        group_canonical_abs_rel = reshape_group_batch(
+            flat_batch["canonical_abs_rel"],
+            num_groups,
+            num_candidates,
+        )
+        group_valid_mask = (
+            torch.isfinite(group_q)
+            & torch.isfinite(group_candidate_abs_rel)
+            & torch.isfinite(group_canonical_abs_rel)
+            & (group_candidate_abs_rel >= 0)
+            & (group_canonical_abs_rel >= 0)
+        )
+        evaluation_group_degradation = group_candidate_abs_rel - group_canonical_abs_rel
+        rank_accuracy = _pairwise_rank_accuracy(
+            group_q,
+            evaluation_group_degradation,
+            valid_mask=group_valid_mask,
+        )
+
+        group_info = batch["info"].to(device=device)
+        batch_scene_ids = torch.tensor(
+            [scene_ids.setdefault(str(scene), len(scene_ids)) for scene in batch["scene"]],
+            device=device,
+            dtype=torch.float32,
+        )
+        batch_vectors.update(
+            {
+                "group_id": batch["group_index"].to(device=device)[:, None]
+                .expand(-1, num_candidates)
+                .reshape(-1),
+                "scene_id": batch_scene_ids[:, None].expand(-1, num_candidates).reshape(-1),
+                "motion_id": group_info[:, 3:4].expand(-1, num_candidates).reshape(-1),
+                "light_id": group_info[:, 2:3].expand(-1, num_candidates).reshape(-1),
+            }
+        )
 
         total_accumulator["loss"] += float(loss.item())
         total_accumulator["nll_loss"] += float(nll_loss.item())
@@ -262,7 +562,7 @@ def validate(
         _add_rank_accuracy(total_accumulator, rank_accuracy)
         _append_vectors(total_accumulator, **batch_vectors)
 
-        group_topology = batch["info"][:, 6].to(device=device).long()
+        group_topology = group_info[:, 6].long()
         if seen_topology_numbers is not None:
             seen_group_mask = torch.isin(
                 group_topology,
