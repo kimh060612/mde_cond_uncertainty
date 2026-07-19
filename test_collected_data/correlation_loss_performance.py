@@ -27,11 +27,13 @@ from evaluation_utils.eval_metrics import compute_vector_masked_correlations  # 
 from model.dav2_model import MODEL_IDS  # noqa: E402
 from model.loss_fn import (  # noqa: E402
     log_scale_invariant_depth_difference,
-    scale_shift_invariant_depth_loss,
     sobel_log_gradient_depth_difference,
     sobel_log_gradient_magnitude_difference
 )
-from model.loss_target import ordinal_structure_failure  # noqa: E402
+from model.loss_target import (  # noqa: E402
+    ordinal_structure_failure,
+    ssi_independent_depth_loss,
+)
 
 
 DEFAULT_CONFIG_PATH = PROJECT_ROOT / "config" / "base_caminduce.yaml"
@@ -344,7 +346,7 @@ def build_dataset(args: argparse.Namespace, cfg: Any) -> FoundationCameraGrouped
         pair_transform=PairedResizeToTensor(size=(image_height, image_width)),
         topologies=parse_topologies(args.topologies),
         load_images=True,
-        load_depth=False,
+        load_depth=True,
         min_depth=min_depth,
         max_depth=max_depth,
         seed=int(args.seed or cfg_get(cfg, "training.seed", 42)),
@@ -485,7 +487,7 @@ def collect_loss_values(
     strict: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, object]]:
     log_losses: list[torch.Tensor] = []
-    scale_shift_losses: list[torch.Tensor] = []
+    ssi_independent_losses: list[torch.Tensor] = []
     abs_rel_degradations: list[torch.Tensor] = []
     ordinal_losses: list[torch.Tensor] = []
 
@@ -548,13 +550,34 @@ def collect_loss_values(
                 softplus=softplus,
             ).repeat_interleave(num_candidates, dim=0)
 
+            candidate_gt_depth = batch["candidate_depths"].reshape(
+                num_groups * num_candidates,
+                *batch["candidate_depths"].shape[2:],
+            ).unsqueeze(1).to(device=device, dtype=torch.float32, non_blocking=True)
+            canonical_gt_depth = batch["canonical_depths"].reshape(
+                num_groups * num_candidates,
+                *batch["canonical_depths"].shape[2:],
+            ).unsqueeze(1).to(device=device, dtype=torch.float32, non_blocking=True)
+            candidate_gt_depth = F.interpolate(
+                candidate_gt_depth,
+                size=target_size,
+                mode="nearest",
+            )
+            canonical_gt_depth = F.interpolate(
+                canonical_gt_depth,
+                size=target_size,
+                mode="nearest",
+            )
+
             log_loss = log_scale_invariant_depth_difference(
                 candidate_depth,
                 canonical_depth,
             )
-            scale_shift_loss = scale_shift_invariant_depth_loss(
+            ssi_independent_loss = ssi_independent_depth_loss(
                 candidate_depth,
                 canonical_depth,
+                candidate_gt_depth,
+                canonical_gt_depth,
             )
             failure, _ = ordinal_structure_failure(
                 source_depth=candidate_depth,
@@ -568,7 +591,7 @@ def collect_loss_values(
             degradation = batch["abs_rel_degradation"].reshape(-1).float()
 
             log_losses.append(log_loss.detach().cpu().float())
-            scale_shift_losses.append(scale_shift_loss.detach().cpu().float())
+            ssi_independent_losses.append(ssi_independent_loss.detach().cpu().float())
             abs_rel_degradations.append(degradation.cpu())
             ordinal_losses.append(failure.detach().cpu().float())
 
@@ -580,7 +603,7 @@ def collect_loss_values(
 
             progress.set_postfix(
                 log=f"{finite_stats(log_loss)[0]:.4f}",
-                ssi=f"{finite_stats(scale_shift_loss)[0]:.4f}",
+                ssi=f"{finite_stats(ssi_independent_loss)[0]:.4f}",
                 deg=f"{finite_stats(degradation)[0]:.4f}",
             )
         except Exception:
@@ -593,7 +616,7 @@ def collect_loss_values(
 
     return (
         torch.cat(log_losses, dim=0),
-        torch.cat(scale_shift_losses, dim=0),
+        torch.cat(ssi_independent_losses, dim=0),
         torch.cat(abs_rel_degradations, dim=0),
         torch.cat(ordinal_losses, dim=0),
         counters,
@@ -662,7 +685,7 @@ def main() -> None:
         f"inference_batch_size={args.inference_batch_size}"
     )
 
-    log_losses, scale_shift_losses, degradations, ordinal_losses, counters = collect_loss_values(
+    log_losses, ssi_independent_losses, degradations, ordinal_losses, counters = collect_loss_values(
         model=model,
         processor=processor,
         loader=loader,
@@ -703,8 +726,8 @@ def main() -> None:
             max_samples=args.correlation_max_samples,
         ),
         summarize_loss_correlation(
-            loss_name="scale_shift_invariant_depth_loss",
-            loss_values=scale_shift_losses,
+            loss_name="ssi_independent_depth_loss",
+            loss_values=ssi_independent_losses,
             degradation_values=degradations,
             metadata=metadata,
             max_samples=args.correlation_max_samples,

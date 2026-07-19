@@ -263,3 +263,63 @@ def ordinal_structure_failure(
     }
 
     return failure_score, details
+
+
+def ssi_independent_depth_loss(
+    candidate_depth: torch.Tensor,
+    canonical_depth: torch.Tensor,
+    candidate_gt_depth: torch.Tensor,
+    canonical_gt_depth: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    predictions = torch.stack((candidate_depth, canonical_depth), dim=1)
+    targets = torch.stack((candidate_gt_depth, canonical_gt_depth), dim=1)
+    valid = (
+        torch.isfinite(predictions)
+        & torch.isfinite(targets)
+        & (predictions > 0)
+        & (targets > 0)
+    )
+
+    valid_float = valid.to(predictions.dtype)
+    counts = valid_float.flatten(2).sum(dim=2)
+    safe_counts = counts.clamp_min(1.0)
+    prediction_values = torch.where(valid, predictions, torch.zeros_like(predictions))
+    target_values = torch.where(valid, targets, torch.zeros_like(targets))
+
+    sum_prediction = prediction_values.flatten(2).sum(dim=2)
+    sum_target = target_values.flatten(2).sum(dim=2)
+    sum_prediction_squared = prediction_values.square().flatten(2).sum(dim=2)
+    sum_prediction_target = (prediction_values * target_values).flatten(2).sum(dim=2)
+
+    denominator = safe_counts * sum_prediction_squared - sum_prediction.square()
+    stable = (counts > 1) & (denominator.abs() > eps)
+    scale = torch.where(
+        stable,
+        (safe_counts * sum_prediction_target - sum_prediction * sum_target)
+        / denominator.clamp_min(eps),
+        torch.zeros_like(counts),
+    )
+    shift = torch.where(
+        counts > 0,
+        (sum_target - scale * sum_prediction) / safe_counts,
+        torch.zeros_like(counts),
+    )
+
+    aligned = (
+        scale[:, :, None, None, None] * predictions
+        + shift[:, :, None, None, None]
+    )
+    comparison_valid = valid[:, 0] & valid[:, 1]
+    valid_counts = comparison_valid.flatten(1).sum(dim=1)
+    difference = torch.where(
+        comparison_valid,
+        (aligned[:, 0] - aligned[:, 1]).abs(),
+        torch.zeros_like(aligned[:, 0]),
+    )
+    loss = difference.flatten(1).sum(dim=1) / valid_counts.clamp_min(1)
+    return torch.where(
+        valid_counts > 0,
+        loss,
+        torch.full_like(loss, float("nan")),
+    )
