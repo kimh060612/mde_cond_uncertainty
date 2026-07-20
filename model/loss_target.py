@@ -379,7 +379,7 @@ def ssi_independent_meter_space_depth_loss(
     valid_counts = comparison_valid.flatten(1).sum(dim=1)
     difference = torch.where(
         comparison_valid,
-        (candidate_meter_depth - canonical_meter_depth).abs(),
+        (candidate_meter_depth - canonical_meter_depth).abs() / canonical_meter_depth.clamp_min(eps),
         torch.zeros_like(candidate_meter_depth),
     )
     loss = difference.flatten(1).sum(dim=1) / valid_counts.clamp_min(1)
