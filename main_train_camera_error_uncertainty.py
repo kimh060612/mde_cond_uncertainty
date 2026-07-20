@@ -56,7 +56,11 @@ def main(cfg: DictConfig):
             config=OmegaConf.to_container(cfg, resolve=True),
         )
         
-    image_processor = AutoImageProcessor.from_pretrained(model_id, cache_dir=None)
+    image_processor = AutoImageProcessor.from_pretrained(
+        model_id,
+        cache_dir=None,
+        use_fast=False,
+    )
     
     seen_val_topologies = [ str(topology).strip() for topology in cfg.dataset.seen_val_topologies ]
     unseen_val_topologies = [ str(topology).strip() for topology in cfg.dataset.unseen_val_topologies ]
@@ -93,10 +97,17 @@ def main(cfg: DictConfig):
             "/media/michael/ssd1/AIoT_ATI/orbbec_realworld_dataset":
             cfg.dataset.dataset_root,
         },
-        pair_transform=PairedResizeToTensor(size=(cfg.model.image_height, cfg.model.image_width)),
+        pair_transform=PairedResizeToTensor(image_processor=image_processor),
+        min_overlap_ratio=cfg.dataset.min_registration_overlap_ratio,
+        min_ecc_score=cfg.dataset.min_registration_ecc_score,
+        max_time_diff_sec=cfg.dataset.max_pair_time_diff_sec,
+        max_registration_translation_px=cfg.dataset.max_registration_translation_px,
+        abs_rel_degradation_quantile=cfg.dataset.abs_rel_degradation_quantile,
         topologies=cfg.dataset.train_topologies,
         load_images=True,
         load_depth=False,
+        min_depth=cfg.dataset.min_depth,
+        max_depth=cfg.dataset.max_depth,
         seed=cfg.training.seed,
     )
     val_set = FoundationCameraGroupedDataset(
@@ -112,10 +123,18 @@ def main(cfg: DictConfig):
             "/media/michael/ssd1/AIoT_ATI/orbbec_realworld_dataset":
             cfg.dataset.dataset_root,
         },
-        pair_transform=PairedResizeToTensor(size=(cfg.model.image_height, cfg.model.image_width)),
+        pair_transform=PairedResizeToTensor(image_processor=image_processor),
+        min_overlap_ratio=cfg.dataset.min_registration_overlap_ratio,
+        min_ecc_score=cfg.dataset.min_registration_ecc_score,
+        max_time_diff_sec=cfg.dataset.max_pair_time_diff_sec,
+        max_registration_translation_px=cfg.dataset.max_registration_translation_px,
+        abs_rel_degradation_quantile=cfg.dataset.abs_rel_degradation_quantile,
+        use_all_candidates=True,
         topologies=list(cfg.dataset.seen_val_topologies) + list(cfg.dataset.unseen_val_topologies),
         load_images=True,
         load_depth=False,
+        min_depth=cfg.dataset.min_depth,
+        max_depth=cfg.dataset.max_depth,
         seed=cfg.training.seed,
     )
     # copy_condition_normalization(val_set, train_set)
@@ -166,7 +185,7 @@ def main(cfg: DictConfig):
     )
     val_loader = DataLoader(
         val_set,
-        batch_size=cfg.training.batch_size,
+        batch_size=1,
         shuffle=False,
         num_workers=cfg.dataset.num_workers,
         pin_memory=pin_memory,

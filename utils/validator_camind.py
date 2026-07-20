@@ -28,14 +28,14 @@ def _finite_mean(values: torch.Tensor) -> float:
     return float(values[finite_mask].mean().item())
 
 
-def _pairwise_rank_accuracy(
+def _pairwise_rank_counts(
     predicted_score: torch.Tensor,
     target_score: torch.Tensor,
     valid_mask: torch.Tensor | None = None,
-) -> float:
+) -> tuple[int, int]:
     _, num_candidates = predicted_score.shape
     if num_candidates < 2:
-        return float("nan")
+        return 0, 0
 
     pair_i, pair_j = torch.triu_indices(
         num_candidates,
@@ -59,9 +59,9 @@ def _pairwise_rank_accuracy(
             )
         pair_valid_mask &= valid_mask[:, pair_i] & valid_mask[:, pair_j]
     if not pair_valid_mask.any():
-        return float("nan")
+        return 0, 0
     correct = torch.sign(pred_diff[pair_valid_mask]) == torch.sign(target_diff[pair_valid_mask])
-    return float(correct.float().mean().item())
+    return int(correct.sum().item()), int(pair_valid_mask.sum().item())
 
 
 def _abs_rel_degradation_targets(
@@ -283,8 +283,8 @@ def _new_accumulator() -> dict:
         "variance_loss": 0.0,
         "ranking_loss": 0.0,
         "processed_batches": 0,
-        "q_rank_accuracy": 0.0,
-        "q_rank_accuracy_count": 0,
+        "q_rank_correct": 0,
+        "q_rank_total": 0,
         "vectors": {
             "target_ssi_loss": [],
             "camera_bias": [],
@@ -315,13 +315,13 @@ def _append_vectors(
             accumulator["vectors"][key].append(value.cpu())
 
 
-def _add_rank_accuracy(
+def _add_rank_counts(
     accumulator: dict,
-    rank_accuracy: float,
+    rank_counts: tuple[int, int],
 ) -> None:
-    if torch.isfinite(torch.tensor(rank_accuracy)):
-        accumulator["q_rank_accuracy"] += rank_accuracy
-        accumulator["q_rank_accuracy_count"] += 1
+    correct, total = rank_counts
+    accumulator["q_rank_correct"] += correct
+    accumulator["q_rank_total"] += total
 
 
 def _finalize_accumulator(
@@ -334,9 +334,9 @@ def _finalize_accumulator(
         for key in ("loss", "nll_loss", "mean_loss", "variance_loss", "ranking_loss"):
             metrics[key] = accumulator[key] / processed_batches
 
-    rank_count = accumulator["q_rank_accuracy_count"]
-    if rank_count > 0:
-        metrics["q_rank_accuracy"] = accumulator["q_rank_accuracy"] / rank_count
+    rank_total = accumulator["q_rank_total"]
+    if rank_total > 0:
+        metrics["q_rank_accuracy"] = accumulator["q_rank_correct"] / rank_total
 
     cat_vectors = {
         key: torch.cat(values, dim=0) if values else None
@@ -349,9 +349,10 @@ def _finalize_accumulator(
 
     target_loss = cat_vectors.get("target_ssi_loss")
     camera_bias = cat_vectors.get("camera_bias")
-    abs_rel_degradation = cat_vectors.get("abs_rel_degradation")
     rmse_degradation = cat_vectors.get("rmse_degradation")
     q_score = cat_vectors.get("q_score")
+    candidate_abs_rel = cat_vectors.get("candidate_abs_rel")
+    canonical_abs_rel = cat_vectors.get("canonical_abs_rel")
 
     if target_loss is not None and camera_bias is not None:
         metrics.update(
@@ -362,17 +363,21 @@ def _finalize_accumulator(
                 max_samples=max_samples,
             )
         )
-    if abs_rel_degradation is not None and camera_bias is not None:
+    if camera_bias is not None and candidate_abs_rel is not None and canonical_abs_rel is not None:
+        targets, valid_mask = _abs_rel_degradation_targets(
+            camera_bias,
+            candidate_abs_rel,
+            canonical_abs_rel,
+        )
         metrics.update(
             compute_vector_masked_correlations(
-                abs_rel_degradation,
+                targets["abs_rel_degradation"],
                 camera_bias,
+                valid_mask=valid_mask,
                 prefix="bias_vs_abs_rel_degradation",
                 max_samples=max_samples,
             )
         )
-    candidate_abs_rel = cat_vectors.get("candidate_abs_rel")
-    canonical_abs_rel = cat_vectors.get("canonical_abs_rel")
     group_id = cat_vectors.get("group_id")
     scene_id = cat_vectors.get("scene_id")
     motion_id = cat_vectors.get("motion_id")
@@ -408,10 +413,19 @@ def _finalize_accumulator(
                 )
             )
     if rmse_degradation is not None and q_score is not None:
+        rmse_valid_mask = torch.isfinite(rmse_degradation) & (rmse_degradation != -1.0)
+        if candidate_abs_rel is not None and canonical_abs_rel is not None:
+            _, abs_rel_valid_mask = _abs_rel_degradation_targets(
+                q_score,
+                candidate_abs_rel,
+                canonical_abs_rel,
+            )
+            rmse_valid_mask &= abs_rel_valid_mask
         metrics.update(
             compute_vector_masked_correlations(
                 rmse_degradation,
                 q_score,
+                valid_mask=rmse_valid_mask,
                 prefix="q_vs_rmse_degradation",
                 max_samples=max_samples,
             )
@@ -503,11 +517,6 @@ def validate(
                 num_groups,
                 num_candidates,
             )
-            group_degradation = reshape_group_batch(
-                abs_rel_degradation,
-                num_groups,
-                num_candidates,
-            )
             ranking_loss = signed_pairwise_ranknet_loss(
                 group_q,
                 group_target_loss,
@@ -544,7 +553,7 @@ def validate(
             & (group_canonical_abs_rel >= 0)
         )
         evaluation_group_degradation = group_candidate_abs_rel - group_canonical_abs_rel
-        rank_accuracy = _pairwise_rank_accuracy(
+        rank_counts = _pairwise_rank_counts(
             group_q,
             evaluation_group_degradation,
             valid_mask=group_valid_mask,
@@ -573,7 +582,7 @@ def validate(
         total_accumulator["variance_loss"] += float(variance_loss.item())
         total_accumulator["ranking_loss"] += float(ranking_loss.item())
         total_accumulator["processed_batches"] += 1
-        _add_rank_accuracy(total_accumulator, rank_accuracy)
+        _add_rank_counts(total_accumulator, rank_counts)
         _append_vectors(total_accumulator, **batch_vectors)
 
         group_topology = group_info[:, 6].long()
@@ -585,11 +594,12 @@ def validate(
             seen_sample_mask = seen_group_mask[:, None].expand(-1, num_candidates).reshape(-1)
             _append_vectors(seen_accumulator, seen_sample_mask, **batch_vectors)
             if seen_group_mask.any():
-                _add_rank_accuracy(
+                _add_rank_counts(
                     seen_accumulator,
-                    _pairwise_rank_accuracy(
+                    _pairwise_rank_counts(
                         group_q[seen_group_mask],
-                        group_degradation[seen_group_mask],
+                        evaluation_group_degradation[seen_group_mask],
+                        valid_mask=group_valid_mask[seen_group_mask],
                     ),
                 )
         if unseen_topology_numbers is not None:
@@ -600,11 +610,12 @@ def validate(
             unseen_sample_mask = unseen_group_mask[:, None].expand(-1, num_candidates).reshape(-1)
             _append_vectors(unseen_accumulator, unseen_sample_mask, **batch_vectors)
             if unseen_group_mask.any():
-                _add_rank_accuracy(
+                _add_rank_counts(
                     unseen_accumulator,
-                    _pairwise_rank_accuracy(
+                    _pairwise_rank_counts(
                         group_q[unseen_group_mask],
-                        group_degradation[unseen_group_mask],
+                        evaluation_group_degradation[unseen_group_mask],
+                        valid_mask=group_valid_mask[unseen_group_mask],
                     ),
                 )
 
@@ -614,7 +625,7 @@ def validate(
             avg=f"{total_accumulator['loss'] / n:.4f}",
             ssi=f"{_finite_mean(target_loss):.4f}",
             deg=f"{_finite_mean(abs_rel_degradation):.4f}",
-            q_acc=f"{total_accumulator['q_rank_accuracy'] / max(total_accumulator['q_rank_accuracy_count'], 1):.4f}",
+            q_acc=f"{total_accumulator['q_rank_correct'] / max(total_accumulator['q_rank_total'], 1):.4f}",
         )
 
     total_metrics = _finalize_accumulator(total_accumulator, correlation_max_samples)

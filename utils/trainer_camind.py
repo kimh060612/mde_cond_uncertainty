@@ -26,14 +26,14 @@ def _finite_mean(values: torch.Tensor) -> float:
     return float(values[finite_mask].mean().item())
 
 
-def _pairwise_rank_accuracy(
+def _pairwise_rank_counts(
     predicted_score: torch.Tensor,
     target_score: torch.Tensor,
     valid_mask: torch.Tensor | None = None,
-) -> float:
+) -> tuple[int, int]:
     _, num_candidates = predicted_score.shape
     if num_candidates < 2:
-        return float("nan")
+        return 0, 0
 
     pair_i, pair_j = torch.triu_indices(
         num_candidates,
@@ -57,9 +57,9 @@ def _pairwise_rank_accuracy(
             )
         pair_valid_mask &= valid_mask[:, pair_i] & valid_mask[:, pair_j]
     if not pair_valid_mask.any():
-        return float("nan")
+        return 0, 0
     correct = torch.sign(pred_diff[pair_valid_mask]) == torch.sign(target_diff[pair_valid_mask])
-    return float(correct.float().mean().item())
+    return int(correct.sum().item()), int(pair_valid_mask.sum().item())
 
 
 def _abs_rel_degradation_targets(
@@ -160,9 +160,10 @@ def _summarize_epoch_vectors(
 
     target_loss = cat_vectors.get("target_ssi_loss")
     camera_bias = cat_vectors.get("camera_bias")
-    abs_rel_degradation = cat_vectors.get("abs_rel_degradation")
     rmse_degradation = cat_vectors.get("rmse_degradation")
     q_score = cat_vectors.get("q_score")
+    candidate_abs_rel = cat_vectors.get("candidate_abs_rel")
+    canonical_abs_rel = cat_vectors.get("canonical_abs_rel")
 
     if target_loss is not None and camera_bias is not None:
         metrics.update(
@@ -173,17 +174,21 @@ def _summarize_epoch_vectors(
                 max_samples=max_samples,
             )
         )
-    if abs_rel_degradation is not None and camera_bias is not None:
+    if camera_bias is not None and candidate_abs_rel is not None and canonical_abs_rel is not None:
+        targets, valid_mask = _abs_rel_degradation_targets(
+            camera_bias,
+            candidate_abs_rel,
+            canonical_abs_rel,
+        )
         metrics.update(
             compute_vector_masked_correlations(
-                abs_rel_degradation,
+                targets["abs_rel_degradation"],
                 camera_bias,
+                valid_mask=valid_mask,
                 prefix="bias_vs_abs_rel_degradation",
                 max_samples=max_samples,
             )
         )
-    candidate_abs_rel = cat_vectors.get("candidate_abs_rel")
-    canonical_abs_rel = cat_vectors.get("canonical_abs_rel")
     if q_score is not None and candidate_abs_rel is not None and canonical_abs_rel is not None:
         metrics.update(
             _degradation_correlation_metrics(
@@ -194,10 +199,19 @@ def _summarize_epoch_vectors(
             )
         )
     if rmse_degradation is not None and q_score is not None:
+        rmse_valid_mask = torch.isfinite(rmse_degradation) & (rmse_degradation != -1.0)
+        if candidate_abs_rel is not None and canonical_abs_rel is not None:
+            _, abs_rel_valid_mask = _abs_rel_degradation_targets(
+                q_score,
+                candidate_abs_rel,
+                canonical_abs_rel,
+            )
+            rmse_valid_mask &= abs_rel_valid_mask
         metrics.update(
             compute_vector_masked_correlations(
                 rmse_degradation,
                 q_score,
+                valid_mask=rmse_valid_mask,
                 prefix="q_vs_rmse_degradation",
                 max_samples=max_samples,
             )
@@ -249,9 +263,9 @@ def train_one_epoch(
         "mean_loss": 0.0,
         "variance_loss": 0.0,
         "ranking_loss": 0.0,
-        "q_rank_accuracy": 0.0,
     }
-    rank_accuracy_count = 0
+    rank_correct = 0
+    rank_total = 0
     processed_batches = 0
     vectors: dict[str, list[torch.Tensor]] = {
         "target_ssi_loss": [],
@@ -342,14 +356,13 @@ def train_one_epoch(
                 & (group_candidate_abs_rel >= 0)
                 & (group_canonical_abs_rel >= 0)
             )
-            rank_accuracy = _pairwise_rank_accuracy(
+            batch_rank_correct, batch_rank_total = _pairwise_rank_counts(
                 group_q,
                 group_degradation,
                 valid_mask=group_valid_mask,
             )
-            if torch.isfinite(torch.tensor(rank_accuracy)):
-                running["q_rank_accuracy"] += rank_accuracy
-                rank_accuracy_count += 1
+            rank_correct += batch_rank_correct
+            rank_total += batch_rank_total
 
             batch_vectors = {
                 "target_ssi_loss": target_loss,
@@ -377,7 +390,7 @@ def train_one_epoch(
             avg=f"{running['loss'] / n:.4f}",
             ssi=f"{_finite_mean(target_loss):.4f}",
             deg=f"{_finite_mean(abs_rel_degradation):.4f}",
-            q_acc=f"{running['q_rank_accuracy'] / max(rank_accuracy_count, 1):.4f}",
+            q_acc=f"{rank_correct / max(rank_total, 1):.4f}",
         )
 
         if log_interval > 0 and step % log_interval == 0:
@@ -396,8 +409,7 @@ def train_one_epoch(
     epoch_metrics = {
         key: value / n
         for key, value in running.items()
-        if key != "q_rank_accuracy"
     }
-    epoch_metrics["q_rank_accuracy"] = running["q_rank_accuracy"] / max(rank_accuracy_count, 1)
+    epoch_metrics["q_rank_accuracy"] = rank_correct / rank_total if rank_total > 0 else float("nan")
     epoch_metrics.update(_summarize_epoch_vectors(vectors, correlation_max_samples))
     return epoch_metrics, global_step

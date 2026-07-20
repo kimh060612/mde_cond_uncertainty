@@ -5,6 +5,11 @@ dataset:
   min_depth: 1e-3
   max_depth: 10.0
   min_valid_depth_ratio: 0.9
+  min_registration_overlap_ratio: 0.95
+  min_registration_ecc_score: 0.97
+  max_pair_time_diff_sec: 0.05
+  max_registration_translation_px: 32.0
+  abs_rel_degradation_quantile: 0.99
   output_dir: ./da2_ati_cond_uncertainty_ckpt
   num_workers: 8
   exposure_min: 4000

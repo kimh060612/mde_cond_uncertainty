@@ -161,13 +161,18 @@ class PairedResizeToTensor:
     def __init__(
         self,
         size: tuple[int, int] | None = None,
+        image_processor: Any | None = None,
     ) -> None:
         """
         Args:
             size:
                 (height, width). None이면 원본 크기를 유지합니다.
+            image_processor:
+                CSV metric 생성에 사용한 Hugging Face image processor.
+                지정하면 processor의 resize/rescale/normalize를 그대로 사용합니다.
         """
         self.size = size
+        self.image_processor = image_processor
 
     @staticmethod
     def _to_tensor(image: Image.Image) -> torch.Tensor:
@@ -185,6 +190,13 @@ class PairedResizeToTensor:
         candidate_image: Image.Image,
         _: Mapping[str, Any],
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.image_processor is not None:
+            pixel_values = self.image_processor(
+                images=[canonical_image, candidate_image],
+                return_tensors="pt",
+            )["pixel_values"]
+            return pixel_values[0], pixel_values[1]
+
         if self.size is not None:
             height, width = self.size
             resize_size = (width, height)
@@ -302,6 +314,9 @@ class FoundationCameraGroupedDataset(Dataset[dict[str, Any]]):
         min_overlap_ratio: float | None = None,
         min_ecc_score: float | None = None,
         max_time_diff_sec: float | None = None,
+        max_registration_translation_px: float | None = None,
+        abs_rel_degradation_quantile: float | None = None,
+        use_all_candidates: bool = False,
         topologies: Sequence[str] | None = None,
         validate_optional_pair_columns: bool = True,
         min_depth: float = 1e-3,
@@ -318,6 +333,8 @@ class FoundationCameraGroupedDataset(Dataset[dict[str, Any]]):
             raise ValueError("candidates_per_group must be at least 2.")
         if candidate_sampling not in {"random", "parameter_diverse"}:
             raise ValueError("candidate_sampling must be 'random' or 'parameter_diverse'.")
+        if abs_rel_degradation_quantile is not None and not 0 < abs_rel_degradation_quantile <= 1:
+            raise ValueError("abs_rel_degradation_quantile must be in (0, 1].")
 
         if isinstance(csv_paths, (str, Path)):
             csv_paths = [csv_paths]
@@ -401,9 +418,41 @@ class FoundationCameraGroupedDataset(Dataset[dict[str, Any]]):
                 raise ValueError("time_diff_sec is absent from CSV.")
             table = table.loc[table["time_diff_sec"].abs() <= max_time_diff_sec]
 
+        if max_registration_translation_px is not None:
+            translation_columns = {"registration_dx_px", "registration_dy_px"}
+            if not translation_columns.issubset(table.columns):
+                raise ValueError("registration_dx_px/registration_dy_px are absent from CSV.")
+            translation = np.hypot(
+                table["registration_dx_px"],
+                table["registration_dy_px"],
+            )
+            table = table.loc[np.isfinite(translation) & (translation <= max_registration_translation_px)]
+
         if self.topologies is not None:
             topology_set = set(self.topologies)
             table = table.loc[table["scene"].map(lambda scene: _topology_from_scene(scene) in topology_set)]
+
+        metric_columns = (
+            "source_metric_abs_rel",
+            "canonical_metric_abs_rel",
+            "performance_degradation_abs_rel",
+        )
+        metric_values = table.loc[:, metric_columns].apply(pd.to_numeric, errors="coerce")
+        table = table.loc[
+            np.isfinite(metric_values).all(axis=1)
+            & (metric_values["source_metric_abs_rel"] >= 0)
+            & (metric_values["canonical_metric_abs_rel"] >= 0)
+            & (metric_values["performance_degradation_abs_rel"] >= 0)
+        ].copy()
+
+        if abs_rel_degradation_quantile is not None:
+            upper_bound = table.groupby(
+                ["scene", "source_motion_label"],
+                sort=False,
+            )["performance_degradation_abs_rel"].transform(
+                lambda values: values.quantile(abs_rel_degradation_quantile)
+            )
+            table = table.loc[table["performance_degradation_abs_rel"] <= upper_bound]
 
         table = table.dropna(subset=["source_rgb_path", "matched_rgb_path", "matched_lap_dir", "matched_frame_index"]).reset_index(drop=True)
 
@@ -414,6 +463,7 @@ class FoundationCameraGroupedDataset(Dataset[dict[str, Any]]):
             raise ValueError("Missing group columns: " + ", ".join(sorted(missing_group_columns)))
 
         self.candidates_per_group = candidates_per_group
+        self.use_all_candidates = use_all_candidates
         self.candidate_sampling = candidate_sampling
         self.pair_transform = pair_transform if pair_transform is not None else PairedResizeToTensor()
         self.path_replacements = dict(path_replacements or {})
@@ -634,6 +684,8 @@ class FoundationCameraGroupedDataset(Dataset[dict[str, Any]]):
         setting_ids: list[tuple[int, int]],
         rng: random.Random,
     ) -> list[tuple[int, int]]:
+        if self.use_all_candidates:
+            return setting_ids.copy()
         if self.candidate_sampling == "random":
             return self._sample_random_settings(setting_ids, rng)
 
@@ -851,8 +903,18 @@ class FoundationCameraGroupedDataset(Dataset[dict[str, Any]]):
 
         if self.load_depth:
             canonical_depth = self._load_depth(canonical_depth_path, depth_scale=self.depth_scale)
+            canonical_valid_mask = (
+                torch.isfinite(canonical_depth)
+                & (canonical_depth > self.min_depth)
+                & (canonical_depth < self.max_depth)
+            )
+            canonical_depth = torch.where(
+                canonical_valid_mask,
+                canonical_depth,
+                torch.zeros_like(canonical_depth),
+            )
             result["canonical_depths"] = canonical_depth.unsqueeze(0).expand(
-                self.candidates_per_group, *canonical_depth.shape
+                len(selected_rows), *canonical_depth.shape
             ).clone()
 
             result["candidate_depths"] = torch.stack(
@@ -864,7 +926,7 @@ class FoundationCameraGroupedDataset(Dataset[dict[str, Any]]):
             valid_mask &= depth > self.min_depth
             valid_mask &= depth < self.max_depth
             depth = torch.nan_to_num(depth, nan=0.0, posinf=0.0, neginf=0.0)
-            result["candidate_depths"] = depth
+            result["candidate_depths"] = torch.where(valid_mask, depth, torch.zeros_like(depth))
             result["candidate_valid_mask"] = valid_mask
 
         return result

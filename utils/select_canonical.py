@@ -219,6 +219,7 @@ class SelectCanonicalandMatchFrames:
             MODEL_ID,
             cache_dir=HF_CACHE_DIR,
             local_files_only=LOCAL_FILES_ONLY,
+            use_fast=False,
         )
         model = AutoModelForDepthEstimation.from_pretrained(
             MODEL_ID,
