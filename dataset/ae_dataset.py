@@ -270,7 +270,7 @@ class AutoExposureMotionDataset(Dataset):
         item = self.items[idx]
 
         image = Image.open(item.rgb_path).convert("RGB")
-        depth = self._load_depth(item.depth_path)
+        depth = self._load_depth(item.depth_path) / 1000.0
 
         if self.image_size is not None:
             height, width = self.image_size

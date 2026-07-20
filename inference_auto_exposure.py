@@ -225,7 +225,7 @@ def evaluate(
             device=device,
             dtype=torch.float32,
             non_blocking=True,
-        ) / 1000.
+        ) 
         valid_mask = valid_mask.to(device=device, dtype=torch.bool, non_blocking=True)
 
         with torch.autocast(
