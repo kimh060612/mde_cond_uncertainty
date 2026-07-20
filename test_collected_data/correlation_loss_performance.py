@@ -33,6 +33,7 @@ from model.loss_fn import (  # noqa: E402
 from model.loss_target import (  # noqa: E402
     ordinal_structure_failure,
     ssi_independent_depth_loss,
+    ssi_independent_meter_space_depth_loss,
 )
 
 
@@ -485,9 +486,17 @@ def collect_loss_values(
     softplus: bool,
     max_batches: int | None,
     strict: bool,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict[str, object]]:
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    dict[str, object],
+]:
     log_losses: list[torch.Tensor] = []
     ssi_independent_losses: list[torch.Tensor] = []
+    ssi_independent_meter_space_losses: list[torch.Tensor] = []
     abs_rel_degradations: list[torch.Tensor] = []
     ordinal_losses: list[torch.Tensor] = []
 
@@ -579,6 +588,12 @@ def collect_loss_values(
                 candidate_gt_depth,
                 canonical_gt_depth,
             )
+            ssi_independent_meter_space_loss = ssi_independent_meter_space_depth_loss(
+                candidate_depth,
+                canonical_depth,
+                candidate_gt_depth,
+                canonical_gt_depth,
+            )
             failure, _ = ordinal_structure_failure(
                 source_depth=candidate_depth,
                 canonical_depth=canonical_depth,
@@ -592,6 +607,9 @@ def collect_loss_values(
 
             log_losses.append(log_loss.detach().cpu().float())
             ssi_independent_losses.append(ssi_independent_loss.detach().cpu().float())
+            ssi_independent_meter_space_losses.append(
+                ssi_independent_meter_space_loss.detach().cpu().float()
+            )
             abs_rel_degradations.append(degradation.cpu())
             ordinal_losses.append(failure.detach().cpu().float())
 
@@ -604,6 +622,7 @@ def collect_loss_values(
             progress.set_postfix(
                 log=f"{finite_stats(log_loss)[0]:.4f}",
                 ssi=f"{finite_stats(ssi_independent_loss)[0]:.4f}",
+                meter=f"{finite_stats(ssi_independent_meter_space_loss)[0]:.4f}",
                 deg=f"{finite_stats(degradation)[0]:.4f}",
             )
         except Exception:
@@ -617,6 +636,7 @@ def collect_loss_values(
     return (
         torch.cat(log_losses, dim=0),
         torch.cat(ssi_independent_losses, dim=0),
+        torch.cat(ssi_independent_meter_space_losses, dim=0),
         torch.cat(abs_rel_degradations, dim=0),
         torch.cat(ordinal_losses, dim=0),
         counters,
@@ -685,7 +705,14 @@ def main() -> None:
         f"inference_batch_size={args.inference_batch_size}"
     )
 
-    log_losses, ssi_independent_losses, degradations, ordinal_losses, counters = collect_loss_values(
+    (
+        log_losses,
+        ssi_independent_losses,
+        ssi_independent_meter_space_losses,
+        degradations,
+        ordinal_losses,
+        counters,
+    ) = collect_loss_values(
         model=model,
         processor=processor,
         loader=loader,
@@ -728,6 +755,13 @@ def main() -> None:
         summarize_loss_correlation(
             loss_name="ssi_independent_depth_loss",
             loss_values=ssi_independent_losses,
+            degradation_values=degradations,
+            metadata=metadata,
+            max_samples=args.correlation_max_samples,
+        ),
+        summarize_loss_correlation(
+            loss_name="ssi_independent_meter_space_depth_loss",
+            loss_values=ssi_independent_meter_space_losses,
             degradation_values=degradations,
             metadata=metadata,
             max_samples=args.correlation_max_samples,

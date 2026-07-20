@@ -5,6 +5,9 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
+from evaluation_utils.eval_utils import (
+    align_relative_prediction_to_depth_space,
+)
 
 
 def _ensure_bchw(x: torch.Tensor) -> torch.Tensor:
@@ -316,6 +319,68 @@ def ssi_independent_depth_loss(
         comparison_valid,
         (aligned[:, 0] - aligned[:, 1]).abs(),
         torch.zeros_like(aligned[:, 0]),
+    )
+    loss = difference.flatten(1).sum(dim=1) / valid_counts.clamp_min(1)
+    return torch.where(
+        valid_counts > 0,
+        loss,
+        torch.full_like(loss, float("nan")),
+    )
+
+
+def ssi_independent_meter_space_depth_loss(
+    candidate_depth: torch.Tensor,
+    canonical_depth: torch.Tensor,
+    candidate_gt_depth: torch.Tensor,
+    canonical_gt_depth: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    candidate_depth = _ensure_bchw(candidate_depth)
+    canonical_depth = _ensure_bchw(canonical_depth)
+    candidate_gt_depth = _ensure_bchw(candidate_gt_depth)
+    canonical_gt_depth = _ensure_bchw(canonical_gt_depth)
+
+    candidate_valid = (
+        torch.isfinite(candidate_depth)
+        & torch.isfinite(candidate_gt_depth)
+        & (candidate_depth > 0)
+        & (candidate_gt_depth > 0)
+    )
+    canonical_valid = (
+        torch.isfinite(canonical_depth)
+        & torch.isfinite(canonical_gt_depth)
+        & (canonical_depth > 0)
+        & (canonical_gt_depth > 0)
+    )
+
+    candidate_meter_depth = align_relative_prediction_to_depth_space(
+        candidate_depth,
+        candidate_gt_depth,
+        candidate_valid,
+        align_mode="scale_shift",
+        eps=eps,
+    )["depth"]
+    canonical_meter_depth = align_relative_prediction_to_depth_space(
+        canonical_depth,
+        canonical_gt_depth,
+        canonical_valid,
+        align_mode="scale_shift",
+        eps=eps,
+    )["depth"]
+
+    comparison_valid = (
+        candidate_valid
+        & canonical_valid
+        & torch.isfinite(candidate_meter_depth)
+        & torch.isfinite(canonical_meter_depth)
+        & (candidate_meter_depth > 0)
+        & (canonical_meter_depth > 0)
+    )
+    valid_counts = comparison_valid.flatten(1).sum(dim=1)
+    difference = torch.where(
+        comparison_valid,
+        (candidate_meter_depth - canonical_meter_depth).abs(),
+        torch.zeros_like(candidate_meter_depth),
     )
     loss = difference.flatten(1).sum(dim=1) / valid_counts.clamp_min(1)
     return torch.where(
