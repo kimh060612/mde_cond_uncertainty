@@ -49,10 +49,10 @@ training:
   freeze_backbone: true
   min_log_var: -9.21
   max_log_var: -1.39
-  initial_std: 0.5
+  initial_std: 0.07
   variance_head_init_std: 1e-3
   max_bias: 0.5
-  listnet_temperature: 0.1
+  listnet_temperature: 0.02
   list_loss_weight: 0.1
   lambda_variance: 1.0
   lambda_smooth_logvar: 1e-3

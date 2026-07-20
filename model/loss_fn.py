@@ -501,7 +501,7 @@ def scalar_heteroscedastic_loss(
         zero = predicted_mean.sum() * 0.0 + variance.sum() * 0.0
         return zero, zero
 
-    mean_loss = F.smooth_l1_loss(predicted_mean[valid_mask], target[valid_mask], beta=0.1)
+    mean_loss = F.smooth_l1_loss(predicted_mean[valid_mask], target[valid_mask], beta=0.05)
     safe_variance = variance[valid_mask].clamp_min(1e-8)
     detached_residual2 = (target[valid_mask] - predicted_mean[valid_mask].detach()).square()
     variance_loss = 0.5 * (detached_residual2 / safe_variance + torch.log(safe_variance))
