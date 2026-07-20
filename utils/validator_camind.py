@@ -12,7 +12,7 @@ from model.loss_fn import (
     scale_shift_invariant_depth_loss,
     signed_pairwise_ranknet_loss,
 )
-from model.loss_target import ssi_independent_depth_loss
+from model.loss_target import ssi_independent_depth_loss, ssi_independent_meter_space_depth_loss
 from utils.train_utils import reshape_group_batch, tensor_device
 
 
@@ -499,7 +499,7 @@ def validate(
                 camera_context,
                 target_size=candidate_imgs.shape[-2:],
             )
-            target_loss = ssi_independent_depth_loss(
+            target_loss = ssi_independent_meter_space_depth_loss(
                 out["candidate_depth"],
                 out["canonical_depth"],
                 candidate_gt_depth,
