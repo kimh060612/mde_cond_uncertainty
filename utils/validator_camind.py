@@ -112,6 +112,7 @@ def _degradation_correlation_metrics(
     candidate_abs_rel: torch.Tensor,
     canonical_abs_rel: torch.Tensor,
     max_samples: int,
+    score_name: str,
 ) -> Dict[str, float]:
     targets, valid_mask = _abs_rel_degradation_targets(
         predicted_score,
@@ -125,67 +126,11 @@ def _degradation_correlation_metrics(
                 target,
                 predicted_score,
                 valid_mask=valid_mask,
-                prefix=f"q_vs_{target_name}",
+                prefix=f"{score_name}_vs_{target_name}",
                 max_samples=max_samples,
             )
         )
     return metrics
-
-
-def _condition_groupwise_correlation_metrics(
-    predicted_score: torch.Tensor,
-    candidate_abs_rel: torch.Tensor,
-    canonical_abs_rel: torch.Tensor,
-    scene_id: torch.Tensor,
-    motion_id: torch.Tensor,
-    light_id: torch.Tensor,
-    max_samples: int,
-) -> Dict[str, float]:
-    """Macro-average correlations over (scene, motion, light) conditions."""
-    predicted_score = predicted_score.detach().float().flatten()
-    candidate_abs_rel = candidate_abs_rel.detach().float().flatten()
-    canonical_abs_rel = canonical_abs_rel.detach().float().flatten()
-    conditions = torch.stack(
-        [scene_id.flatten(), motion_id.flatten(), light_id.flatten()],
-        dim=1,
-    )
-    if not (
-        predicted_score.shape
-        == candidate_abs_rel.shape
-        == canonical_abs_rel.shape
-        == conditions[:, 0].shape
-    ):
-        raise ValueError("condition metadata must have the same sample count as predicted_score")
-    condition_valid = torch.isfinite(conditions).all(dim=1)
-    metric_keys = tuple(
-        f"q_vs_{target_name}_{correlation_name}"
-        for target_name in (
-            "abs_rel_degradation",
-            "abs_rel_degradation_percent",
-            "abs_rel_degradation_log",
-        )
-        for correlation_name in ("pearson", "spearman")
-    )
-    correlation_values: dict[str, list[float]] = {key: [] for key in metric_keys}
-
-    for condition in torch.unique(conditions[condition_valid], dim=0):
-        condition_mask = condition_valid & (conditions == condition).all(dim=1)
-        condition_metrics = _degradation_correlation_metrics(
-            predicted_score[condition_mask],
-            candidate_abs_rel[condition_mask],
-            canonical_abs_rel[condition_mask],
-            max_samples,
-        )
-        for key, value in condition_metrics.items():
-            if torch.isfinite(torch.tensor(value)):
-                correlation_values[key].append(value)
-
-    return {
-        f"condition_groupwise_mean_{key}": (
-            float(torch.tensor(values).mean().item()) if values else float("nan")
-        )
-        for key, values in correlation_values.items()
-    }
 
 
 def _selection_metrics(
@@ -295,9 +240,6 @@ def _new_accumulator() -> dict:
             "abs_rel_degradation": [],
             "rmse_degradation": [],
             "group_id": [],
-            "scene_id": [],
-            "motion_id": [],
-            "light_id": [],
         },
     }
 
@@ -342,7 +284,7 @@ def _finalize_accumulator(
         key: torch.cat(values, dim=0) if values else None
         for key, values in accumulator["vectors"].items()
     }
-    metadata_keys = {"group_id", "scene_id", "motion_id", "light_id"}
+    metadata_keys = {"group_id"}
     for key, value in cat_vectors.items():
         if value is not None and key != "rmse_degradation" and key not in metadata_keys:
             metrics[key] = _finite_mean(value)
@@ -364,24 +306,16 @@ def _finalize_accumulator(
             )
         )
     if camera_bias is not None and candidate_abs_rel is not None and canonical_abs_rel is not None:
-        targets, valid_mask = _abs_rel_degradation_targets(
-            camera_bias,
-            candidate_abs_rel,
-            canonical_abs_rel,
-        )
         metrics.update(
-            compute_vector_masked_correlations(
-                targets["abs_rel_degradation"],
+            _degradation_correlation_metrics(
                 camera_bias,
-                valid_mask=valid_mask,
-                prefix="bias_vs_abs_rel_degradation",
-                max_samples=max_samples,
+                candidate_abs_rel,
+                canonical_abs_rel,
+                max_samples,
+                score_name="bias",
             )
         )
     group_id = cat_vectors.get("group_id")
-    scene_id = cat_vectors.get("scene_id")
-    motion_id = cat_vectors.get("motion_id")
-    light_id = cat_vectors.get("light_id")
     if q_score is not None and candidate_abs_rel is not None and canonical_abs_rel is not None:
         metrics.update(
             _degradation_correlation_metrics(
@@ -389,6 +323,7 @@ def _finalize_accumulator(
                 candidate_abs_rel,
                 canonical_abs_rel,
                 max_samples,
+                score_name="q",
             )
         )
         if group_id is not None:
@@ -398,18 +333,6 @@ def _finalize_accumulator(
                     candidate_abs_rel,
                     canonical_abs_rel,
                     group_id,
-                )
-            )
-        if scene_id is not None and motion_id is not None and light_id is not None:
-            metrics.update(
-                _condition_groupwise_correlation_metrics(
-                    q_score,
-                    candidate_abs_rel,
-                    canonical_abs_rel,
-                    scene_id,
-                    motion_id,
-                    light_id,
-                    max_samples,
                 )
             )
     if rmse_degradation is not None and q_score is not None:
@@ -461,7 +384,6 @@ def validate(
     total_accumulator = _new_accumulator()
     seen_accumulator = _new_accumulator()
     unseen_accumulator = _new_accumulator()
-    scene_ids: dict[str, int] = {}
 
     progress_bar = tqdm(
         loader,
@@ -560,19 +482,11 @@ def validate(
         )
 
         group_info = batch["info"].to(device=device)
-        batch_scene_ids = torch.tensor(
-            [scene_ids.setdefault(str(scene), len(scene_ids)) for scene in batch["scene"]],
-            device=device,
-            dtype=torch.float32,
-        )
         batch_vectors.update(
             {
                 "group_id": batch["group_index"].to(device=device)[:, None]
                 .expand(-1, num_candidates)
                 .reshape(-1),
-                "scene_id": batch_scene_ids[:, None].expand(-1, num_candidates).reshape(-1),
-                "motion_id": group_info[:, 3:4].expand(-1, num_candidates).reshape(-1),
-                "light_id": group_info[:, 2:3].expand(-1, num_candidates).reshape(-1),
             }
         )
 
