@@ -47,8 +47,8 @@ training:
   lr_uncertainty: 1e-4
   weight_decay: 1e-4
   freeze_backbone: true
-  min_log_var: -2.5
-  max_log_var: 1.0
+  min_log_var: -9.21
+  max_log_var: -1.39
   initial_std: 0.5
   variance_head_init_std: 1e-3
   max_bias: 0.5
