@@ -249,19 +249,19 @@ def main():
                 canonical_rgb_path = row["matched_rgb_path"]
                 source_depth_path = row["source_depth_path"]
                 canonical_depth_path = row["matched_depth_path"]
-                source_rgb = Image.open(source_rgb_path).convert("RGB").copy()
-                canonical_rgb = Image.open(canonical_rgb_path).convert("RGB").copy()
+                source_rgb = np.asarray(Image.open(source_rgb_path).convert("RGB").copy())
+                canonical_rgb = np.asarray(Image.open(canonical_rgb_path).convert("RGB").copy())
                 candidate_gt_depth = _load_depth(Path(source_depth_path), depth_scale=1000.0).unsqueeze(0).reshape(-1, source_rgb.shape[1], source_rgb.shape[2]).to(device)
                 canonical_gt_depth = _load_depth(Path(canonical_depth_path), depth_scale=1000.0).unsqueeze(0).reshape(-1, source_rgb.shape[1], source_rgb.shape[2]).to(device)
                 
                 candidate_pixel_values = prepare_pixel_values(
-                    torch.tensor(np.array(source_rgb)).permute(2, 0, 1).unsqueeze(0),
+                    torch.tensor(source_rgb).permute(2, 0, 1).unsqueeze(0),
                     processor=processor,
                     device=device,
                     normalize=True,
                 )
                 canonical_pixel_values = prepare_pixel_values(
-                    torch.tensor(np.array(canonical_rgb)).permute(2, 0, 1).unsqueeze(0),
+                    torch.tensor(canonical_rgb).permute(2, 0, 1).unsqueeze(0),
                     processor=processor,
                     device=device,
                     normalize=True,
