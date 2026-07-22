@@ -286,8 +286,8 @@ def main():
                 ssi_independent_meter_space_loss = ssi_independent_meter_space_depth_loss(
                     candidate_depth,
                     canonical_depth,
-                    candidate_gt_depth,
-                    canonical_gt_depth,
+                    candidate_gt_depth.unsqueeze(1),
+                    canonical_gt_depth.unsqueeze(1),
                 )
                 distribution_ssi_target_loss[f"{motion_cond}_{lighting_cond}"][topology_type].append(ssi_independent_meter_space_loss.item())
                 ratio_Abs_rel_degrade = (row["source_metric_abs_rel"] - canonical_abs_rel) / canonical_abs_rel * 100.
