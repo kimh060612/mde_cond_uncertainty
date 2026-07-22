@@ -10,11 +10,19 @@ from tqdm.auto import tqdm
 
 import seaborn as sns
 import matplotlib.pyplot as plt
-from model.dav2_model import MODEL_IDS  # noqa: E402
 from model.loss_target import ssi_independent_meter_space_depth_loss
 
 ### Unseen/Seen Degrade Distribution 차이 plotting
 import sys
+
+MODEL_IDS = {
+    "small": "depth-anything/Depth-Anything-V2-Small-hf",
+    "base": "depth-anything/Depth-Anything-V2-Base-hf",
+    "metric-indoor-small": "depth-anything/Depth-Anything-V2-Metric-Indoor-Small-hf",
+    "metric-indoor-base": "depth-anything/Depth-Anything-V2-Metric-Indoor-Base-hf",
+    "metric-outdoor-small": "depth-anything/Depth-Anything-V2-Metric-Outdoor-Small-hf",
+    "metric-outdoor-base": "depth-anything/Depth-Anything-V2-Metric-Outdoor-Base-hf",
+}
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
