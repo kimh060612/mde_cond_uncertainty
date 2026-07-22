@@ -251,8 +251,8 @@ def main():
                 canonical_depth_path = row["matched_depth_path"]
                 source_rgb = np.asarray(Image.open(source_rgb_path).convert("RGB").copy())
                 canonical_rgb = np.asarray(Image.open(canonical_rgb_path).convert("RGB").copy())
-                candidate_gt_depth = _load_depth(Path(source_depth_path), depth_scale=1000.0).unsqueeze(0).reshape(-1, source_rgb.shape[1], source_rgb.shape[2]).to(device)
-                canonical_gt_depth = _load_depth(Path(canonical_depth_path), depth_scale=1000.0).unsqueeze(0).reshape(-1, source_rgb.shape[1], source_rgb.shape[2]).to(device)
+                candidate_gt_depth = _load_depth(Path(source_depth_path), depth_scale=1000.0).unsqueeze(0).to(device)
+                canonical_gt_depth = _load_depth(Path(canonical_depth_path), depth_scale=1000.0).unsqueeze(0).to(device)
                 
                 candidate_pixel_values = prepare_pixel_values(
                     torch.tensor(source_rgb).permute(2, 0, 1).unsqueeze(0),
@@ -283,6 +283,7 @@ def main():
                     softplus=True,
                 )
                 
+                print(candidate_depth.shape, canonical_depth.shape, candidate_gt_depth.shape, canonical_gt_depth.shape)
                 ssi_independent_meter_space_loss = ssi_independent_meter_space_depth_loss(
                     candidate_depth,
                     canonical_depth,
