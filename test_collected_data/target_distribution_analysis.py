@@ -283,7 +283,6 @@ def main():
                     softplus=True,
                 )
                 
-                print(candidate_depth.shape, canonical_depth.shape, candidate_gt_depth.shape, canonical_gt_depth.shape)
                 ssi_independent_meter_space_loss = ssi_independent_meter_space_depth_loss(
                     candidate_depth,
                     canonical_depth,
