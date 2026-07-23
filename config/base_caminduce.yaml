@@ -62,6 +62,7 @@ training:
   wandb_project: mde_uncertainty_measure
   wandb_name: dav2_cond_uncertainty
   uncertainty_mode: "mean"
+  uncertainty_alpha: 1.0
   disable_wandb: false
   no_amp: true
   log_interval: 20
@@ -73,3 +74,13 @@ training:
   lr_scheduler_threshold: 1e-4
   lr_scheduler_cooldown: 0
   lr_scheduler_min_lr_ratio: 0.05
+
+evaluation:
+  csv_path: /media/michael/ssd1/AIoT_ATI/analytics_realworld_dataset/orbbec
+  dataset_root: /media/michael/ssd1/AIoT_ATI/orbbec_realworld_dataset
+  min_camera_settings: 10
+  relative_regret_thresholds_percent: [3.0, 5.0, 10.0]
+  alpha_sweep_values: [0.0, 0.1, 0.3, 0.5, 0.7, 1.0]
+  inference_batch_size: 8
+  checkpoint_path: null
+  output_dir: ./selection_evaluation

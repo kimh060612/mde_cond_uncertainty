@@ -1,6 +1,15 @@
+from collections.abc import Sequence
 from typing import Dict, Tuple, Optional
 import math
 import torch
+
+from evaluation_utils.eval_selection import (
+    DEFAULT_RELATIVE_REGRET_THRESHOLDS,
+    compute_selection_metrics,
+)
+
+
+DEGRADATION_EPS = 1e-6
 
 
 def depth_error_maps(
@@ -216,3 +225,306 @@ def _mean_finite_metrics(metric_sums, metric_counts):
         for key in metric_sums
         if metric_counts.get(key, 0) > 0
     }
+
+
+def finite_mean(values: torch.Tensor) -> float:
+    values = values.detach().float().flatten()
+    finite_mask = torch.isfinite(values)
+    if not finite_mask.any():
+        return float("nan")
+    return float(values[finite_mask].mean().item())
+
+
+def pairwise_rank_counts(
+    predicted_score: torch.Tensor,
+    target_score: torch.Tensor,
+    valid_mask: torch.Tensor | None = None,
+) -> tuple[int, int]:
+    _, num_candidates = predicted_score.shape
+    if num_candidates < 2:
+        return 0, 0
+
+    pair_i, pair_j = torch.triu_indices(
+        num_candidates,
+        num_candidates,
+        offset=1,
+        device=predicted_score.device,
+    )
+    pred_diff = predicted_score[:, pair_i] - predicted_score[:, pair_j]
+    target_diff = target_score[:, pair_i] - target_score[:, pair_j]
+    pair_valid_mask = (
+        torch.isfinite(pred_diff)
+        & torch.isfinite(target_diff)
+        & (target_diff != 0)
+    )
+    if valid_mask is not None:
+        valid_mask = valid_mask.bool()
+        if valid_mask.shape != predicted_score.shape:
+            raise ValueError(
+                f"valid_mask shape {tuple(valid_mask.shape)} does not match "
+                f"predicted_score shape {tuple(predicted_score.shape)}"
+            )
+        pair_valid_mask &= valid_mask[:, pair_i] & valid_mask[:, pair_j]
+    if not pair_valid_mask.any():
+        return 0, 0
+
+    correct = (
+        torch.sign(pred_diff[pair_valid_mask])
+        == torch.sign(target_diff[pair_valid_mask])
+    )
+    return int(correct.sum().item()), int(pair_valid_mask.sum().item())
+
+
+def abs_rel_degradation_targets(
+    predicted_score: torch.Tensor,
+    candidate_abs_rel: torch.Tensor,
+    canonical_abs_rel: torch.Tensor,
+    eps: float = DEGRADATION_EPS,
+) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
+    """Build AbsRel degradation targets with one shared validity mask."""
+    predicted_score = predicted_score.detach().float().flatten()
+    candidate_abs_rel = candidate_abs_rel.detach().float().flatten()
+    canonical_abs_rel = canonical_abs_rel.detach().float().flatten()
+    if not (
+        predicted_score.shape
+        == candidate_abs_rel.shape
+        == canonical_abs_rel.shape
+    ):
+        raise ValueError(
+            "predicted_score, candidate_abs_rel, and canonical_abs_rel must "
+            "have the same flattened shape"
+        )
+
+    valid_mask = (
+        torch.isfinite(predicted_score)
+        & torch.isfinite(candidate_abs_rel)
+        & torch.isfinite(canonical_abs_rel)
+        & (candidate_abs_rel >= 0)
+        & (canonical_abs_rel >= 0)
+    )
+    absolute = candidate_abs_rel - canonical_abs_rel
+    percentage = absolute / (canonical_abs_rel + eps) * 100.0
+    log_ratio = (
+        torch.log(candidate_abs_rel + eps)
+        - torch.log(canonical_abs_rel + eps)
+    )
+    valid_mask &= (
+        torch.isfinite(absolute)
+        & torch.isfinite(percentage)
+        & torch.isfinite(log_ratio)
+    )
+    return {
+        "abs_rel_degradation": absolute,
+        "abs_rel_degradation_percent": percentage,
+        "abs_rel_degradation_log": log_ratio,
+    }, valid_mask
+
+
+def degradation_correlation_metrics(
+    predicted_score: torch.Tensor,
+    candidate_abs_rel: torch.Tensor,
+    canonical_abs_rel: torch.Tensor,
+    max_samples: int,
+    score_name: str,
+) -> Dict[str, float]:
+    from evaluation_utils.eval_metrics import (
+        compute_vector_masked_correlations,
+    )
+
+    targets, valid_mask = abs_rel_degradation_targets(
+        predicted_score,
+        candidate_abs_rel,
+        canonical_abs_rel,
+    )
+    metrics: Dict[str, float] = {}
+    for target_name, target in targets.items():
+        metrics.update(
+            compute_vector_masked_correlations(
+                target,
+                predicted_score,
+                valid_mask=valid_mask,
+                prefix=f"{score_name}_vs_{target_name}",
+                max_samples=max_samples,
+            )
+        )
+    return metrics
+
+
+def new_validation_accumulator() -> dict:
+    return {
+        "loss": 0.0,
+        "nll_loss": 0.0,
+        "mean_loss": 0.0,
+        "variance_loss": 0.0,
+        "ranking_loss": 0.0,
+        "processed_batches": 0,
+        "q_rank_correct": 0,
+        "q_rank_total": 0,
+        "vectors": {
+            "target_ssi_loss": [],
+            "camera_bias": [],
+            "sigma": [],
+            "q_score": [],
+            "candidate_abs_rel": [],
+            "canonical_abs_rel": [],
+            "abs_rel_degradation": [],
+            "rmse_degradation": [],
+            "group_id": [],
+        },
+    }
+
+
+def append_accumulator_vectors(
+    accumulator: dict,
+    sample_mask: torch.Tensor | None = None,
+    **items: torch.Tensor,
+) -> None:
+    for key, value in items.items():
+        value = value.detach().float().flatten()
+        if sample_mask is not None:
+            value = value[sample_mask]
+        if value.numel() > 0:
+            accumulator["vectors"][key].append(value.cpu())
+
+
+def add_rank_counts(
+    accumulator: dict,
+    rank_counts: tuple[int, int],
+) -> None:
+    correct, total = rank_counts
+    accumulator["q_rank_correct"] += correct
+    accumulator["q_rank_total"] += total
+
+
+def concatenate_accumulator_vectors(
+    accumulator: dict,
+) -> dict[str, torch.Tensor | None]:
+    return {
+        key: torch.cat(values, dim=0) if values else None
+        for key, values in accumulator["vectors"].items()
+    }
+
+
+def finalize_validation_accumulator(
+    accumulator: dict,
+    max_samples: int,
+    *,
+    selection_min_settings: int = 10,
+    selection_thresholds: Sequence[
+        float
+    ] = DEFAULT_RELATIVE_REGRET_THRESHOLDS,
+    concatenated_vectors: dict[str, torch.Tensor | None] | None = None,
+) -> Dict[str, float]:
+    from evaluation_utils.eval_metrics import (
+        compute_vector_masked_correlations,
+    )
+
+    metrics: Dict[str, float] = {}
+    processed_batches = accumulator["processed_batches"]
+    if processed_batches > 0:
+        for key in (
+            "loss",
+            "nll_loss",
+            "mean_loss",
+            "variance_loss",
+            "ranking_loss",
+        ):
+            metrics[key] = accumulator[key] / processed_batches
+
+    rank_total = accumulator["q_rank_total"]
+    if rank_total > 0:
+        metrics["q_rank_accuracy"] = (
+            accumulator["q_rank_correct"] / rank_total
+        )
+
+    vectors = (
+        concatenate_accumulator_vectors(accumulator)
+        if concatenated_vectors is None
+        else concatenated_vectors
+    )
+    for key, value in vectors.items():
+        if value is not None and key not in {"rmse_degradation", "group_id"}:
+            metrics[key] = finite_mean(value)
+
+    target_loss = vectors.get("target_ssi_loss")
+    camera_bias = vectors.get("camera_bias")
+    rmse_degradation = vectors.get("rmse_degradation")
+    q_score = vectors.get("q_score")
+    candidate_abs_rel = vectors.get("candidate_abs_rel")
+    canonical_abs_rel = vectors.get("canonical_abs_rel")
+    group_id = vectors.get("group_id")
+
+    if target_loss is not None and camera_bias is not None:
+        metrics.update(
+            compute_vector_masked_correlations(
+                target_loss,
+                camera_bias,
+                prefix="bias_vs_ssi_loss",
+                max_samples=max_samples,
+            )
+        )
+    if (
+        camera_bias is not None
+        and candidate_abs_rel is not None
+        and canonical_abs_rel is not None
+    ):
+        metrics.update(
+            degradation_correlation_metrics(
+                camera_bias,
+                candidate_abs_rel,
+                canonical_abs_rel,
+                max_samples,
+                score_name="bias",
+            )
+        )
+    if (
+        q_score is not None
+        and candidate_abs_rel is not None
+        and canonical_abs_rel is not None
+    ):
+        metrics.update(
+            degradation_correlation_metrics(
+                q_score,
+                candidate_abs_rel,
+                canonical_abs_rel,
+                max_samples,
+                score_name="q",
+            )
+        )
+        if group_id is not None:
+            selection_metrics = compute_selection_metrics(
+                q_score,
+                candidate_abs_rel,
+                group_id,
+                min_settings_per_group=selection_min_settings,
+                relative_regret_thresholds=selection_thresholds,
+            )
+            metrics.update(
+                {
+                    key: value
+                    for key, value in selection_metrics.items()
+                    if key != "num_groups"
+                }
+            )
+    if rmse_degradation is not None and q_score is not None:
+        rmse_valid_mask = (
+            torch.isfinite(rmse_degradation)
+            & (rmse_degradation != -1.0)
+        )
+        if candidate_abs_rel is not None and canonical_abs_rel is not None:
+            _, abs_rel_valid_mask = abs_rel_degradation_targets(
+                q_score,
+                candidate_abs_rel,
+                canonical_abs_rel,
+            )
+            rmse_valid_mask &= abs_rel_valid_mask
+        metrics.update(
+            compute_vector_masked_correlations(
+                rmse_degradation,
+                q_score,
+                valid_mask=rmse_valid_mask,
+                prefix="q_vs_rmse_degradation",
+                max_samples=max_samples,
+            )
+        )
+    return metrics

@@ -531,7 +531,10 @@ class FoundationCameraGroupedDataset(Dataset[dict[str, Any]]):
         self.group_keys = list(self.group_to_setting_rows.keys())
 
         if not self.group_keys:
-            raise ValueError(f"No eligible groups remain. Each canonical group needs at least {candidates_per_group} distinct exposure/gain settings.")
+            raise ValueError(
+                f"No eligible groups remain. Each canonical group needs at "
+                f"least {candidates_per_group} distinct exposure/gain settings."
+            )
 
     @property
     def condition_dim(self) -> int:
@@ -550,7 +553,10 @@ class FoundationCameraGroupedDataset(Dataset[dict[str, Any]]):
         values = {str(value) for value in table[column_name].dropna().unique()}
 
         if values and values != {expected_value}:
-            raise ValueError(f"Column '{column_name}' contains {values}, but this Dataset is configured for '{expected_value}'. Do not mix different foundation-model/camera pairs.")
+            raise ValueError(
+                f"Column '{column_name}' contains {values}, but this Dataset is configured for '{expected_value}'. "
+                "Do not mix different foundation-model/camera pairs."
+            )
 
     @property
     def pair_name(self) -> str:

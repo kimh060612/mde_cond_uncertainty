@@ -14,6 +14,7 @@ from dataset.ati_dataset_caminduce import (
     FoundationCameraGroupedDataset
 )
 from dataset.ati_dataset_caminduce import *
+from evaluation_utils.eval_selection import plot_selection_alpha_sweep
 from model.dav2_ati_model import MODEL_IDS
 from model.dav2_camerror_model import CameraInducedErrorModel
 from omegaconf import DictConfig, OmegaConf
@@ -115,7 +116,7 @@ def main(cfg: DictConfig):
         foundation_model_name=cfg.model.model_id,
         camera_model_name=cfg.model.camera_model_name,
         parameter_range=train_set.parameter_range,
-        candidates_per_group=cfg.training.candidates_per_group,
+        candidates_per_group=cfg.evaluation.min_camera_settings,
         candidate_sampling="parameter_diverse",
         parameter_normalization="linear",
         context_output_range="zero_one",
@@ -128,7 +129,8 @@ def main(cfg: DictConfig):
         min_ecc_score=cfg.dataset.min_registration_ecc_score,
         max_time_diff_sec=cfg.dataset.max_pair_time_diff_sec,
         max_registration_translation_px=cfg.dataset.max_registration_translation_px,
-        abs_rel_degradation_quantile=cfg.dataset.abs_rel_degradation_quantile,
+        abs_rel_degradation_quantile=None,
+        include_canonical_setting_as_candidate=True,
         use_all_candidates=True,
         topologies=list(cfg.dataset.seen_val_topologies) + list(cfg.dataset.unseen_val_topologies),
         load_images=True,
@@ -280,7 +282,12 @@ def main(cfg: DictConfig):
             global_step=global_step,
             log_interval=cfg.training.log_interval,
         )
-        val_total_metrics, val_seen_metrics, val_unseen_metrics = validate(
+        (
+            val_total_metrics,
+            val_seen_metrics,
+            val_unseen_metrics,
+            selection_sweeps,
+        ) = validate(
             epoch=epoch,
             model_id=model_id,
             model=model,
@@ -299,6 +306,9 @@ def main(cfg: DictConfig):
             max_depth=cfg.dataset.max_depth,
             relative_align_mode=cfg.training.relative_align_mode,
             uncertainty_alpha=cfg.training.get("uncertainty_alpha", 1.0),
+            selection_min_settings=cfg.evaluation.min_camera_settings,
+            selection_thresholds=cfg.evaluation.relative_regret_thresholds_percent,
+            selection_alpha_values=cfg.evaluation.alpha_sweep_values,
         )
         
         print(f"[epoch {epoch}] train={train_metrics}")
@@ -343,6 +353,7 @@ def main(cfg: DictConfig):
                 wandb_run.summary["best_epoch"] = epoch
 
         if wandb_run is not None:
+            selection_figure = plot_selection_alpha_sweep(selection_sweeps)
             wandb_run.log({
                 "epoch": epoch,
                 "best/q_abs_rel_degradation_spearman": best_abs_rel_correlation,
@@ -353,10 +364,37 @@ def main(cfg: DictConfig):
                     for group_idx, group in enumerate(optimizer.param_groups)
                 },
                 **{f"train/{key}": value for key, value in train_metrics.items()},
-                **{f"val/{key}": value for key, value in val_total_metrics.items()},
-                **{f"val_seen/{key}": value for key, value in val_seen_metrics.items()},
-                **{f"val_unseen/{key}": value for key, value in val_unseen_metrics.items()}
+                **{
+                    f"val/{key}": value
+                    for key, value in val_total_metrics.items()
+                    if not key.startswith("selection_")
+                },
+                **{
+                    f"val_seen/{key}": value
+                    for key, value in val_seen_metrics.items()
+                    if not key.startswith("selection_")
+                },
+                **{
+                    f"val_unseen/{key}": value
+                    for key, value in val_unseen_metrics.items()
+                    if not key.startswith("selection_")
+                },
+                "val_seen/selection_accuracy": val_seen_metrics[
+                    "selection_accuracy"
+                ],
+                "val_seen/selection_mean_regret_abs_rel": val_seen_metrics[
+                    "selection_mean_regret_abs_rel"
+                ],
+                "val_unseen/selection_accuracy": val_unseen_metrics[
+                    "selection_accuracy"
+                ],
+                "val_unseen/selection_mean_regret_abs_rel": val_unseen_metrics[
+                    "selection_mean_regret_abs_rel"
+                ],
+                "val/selection_alpha_sweep": wandb.Image(selection_figure),
             }, step=epoch, commit=True)
+            import matplotlib.pyplot as plt
+            plt.close(selection_figure)
     
     if wandb_run is not None:
         wandb_run.finish()

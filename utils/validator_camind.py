@@ -1,4 +1,4 @@
-from typing import Dict
+from collections.abc import Sequence
 
 import torch
 import torch.nn.functional as F
@@ -6,354 +6,25 @@ from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 from dataset.ati_dataset_caminduce import flatten_group_batch
-from evaluation_utils.eval_metrics import compute_vector_masked_correlations
+from evaluation_utils.eval_selection import (
+    DEFAULT_RELATIVE_REGRET_THRESHOLDS,
+    compute_selection_alpha_sweep,
+)
+from evaluation_utils.eval_utils import (
+    add_rank_counts,
+    append_accumulator_vectors,
+    concatenate_accumulator_vectors,
+    finalize_validation_accumulator,
+    finite_mean,
+    new_validation_accumulator,
+    pairwise_rank_counts,
+)
 from model.loss_fn import (
     scalar_heteroscedastic_loss,
-    scale_shift_invariant_depth_loss,
     signed_pairwise_ranknet_loss,
 )
-from model.loss_target import ssi_independent_depth_loss, ssi_independent_meter_space_depth_loss
+from model.loss_target import ssi_independent_meter_space_depth_loss
 from utils.train_utils import reshape_group_batch, tensor_device
-
-
-_DEGRADATION_EPS = 1e-6
-_NEAR_ORACLE_THRESHOLDS = (5.0, 10.0, 20.0)
-
-
-def _finite_mean(values: torch.Tensor) -> float:
-    values = values.detach().float().flatten()
-    finite_mask = torch.isfinite(values)
-    if not finite_mask.any():
-        return float("nan")
-    return float(values[finite_mask].mean().item())
-
-
-def _pairwise_rank_counts(
-    predicted_score: torch.Tensor,
-    target_score: torch.Tensor,
-    valid_mask: torch.Tensor | None = None,
-) -> tuple[int, int]:
-    _, num_candidates = predicted_score.shape
-    if num_candidates < 2:
-        return 0, 0
-
-    pair_i, pair_j = torch.triu_indices(
-        num_candidates,
-        num_candidates,
-        offset=1,
-        device=predicted_score.device,
-    )
-    pred_diff = predicted_score[:, pair_i] - predicted_score[:, pair_j]
-    target_diff = target_score[:, pair_i] - target_score[:, pair_j]
-    pair_valid_mask = (
-        torch.isfinite(pred_diff)
-        & torch.isfinite(target_diff)
-        & (target_diff != 0)
-    )
-    if valid_mask is not None:
-        valid_mask = valid_mask.bool()
-        if valid_mask.shape != predicted_score.shape:
-            raise ValueError(
-                f"valid_mask shape {tuple(valid_mask.shape)} does not match "
-                f"predicted_score shape {tuple(predicted_score.shape)}"
-            )
-        pair_valid_mask &= valid_mask[:, pair_i] & valid_mask[:, pair_j]
-    if not pair_valid_mask.any():
-        return 0, 0
-    correct = torch.sign(pred_diff[pair_valid_mask]) == torch.sign(target_diff[pair_valid_mask])
-    return int(correct.sum().item()), int(pair_valid_mask.sum().item())
-
-
-def _abs_rel_degradation_targets(
-    predicted_score: torch.Tensor,
-    candidate_abs_rel: torch.Tensor,
-    canonical_abs_rel: torch.Tensor,
-    eps: float = _DEGRADATION_EPS,
-) -> tuple[dict[str, torch.Tensor], torch.Tensor]:
-    """Build all AbsRel degradation targets with one shared validity mask."""
-    predicted_score = predicted_score.detach().float().flatten()
-    candidate_abs_rel = candidate_abs_rel.detach().float().flatten()
-    canonical_abs_rel = canonical_abs_rel.detach().float().flatten()
-
-    if not (predicted_score.shape == candidate_abs_rel.shape == canonical_abs_rel.shape):
-        raise ValueError(
-            "predicted_score, candidate_abs_rel, and canonical_abs_rel must have "
-            "the same flattened shape"
-        )
-
-    # AbsRel is non-negative. Negative values (notably the CSV -1 sentinel)
-    # must not participate in correlations or selection.
-    valid_mask = (
-        torch.isfinite(predicted_score)
-        & torch.isfinite(candidate_abs_rel)
-        & torch.isfinite(canonical_abs_rel)
-        & (candidate_abs_rel >= 0)
-        & (canonical_abs_rel >= 0)
-    )
-
-    absolute = candidate_abs_rel - canonical_abs_rel
-    percentage = absolute / (canonical_abs_rel + eps) * 100.0
-    log_ratio = torch.log(candidate_abs_rel + eps) - torch.log(canonical_abs_rel + eps)
-    valid_mask &= (
-        torch.isfinite(absolute)
-        & torch.isfinite(percentage)
-        & torch.isfinite(log_ratio)
-    )
-
-    return {
-        "abs_rel_degradation": absolute,
-        "abs_rel_degradation_percent": percentage,
-        "abs_rel_degradation_log": log_ratio,
-    }, valid_mask
-
-
-def _degradation_correlation_metrics(
-    predicted_score: torch.Tensor,
-    candidate_abs_rel: torch.Tensor,
-    canonical_abs_rel: torch.Tensor,
-    max_samples: int,
-    score_name: str,
-) -> Dict[str, float]:
-    targets, valid_mask = _abs_rel_degradation_targets(
-        predicted_score,
-        candidate_abs_rel,
-        canonical_abs_rel,
-    )
-    metrics: Dict[str, float] = {}
-    for target_name, target in targets.items():
-        metrics.update(
-            compute_vector_masked_correlations(
-                target,
-                predicted_score,
-                valid_mask=valid_mask,
-                prefix=f"{score_name}_vs_{target_name}",
-                max_samples=max_samples,
-            )
-        )
-    return metrics
-
-
-def _selection_metrics(
-    predicted_score: torch.Tensor,
-    candidate_abs_rel: torch.Tensor,
-    canonical_abs_rel: torch.Tensor,
-    group_id: torch.Tensor,
-    eps: float = _DEGRADATION_EPS,
-) -> Dict[str, float]:
-    predicted_score = predicted_score.detach().float().flatten()
-    candidate_abs_rel = candidate_abs_rel.detach().float().flatten()
-    canonical_abs_rel = canonical_abs_rel.detach().float().flatten()
-    targets, valid_mask = _abs_rel_degradation_targets(
-        predicted_score,
-        candidate_abs_rel,
-        canonical_abs_rel,
-        eps=eps,
-    )
-    group_id = group_id.detach().flatten()
-    if group_id.shape != valid_mask.shape:
-        raise ValueError("group_id must have the same flattened shape as predicted_score")
-    valid_mask &= torch.isfinite(group_id.float())
-
-    exact_hits: list[float] = []
-    relative_regrets: list[float] = []
-    near_oracle_hits: dict[float, list[float]] = {
-        threshold: [] for threshold in _NEAR_ORACLE_THRESHOLDS
-    }
-
-    for current_group_id in torch.unique(group_id[valid_mask]):
-        group_mask = valid_mask & (group_id == current_group_id)
-        if int(group_mask.sum().item()) < 2:
-            continue
-
-        group_q = predicted_score[group_mask]
-        group_candidate_abs_rel = candidate_abs_rel[group_mask]
-        group_canonical_abs_rel = canonical_abs_rel[group_mask]
-
-        canonical_spread = group_canonical_abs_rel.max() - group_canonical_abs_rel.min()
-        canonical_tolerance = eps + 1e-6 * group_canonical_abs_rel.abs().max()
-        if canonical_spread > canonical_tolerance:
-            raise RuntimeError(
-                "canonical AbsRel is inconsistent inside one selection group; "
-                "check grouping and canonical matching"
-            )
-
-        selected_index = int(torch.argmin(group_q).item())
-        transformed_hits = []
-        for target in targets.values():
-            group_target = target[group_mask]
-            transformed_hits.append(
-                bool((group_target[selected_index] == group_target.min()).item())
-            )
-        if len(set(transformed_hits)) != 1:
-            raise RuntimeError(
-                "absolute/percentage/log-ratio selection accuracy diverged; "
-                "check grouping, canonical matching, and filtering"
-            )
-
-        selected_abs_rel = group_candidate_abs_rel[selected_index]
-        oracle_abs_rel = group_candidate_abs_rel.min()
-        relative_regret = (selected_abs_rel - oracle_abs_rel) / (oracle_abs_rel + eps) * 100.0
-        relative_regret_value = float(relative_regret.item())
-
-        exact_hits.append(float(transformed_hits[0]))
-        relative_regrets.append(relative_regret_value)
-        for threshold in _NEAR_ORACLE_THRESHOLDS:
-            near_oracle_hits[threshold].append(float(relative_regret_value <= threshold))
-
-    if not exact_hits:
-        return {
-            "selection_exact_accuracy": float("nan"),
-            "selection_relative_regret_percent": float("nan"),
-            **{
-                f"selection_near_oracle_{int(threshold)}pct_rate": float("nan")
-                for threshold in _NEAR_ORACLE_THRESHOLDS
-            },
-        }
-
-    return {
-        "selection_exact_accuracy": sum(exact_hits) / len(exact_hits),
-        "selection_relative_regret_percent": sum(relative_regrets) / len(relative_regrets),
-        **{
-            f"selection_near_oracle_{int(threshold)}pct_rate": sum(hits) / len(hits)
-            for threshold, hits in near_oracle_hits.items()
-        },
-    }
-
-
-def _new_accumulator() -> dict:
-    return {
-        "loss": 0.0,
-        "nll_loss": 0.0,
-        "mean_loss": 0.0,
-        "variance_loss": 0.0,
-        "ranking_loss": 0.0,
-        "processed_batches": 0,
-        "q_rank_correct": 0,
-        "q_rank_total": 0,
-        "vectors": {
-            "target_ssi_loss": [],
-            "camera_bias": [],
-            "sigma": [],
-            "q_score": [],
-            "candidate_abs_rel": [],
-            "canonical_abs_rel": [],
-            "abs_rel_degradation": [],
-            "rmse_degradation": [],
-            "group_id": [],
-        },
-    }
-
-
-def _append_vectors(
-    accumulator: dict,
-    sample_mask: torch.Tensor | None = None,
-    **items: torch.Tensor,
-) -> None:
-    for key, value in items.items():
-        value = value.detach().float().flatten()
-        if sample_mask is not None:
-            value = value[sample_mask]
-        if value.numel() > 0:
-            accumulator["vectors"][key].append(value.cpu())
-
-
-def _add_rank_counts(
-    accumulator: dict,
-    rank_counts: tuple[int, int],
-) -> None:
-    correct, total = rank_counts
-    accumulator["q_rank_correct"] += correct
-    accumulator["q_rank_total"] += total
-
-
-def _finalize_accumulator(
-    accumulator: dict,
-    max_samples: int,
-) -> Dict[str, float]:
-    metrics: Dict[str, float] = {}
-    processed_batches = accumulator["processed_batches"]
-    if processed_batches > 0:
-        for key in ("loss", "nll_loss", "mean_loss", "variance_loss", "ranking_loss"):
-            metrics[key] = accumulator[key] / processed_batches
-
-    rank_total = accumulator["q_rank_total"]
-    if rank_total > 0:
-        metrics["q_rank_accuracy"] = accumulator["q_rank_correct"] / rank_total
-
-    cat_vectors = {
-        key: torch.cat(values, dim=0) if values else None
-        for key, values in accumulator["vectors"].items()
-    }
-    metadata_keys = {"group_id"}
-    for key, value in cat_vectors.items():
-        if value is not None and key != "rmse_degradation" and key not in metadata_keys:
-            metrics[key] = _finite_mean(value)
-
-    target_loss = cat_vectors.get("target_ssi_loss")
-    camera_bias = cat_vectors.get("camera_bias")
-    rmse_degradation = cat_vectors.get("rmse_degradation")
-    q_score = cat_vectors.get("q_score")
-    candidate_abs_rel = cat_vectors.get("candidate_abs_rel")
-    canonical_abs_rel = cat_vectors.get("canonical_abs_rel")
-
-    if target_loss is not None and camera_bias is not None:
-        metrics.update(
-            compute_vector_masked_correlations(
-                target_loss,
-                camera_bias,
-                prefix="bias_vs_ssi_loss",
-                max_samples=max_samples,
-            )
-        )
-    if camera_bias is not None and candidate_abs_rel is not None and canonical_abs_rel is not None:
-        metrics.update(
-            _degradation_correlation_metrics(
-                camera_bias,
-                candidate_abs_rel,
-                canonical_abs_rel,
-                max_samples,
-                score_name="bias",
-            )
-        )
-    group_id = cat_vectors.get("group_id")
-    if q_score is not None and candidate_abs_rel is not None and canonical_abs_rel is not None:
-        metrics.update(
-            _degradation_correlation_metrics(
-                q_score,
-                candidate_abs_rel,
-                canonical_abs_rel,
-                max_samples,
-                score_name="q",
-            )
-        )
-        if group_id is not None:
-            metrics.update(
-                _selection_metrics(
-                    q_score,
-                    candidate_abs_rel,
-                    canonical_abs_rel,
-                    group_id,
-                )
-            )
-    if rmse_degradation is not None and q_score is not None:
-        rmse_valid_mask = torch.isfinite(rmse_degradation) & (rmse_degradation != -1.0)
-        if candidate_abs_rel is not None and canonical_abs_rel is not None:
-            _, abs_rel_valid_mask = _abs_rel_degradation_targets(
-                q_score,
-                candidate_abs_rel,
-                canonical_abs_rel,
-            )
-            rmse_valid_mask &= abs_rel_valid_mask
-        metrics.update(
-            compute_vector_masked_correlations(
-                rmse_degradation,
-                q_score,
-                valid_mask=rmse_valid_mask,
-                prefix="q_vs_rmse_degradation",
-                max_samples=max_samples,
-            )
-        )
-    return metrics
 
 
 @torch.no_grad()
@@ -376,14 +47,19 @@ def validate(
     max_depth: float = 80.0,
     relative_align_mode: str = "scale_shift",
     uncertainty_alpha: float = 1.0,
+    selection_min_settings: int = 10,
+    selection_thresholds: Sequence[
+        float
+    ] = DEFAULT_RELATIVE_REGRET_THRESHOLDS,
+    selection_alpha_values: Sequence[float] = (0.0, 0.5, 1.0),
 ):
     del model_id, lambda_smooth_logvar, uncertainty_mode, min_depth, max_depth, relative_align_mode
 
     loader.dataset.load_depth = True
     model.eval()
-    total_accumulator = _new_accumulator()
-    seen_accumulator = _new_accumulator()
-    unseen_accumulator = _new_accumulator()
+    total_accumulator = new_validation_accumulator()
+    seen_accumulator = new_validation_accumulator()
+    unseen_accumulator = new_validation_accumulator()
 
     progress_bar = tqdm(
         loader,
@@ -475,7 +151,7 @@ def validate(
             & (group_canonical_abs_rel >= 0)
         )
         evaluation_group_degradation = group_candidate_abs_rel - group_canonical_abs_rel
-        rank_counts = _pairwise_rank_counts(
+        rank_counts = pairwise_rank_counts(
             group_q,
             evaluation_group_degradation,
             valid_mask=group_valid_mask,
@@ -496,8 +172,8 @@ def validate(
         total_accumulator["variance_loss"] += float(variance_loss.item())
         total_accumulator["ranking_loss"] += float(ranking_loss.item())
         total_accumulator["processed_batches"] += 1
-        _add_rank_counts(total_accumulator, rank_counts)
-        _append_vectors(total_accumulator, **batch_vectors)
+        add_rank_counts(total_accumulator, rank_counts)
+        append_accumulator_vectors(total_accumulator, **batch_vectors)
 
         group_topology = group_info[:, 6].long()
         if seen_topology_numbers is not None:
@@ -506,11 +182,15 @@ def validate(
                 seen_topology_numbers.to(device=device).long(),
             )
             seen_sample_mask = seen_group_mask[:, None].expand(-1, num_candidates).reshape(-1)
-            _append_vectors(seen_accumulator, seen_sample_mask, **batch_vectors)
+            append_accumulator_vectors(
+                seen_accumulator,
+                seen_sample_mask,
+                **batch_vectors,
+            )
             if seen_group_mask.any():
-                _add_rank_counts(
+                add_rank_counts(
                     seen_accumulator,
-                    _pairwise_rank_counts(
+                    pairwise_rank_counts(
                         group_q[seen_group_mask],
                         evaluation_group_degradation[seen_group_mask],
                         valid_mask=group_valid_mask[seen_group_mask],
@@ -522,11 +202,15 @@ def validate(
                 unseen_topology_numbers.to(device=device).long(),
             )
             unseen_sample_mask = unseen_group_mask[:, None].expand(-1, num_candidates).reshape(-1)
-            _append_vectors(unseen_accumulator, unseen_sample_mask, **batch_vectors)
+            append_accumulator_vectors(
+                unseen_accumulator,
+                unseen_sample_mask,
+                **batch_vectors,
+            )
             if unseen_group_mask.any():
-                _add_rank_counts(
+                add_rank_counts(
                     unseen_accumulator,
-                    _pairwise_rank_counts(
+                    pairwise_rank_counts(
                         group_q[unseen_group_mask],
                         evaluation_group_degradation[unseen_group_mask],
                         valid_mask=group_valid_mask[unseen_group_mask],
@@ -537,13 +221,57 @@ def validate(
         progress_bar.set_postfix(
             loss=f"{loss.item():.4f}",
             avg=f"{total_accumulator['loss'] / n:.4f}",
-            ssi=f"{_finite_mean(target_loss):.4f}",
-            deg=f"{_finite_mean(abs_rel_degradation):.4f}",
+            ssi=f"{finite_mean(target_loss):.4f}",
+            deg=f"{finite_mean(abs_rel_degradation):.4f}",
             q_acc=f"{total_accumulator['q_rank_correct'] / max(total_accumulator['q_rank_total'], 1):.4f}",
         )
 
-    total_metrics = _finalize_accumulator(total_accumulator, correlation_max_samples)
-    seen_metrics = _finalize_accumulator(seen_accumulator, correlation_max_samples)
-    unseen_metrics = _finalize_accumulator(unseen_accumulator, correlation_max_samples)
+    accumulators = {
+        "all": total_accumulator,
+        "seen": seen_accumulator,
+        "unseen": unseen_accumulator,
+    }
+    vectors = {
+        name: concatenate_accumulator_vectors(accumulator)
+        for name, accumulator in accumulators.items()
+    }
+    finalized_metrics = {
+        name: finalize_validation_accumulator(
+            accumulator,
+            correlation_max_samples,
+            selection_min_settings=selection_min_settings,
+            selection_thresholds=selection_thresholds,
+            concatenated_vectors=vectors[name],
+        )
+        for name, accumulator in accumulators.items()
+    }
+    selection_sweeps = {}
+    for name, split_vectors in vectors.items():
+        camera_bias = split_vectors["camera_bias"]
+        camera_std = split_vectors["sigma"]
+        candidate_abs_rel = split_vectors["candidate_abs_rel"]
+        group_id = split_vectors["group_id"]
+        if (
+            camera_bias is None
+            or camera_std is None
+            or candidate_abs_rel is None
+            or group_id is None
+        ):
+            selection_sweeps[name] = []
+            continue
+        selection_sweeps[name] = compute_selection_alpha_sweep(
+            camera_bias,
+            camera_std,
+            candidate_abs_rel,
+            group_id,
+            selection_alpha_values,
+            min_settings_per_group=selection_min_settings,
+            relative_regret_thresholds=selection_thresholds,
+        )
 
-    return total_metrics, seen_metrics, unseen_metrics
+    return (
+        finalized_metrics["all"],
+        finalized_metrics["seen"],
+        finalized_metrics["unseen"],
+        selection_sweeps,
+    )
