@@ -238,7 +238,6 @@ def train_one_epoch(
     min_depth: float = 1e-3,
     max_depth: float = 80.0,
     correlation_max_samples: int = 100_000,
-    relative_align_mode: str = "scale_shift",
     uncertainty_alpha: float = 1.0,
     global_step: int = 0,
     log_interval: int = 20,
