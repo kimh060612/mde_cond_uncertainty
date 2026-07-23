@@ -76,8 +76,8 @@ training:
   lr_scheduler_min_lr_ratio: 0.05
 
 evaluation:
-  csv_path: /media/michael/ssd1/AIoT_ATI/analytics_realworld_dataset/orbbec
-  dataset_root: /media/michael/ssd1/AIoT_ATI/orbbec_realworld_dataset
+  csv_path: /home/kimh060612/ati_workspace/mde_cond_uncertainty/orbbec_canonical_parameter_frame_matches_by_scene
+  dataset_root: /datasets/ATI/MDE/orbbec_realworld_dataset
   min_camera_settings: 10
   relative_regret_thresholds_percent: [3.0, 5.0, 10.0]
   alpha_sweep_values: [0.0, 0.1, 0.3, 0.5, 0.7, 1.0]
