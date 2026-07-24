@@ -277,7 +277,7 @@ def main(cfg: DictConfig):
             grad_clip=cfg.training.grad_clip,
             min_depth=cfg.dataset.min_depth,
             max_depth=cfg.dataset.max_depth,
-            relative_align_mode=cfg.training.relative_align_mode,
+            # relative_align_mode=cfg.training.relative_align_mode,
             uncertainty_alpha=cfg.training.get("uncertainty_alpha", 1.0),
             global_step=global_step,
             log_interval=cfg.training.log_interval,
