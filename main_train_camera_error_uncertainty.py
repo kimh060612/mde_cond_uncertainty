@@ -391,6 +391,15 @@ def main(cfg: DictConfig):
                 "val_unseen/selection_mean_regret_abs_rel": val_unseen_metrics[
                     "selection_mean_regret_abs_rel"
                 ],
+                "val/selection_accuracy_within_3pct": val_total_metrics[
+                    "selection_accuracy_within_3pct"
+                ],
+                "val/selection_accuracy_within_5pct": val_total_metrics[
+                    "selection_accuracy_within_5pct"
+                ],
+                "val/selection_accuracy_within_10pct": val_total_metrics[
+                    "selection_accuracy_within_10pct"
+                ],
                 "val/selection_alpha_sweep": wandb.Image(selection_figure),
             }, step=epoch, commit=True)
             import matplotlib.pyplot as plt

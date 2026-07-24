@@ -339,7 +339,7 @@ def main():
             count_total += 1
 
     print(f"Number of self canonical frames: {count_self_optimal} / {count_total}")
-    df_ssi_absrel_degrade.to_csv("./output/ssi_absrel_degrade_distribution.csv", index=False)
+    df_ssi_absrel_degrade.to_csv("./outputs/ssi_absrel_degrade_distribution.csv", index=False)
     
     for s, l in CONTEXT_STATE:
         fig, axs = plt.subplots(nrows=4, ncols=1, figsize=(12, 5))
@@ -462,7 +462,7 @@ def main():
         axs[2].legend(title="Topology")
         axs[3].legend(title="Topology")
         plt.tight_layout()
-        plt.savefig(f"./output/distribution/distribution_analysis_{s}_{l}.png", dpi=300)
+        plt.savefig(f"./outputs/distribution/distribution_analysis_{s}_{l}.png", dpi=300)
 
 
 if __name__ == "__main__":
