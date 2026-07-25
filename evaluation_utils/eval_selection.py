@@ -7,11 +7,98 @@ import torch
 
 
 DEFAULT_RELATIVE_REGRET_THRESHOLDS = (3.0, 5.0, 10.0)
+DEFAULT_TOP_K_THRESHOLDS = (1, 3, 5)
 
 
 def _threshold_metric_name(threshold: float) -> str:
     value = f"{float(threshold):g}".replace(".", "p")
     return f"selection_accuracy_within_{value}pct"
+
+
+def compute_selection_metrics_rank_topk(
+    predicted_score: torch.Tensor,
+    candidate_abs_rel: torch.Tensor,
+    group_id: torch.Tensor,
+    *,
+    min_settings_per_group: int = 10,
+    top_k_thresholds: Sequence[int] = DEFAULT_TOP_K_THRESHOLDS,
+    eps: float = 1e-8,
+) -> dict[str, float]:
+    """Measure whether the predicted selection is within the AbsRel top-k."""
+    if min_settings_per_group < 2:
+        raise ValueError("min_settings_per_group must be at least 2")
+
+    predicted_score = predicted_score.detach().float().flatten()
+    candidate_abs_rel = candidate_abs_rel.detach().float().flatten()
+    group_id = group_id.detach().flatten()
+    if not (
+        predicted_score.shape
+        == candidate_abs_rel.shape
+        == group_id.shape
+    ):
+        raise ValueError(
+            "predicted_score, candidate_abs_rel, and group_id must have "
+            "the same flattened shape"
+        )
+
+    thresholds = tuple(int(value) for value in top_k_thresholds)
+    if any(value <= 0 for value in thresholds):
+        raise ValueError("top_k_thresholds must contain positive integers")
+
+    valid_mask = (
+        torch.isfinite(predicted_score)
+        & torch.isfinite(candidate_abs_rel)
+        & (candidate_abs_rel >= 0)
+        & torch.isfinite(group_id.float())
+    )
+    top_k_hits = {threshold: [] for threshold in thresholds}
+
+    for current_group_id in torch.unique(group_id[valid_mask]):
+        group_mask = valid_mask & (group_id == current_group_id)
+        num_settings = int(group_mask.sum().item())
+        if num_settings < min_settings_per_group:
+            continue
+
+        group_score = predicted_score[group_mask]
+        group_abs_rel = candidate_abs_rel[group_mask]
+        selected_abs_rel = group_abs_rel[torch.argmin(group_score)]
+
+        for threshold in thresholds:
+            top_abs_rel = torch.topk(
+                group_abs_rel,
+                k=min(threshold, num_settings),
+                largest=False,
+            ).values
+            top_k_hits[threshold].append(
+                float(
+                    torch.isclose(
+                        selected_abs_rel,
+                        top_abs_rel,
+                        rtol=1e-6,
+                        atol=eps,
+                    ).any().item()
+                )
+            )
+
+    num_groups = len(next(iter(top_k_hits.values()))) if top_k_hits else 0
+    if num_groups == 0:
+        return {
+            "num_groups": 0.0,
+            **{
+                f"selection_top{threshold}_accuracy": float("nan")
+                for threshold in thresholds
+            },
+        }
+
+    return {
+        "num_groups": float(num_groups),
+        **{
+            f"selection_top{threshold}_accuracy": (
+                sum(top_k_hits[threshold]) / num_groups
+            )
+            for threshold in thresholds
+        },
+    }
 
 
 def compute_selection_metrics(
@@ -122,6 +209,7 @@ def compute_selection_alpha_sweep(
     *,
     min_settings_per_group: int = 10,
     relative_regret_thresholds: Sequence[float] = DEFAULT_RELATIVE_REGRET_THRESHOLDS,
+    top_k_thresholds: Sequence[int] = DEFAULT_TOP_K_THRESHOLDS,
 ) -> list[dict[str, float]]:
     camera_bias = camera_bias.detach().float().flatten()
     camera_std = camera_std.detach().float().flatten()
@@ -140,6 +228,13 @@ def compute_selection_alpha_sweep(
                     group_id,
                     min_settings_per_group=min_settings_per_group,
                     relative_regret_thresholds=relative_regret_thresholds,
+                ),
+                **compute_selection_metrics_rank_topk(
+                    camera_bias + alpha * camera_std,
+                    candidate_abs_rel,
+                    group_id,
+                    min_settings_per_group=min_settings_per_group,
+                    top_k_thresholds=top_k_thresholds,
                 ),
             }
         )

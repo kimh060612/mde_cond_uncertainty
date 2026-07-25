@@ -269,6 +269,7 @@ def main(cfg: DictConfig) -> None:
             relative_regret_thresholds=(
                 cfg.evaluation.relative_regret_thresholds_percent
             ),
+            top_k_thresholds=(1, 3, 5),
         )
         sweeps[split_name] = rows
         csv_rows.extend(
