@@ -22,9 +22,47 @@ from evaluation_utils.eval_utils import (
 from model.loss_fn import (
     scalar_heteroscedastic_loss,
     signed_pairwise_ranknet_loss,
+    groupwise_optimal_classification_loss,
 )
 from model.loss_target import ssi_independent_meter_space_depth_loss
 from utils.train_utils import reshape_group_batch, tensor_device
+
+
+def _update_optimal_selection_stats(
+    stats: dict[str, float],
+    group_bias: torch.Tensor,
+    optimal_candidate_index: torch.Tensor,
+    group_degradation: torch.Tensor,
+    temperature: float,
+    group_mask: torch.Tensor | None = None,
+) -> None:
+    if group_mask is not None:
+        group_bias = group_bias[group_mask]
+        optimal_candidate_index = optimal_candidate_index[group_mask]
+        group_degradation = group_degradation[group_mask]
+    if group_bias.shape[0] == 0:
+        return
+
+    selected_index = group_bias.argmin(dim=1)
+    selected_degradation = group_degradation.gather(
+        1, selected_index[:, None]
+    ).squeeze(1)
+    optimal_degradation = group_degradation.gather(
+        1, optimal_candidate_index[:, None]
+    ).squeeze(1)
+    num_groups = group_bias.shape[0]
+    stats["loss_sum"] += float(
+        groupwise_optimal_classification_loss(
+            group_bias,
+            optimal_candidate_index,
+            temperature,
+        ).item()
+    ) * num_groups
+    stats["correct"] += int((selected_index == optimal_candidate_index).sum().item())
+    stats["regret_sum"] += float(
+        (selected_degradation - optimal_degradation).clamp_min(0).sum().item()
+    )
+    stats["num_groups"] += num_groups
 
 
 @torch.no_grad()
@@ -40,6 +78,11 @@ def validate(
     listnet_temperature: float,
     uncertainty_mode: str,
     list_loss_weight: float,
+    use_ranking_loss: bool,
+    group_size: int,
+    use_optimal_loss: bool,
+    optimal_loss_weight: float,
+    optimal_softmax_temperature: float,
     seen_topology_numbers: torch.Tensor = None,
     unseen_topology_numbers: torch.Tensor = None,
     context_offset: int = 0,
@@ -61,6 +104,10 @@ def validate(
     total_accumulator = new_validation_accumulator()
     seen_accumulator = new_validation_accumulator()
     unseen_accumulator = new_validation_accumulator()
+    optimal_stats = {
+        name: {"loss_sum": 0.0, "correct": 0, "regret_sum": 0.0, "num_groups": 0}
+        for name in ("all", "seen", "unseen")
+    }
 
     progress_bar = tqdm(
         loader,
@@ -74,6 +121,10 @@ def validate(
             continue
 
         num_groups, num_candidates = batch["candidate_images"].shape[:2]
+        if num_candidates != group_size:
+            raise ValueError(
+                f"Expected group_size={group_size}, got {num_candidates} candidates"
+            )
         flat_batch = tensor_device(flatten_group_batch(batch), device)
         candidate_imgs = flat_batch["candidate_images"]
         canonical_imgs = flat_batch["canonical_images"]
@@ -110,19 +161,36 @@ def validate(
                 target_loss,
             )
             q_score = out["camera_bias"] + uncertainty_alpha * out["std"]
+            group_bias = reshape_group_batch(
+                out["camera_bias"], num_groups, num_candidates
+            )
+            optimal_candidate_index = batch["optimal_candidate_index"].to(device)
+            optimal_loss = groupwise_optimal_classification_loss(
+                group_bias,
+                optimal_candidate_index,
+                optimal_softmax_temperature,
+            )
             group_q = reshape_group_batch(q_score, num_groups, num_candidates)
             group_target_loss = reshape_group_batch(
                 target_loss,
                 num_groups,
                 num_candidates,
             )
-            ranking_loss = signed_pairwise_ranknet_loss(
-                group_q,
-                group_target_loss,
-                temperature=listnet_temperature,
+            ranking_loss = (
+                signed_pairwise_ranknet_loss(
+                    group_q,
+                    group_target_loss,
+                    temperature=listnet_temperature,
+                )
+                if use_ranking_loss
+                else group_bias.new_zeros(())
             )
             nll_loss = mean_loss + lambda_variance * variance_loss
-            loss = nll_loss + list_loss_weight * ranking_loss
+            loss = (
+                nll_loss
+                + (optimal_loss_weight * optimal_loss if use_optimal_loss else 0.0)
+                + list_loss_weight * ranking_loss
+            )
 
         batch_vectors = {
             "target_ssi_loss": target_loss,
@@ -152,6 +220,16 @@ def validate(
             & (group_canonical_abs_rel >= 0)
         )
         evaluation_group_degradation = group_candidate_abs_rel - group_canonical_abs_rel
+        group_degradation = reshape_group_batch(
+            abs_rel_degradation, num_groups, num_candidates
+        )
+        _update_optimal_selection_stats(
+            optimal_stats["all"],
+            group_bias,
+            optimal_candidate_index,
+            group_degradation,
+            optimal_softmax_temperature,
+        )
         rank_counts = pairwise_rank_counts(
             group_q,
             evaluation_group_degradation,
@@ -189,6 +267,14 @@ def validate(
                 **batch_vectors,
             )
             if seen_group_mask.any():
+                _update_optimal_selection_stats(
+                    optimal_stats["seen"],
+                    group_bias,
+                    optimal_candidate_index,
+                    group_degradation,
+                    optimal_softmax_temperature,
+                    seen_group_mask,
+                )
                 add_rank_counts(
                     seen_accumulator,
                     pairwise_rank_counts(
@@ -209,6 +295,14 @@ def validate(
                 **batch_vectors,
             )
             if unseen_group_mask.any():
+                _update_optimal_selection_stats(
+                    optimal_stats["unseen"],
+                    group_bias,
+                    optimal_candidate_index,
+                    group_degradation,
+                    optimal_softmax_temperature,
+                    unseen_group_mask,
+                )
                 add_rank_counts(
                     unseen_accumulator,
                     pairwise_rank_counts(
@@ -246,6 +340,21 @@ def validate(
         )
         for name, accumulator in accumulators.items()
     }
+    for name, stats in optimal_stats.items():
+        num_groups = stats["num_groups"]
+        finalized_metrics[name].update(
+            {
+                "groupwise_top1_selection_accuracy": (
+                    stats["correct"] / num_groups if num_groups else float("nan")
+                ),
+                "optimal_classification_loss": (
+                    stats["loss_sum"] / num_groups if num_groups else float("nan")
+                ),
+                "mean_selected_regret": (
+                    stats["regret_sum"] / num_groups if num_groups else float("nan")
+                ),
+            }
+        )
     selection_sweeps = {}
     for name, split_vectors in vectors.items():
         camera_bias = split_vectors["camera_bias"]

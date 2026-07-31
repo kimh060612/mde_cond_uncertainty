@@ -691,7 +691,9 @@ class FoundationCameraGroupedDataset(Dataset[dict[str, Any]]):
         rng: random.Random,
     ) -> list[tuple[int, int]]:
         if self.use_all_candidates:
-            return setting_ids.copy()
+            selected = setting_ids.copy()
+            rng.shuffle(selected)
+            return selected
         if self.candidate_sampling == "random":
             return self._sample_random_settings(setting_ids, rng)
 
@@ -855,6 +857,7 @@ class FoundationCameraGroupedDataset(Dataset[dict[str, Any]]):
             [float(row["performance_degradation_abs_rel"]) for row in selected_rows],
             dtype=torch.float32,
         )
+        optimal_candidate_index = torch.argmin(abs_rel_degradation)
         rmse_degradation = torch.tensor(
             [float(row["performance_degradation_rmse"]) for row in selected_rows],
             dtype=torch.float32,
@@ -872,6 +875,7 @@ class FoundationCameraGroupedDataset(Dataset[dict[str, Any]]):
             "candidate_abs_rel": candidate_abs_rel,
             "canonical_abs_rel": canonical_abs_rel,
             "abs_rel_degradation": abs_rel_degradation,
+            "optimal_candidate_index": optimal_candidate_index,
             "rmse_degradation": rmse_degradation,
             "camera_context": camera_context,
             "canonical_exposure": torch.tensor(canonical_exposure, dtype=torch.float32),
