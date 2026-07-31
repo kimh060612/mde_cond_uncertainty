@@ -37,7 +37,7 @@ model:
   film_layer_width: 128
   uncertainty_blocks: 3
   uncertainty_dropout: 0.05
-  context_offset: 3
+  context_offset: 0
 
 training:
   seed: 2026
