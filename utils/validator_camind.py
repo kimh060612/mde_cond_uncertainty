@@ -42,6 +42,7 @@ def validate(
     list_loss_weight: float,
     seen_topology_numbers: torch.Tensor = None,
     unseen_topology_numbers: torch.Tensor = None,
+    context_offset: int = 0,
     correlation_max_samples: int = 100_000,
     min_depth: float = 1e-3,
     max_depth: float = 80.0,
@@ -76,7 +77,7 @@ def validate(
         flat_batch = tensor_device(flatten_group_batch(batch), device)
         candidate_imgs = flat_batch["candidate_images"]
         canonical_imgs = flat_batch["canonical_images"]
-        camera_context = flat_batch["camera_context"]
+        camera_context = flat_batch["camera_context"] # B X 10
         abs_rel_degradation = flat_batch["abs_rel_degradation"]
         rmse_degradation = flat_batch["rmse_degradation"]
         candidate_gt_depth = F.interpolate(
@@ -94,7 +95,7 @@ def validate(
             out = model(
                 candidate_imgs,
                 canonical_imgs,
-                camera_context,
+                camera_context[..., context_offset:],
                 target_size=candidate_imgs.shape[-2:],
             )
             target_loss = ssi_independent_meter_space_depth_loss(

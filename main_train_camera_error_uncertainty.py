@@ -195,7 +195,7 @@ def main(cfg: DictConfig):
 
     model = CameraInducedErrorModel(
         model_id=model_id,
-        context_dim=train_set.condition_dim,
+        context_dim=train_set.condition_dim - cfg.model.context_offset,
         cache_dir=None,
         feature_channels=cfg.model.uncertainty_width,
         hidden_channels=cfg.model.uncertainty_width,
@@ -269,6 +269,7 @@ def main(cfg: DictConfig):
             epoch=epoch,
             amp=amp,
             logger=logger,
+            context_offset=cfg.model.context_offset,
             lambda_smooth_logvar=cfg.training.lambda_smooth_logvar,
             lambda_variance=cfg.training.lambda_variance,
             list_loss_weight=cfg.training.list_loss_weight,
@@ -305,6 +306,7 @@ def main(cfg: DictConfig):
             min_depth=cfg.dataset.min_depth,
             max_depth=cfg.dataset.max_depth,
             relative_align_mode=cfg.training.relative_align_mode,
+            context_offset=cfg.model.context_offset,
             uncertainty_alpha=cfg.training.get("uncertainty_alpha", 1.0),
             selection_min_settings=cfg.evaluation.min_camera_settings,
             selection_thresholds=cfg.evaluation.relative_regret_thresholds_percent,

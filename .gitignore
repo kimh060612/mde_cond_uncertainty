@@ -6,3 +6,4 @@ comparison_ae/
 evaluation_models/*
 ckpt*
 outputs/*
+fanova_results/*
