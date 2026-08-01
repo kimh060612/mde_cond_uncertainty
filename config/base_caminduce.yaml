@@ -10,7 +10,6 @@ dataset:
   max_pair_time_diff_sec: 0.05
   max_registration_translation_px: 32.0
   abs_rel_degradation_quantile: 0.99
-  include_canonical_setting_as_candidate: true
   output_dir: ./da2_ati_cond_uncertainty_ckpt
   num_workers: 8
   exposure_min: 4000
@@ -42,8 +41,8 @@ model:
 
 training:
   seed: 2026
-  batch_size: 32
-  group_size: 8
+  batch_size: 8
+  candidates_per_group: 4
   num_epochs: 10
   lr_backbone: 1e-6
   lr_uncertainty: 1e-4
@@ -56,11 +55,6 @@ training:
   max_bias: 0.5
   listnet_temperature: 0.02
   list_loss_weight: 0.1
-  use_ranking_loss: false
-  use_soft_optimal_loss: true
-  soft_optimal_loss_weight: 0.1
-  target_softmax_temperature: 0.02
-  prediction_softmax_temperature: 0.02
   lambda_variance: 1.0
   lambda_smooth_logvar: 1e-3
   grad_clip: 1.0

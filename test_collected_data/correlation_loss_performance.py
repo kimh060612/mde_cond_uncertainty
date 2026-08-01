@@ -27,6 +27,8 @@ from evaluation_utils.eval_metrics import compute_vector_masked_correlations  # 
 from model.dav2_model import MODEL_IDS  # noqa: E402
 from model.loss_fn import (  # noqa: E402
     log_scale_invariant_depth_difference,
+    sobel_log_gradient_depth_difference,
+    sobel_log_gradient_magnitude_difference
 )
 from model.loss_target import (  # noqa: E402
     ordinal_structure_failure,
