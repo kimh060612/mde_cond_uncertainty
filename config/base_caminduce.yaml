@@ -10,6 +10,7 @@ dataset:
   max_pair_time_diff_sec: 0.05
   max_registration_translation_px: 32.0
   abs_rel_degradation_quantile: 0.99
+  include_canonical_setting_as_candidate: false
   output_dir: ./da2_ati_cond_uncertainty_ckpt
   num_workers: 8
   exposure_min: 4000

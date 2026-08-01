@@ -111,7 +111,7 @@ def main(cfg: DictConfig):
         max_time_diff_sec=cfg.dataset.max_pair_time_diff_sec,
         max_registration_translation_px=cfg.dataset.max_registration_translation_px,
         abs_rel_degradation_quantile=cfg.dataset.abs_rel_degradation_quantile,
-        include_canonical_setting_as_candidate=True,
+        include_canonical_setting_as_candidate=cfg.dataset.include_canonical_setting_as_candidate,
         topologies=cfg.dataset.train_topologies,
         load_images=True,
         load_depth=False,
