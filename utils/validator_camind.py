@@ -22,7 +22,7 @@ from evaluation_utils.eval_utils import (
 from model.loss_fn import (
     scalar_heteroscedastic_loss,
     signed_pairwise_ranknet_loss,
-    groupwise_optimal_classification_loss,
+    groupwise_soft_optimal_loss,
 )
 from model.loss_target import ssi_independent_meter_space_depth_loss
 from utils.train_utils import reshape_group_batch, tensor_device
@@ -31,18 +31,18 @@ from utils.train_utils import reshape_group_batch, tensor_device
 def _update_optimal_selection_stats(
     stats: dict[str, float],
     group_bias: torch.Tensor,
-    optimal_candidate_index: torch.Tensor,
     group_degradation: torch.Tensor,
-    temperature: float,
+    target_temperature: float,
+    prediction_temperature: float,
     group_mask: torch.Tensor | None = None,
 ) -> None:
     if group_mask is not None:
         group_bias = group_bias[group_mask]
-        optimal_candidate_index = optimal_candidate_index[group_mask]
         group_degradation = group_degradation[group_mask]
     if group_bias.shape[0] == 0:
         return
 
+    optimal_candidate_index = group_degradation.argmin(dim=1)
     selected_index = group_bias.argmin(dim=1)
     selected_degradation = group_degradation.gather(
         1, selected_index[:, None]
@@ -52,10 +52,11 @@ def _update_optimal_selection_stats(
     ).squeeze(1)
     num_groups = group_bias.shape[0]
     stats["loss_sum"] += float(
-        groupwise_optimal_classification_loss(
+        groupwise_soft_optimal_loss(
             group_bias,
-            optimal_candidate_index,
-            temperature,
+            group_degradation,
+            target_temperature,
+            prediction_temperature,
         ).item()
     ) * num_groups
     stats["correct"] += int((selected_index == optimal_candidate_index).sum().item())
@@ -80,9 +81,10 @@ def validate(
     list_loss_weight: float,
     use_ranking_loss: bool,
     group_size: int,
-    use_optimal_loss: bool,
-    optimal_loss_weight: float,
-    optimal_softmax_temperature: float,
+    use_soft_optimal_loss: bool,
+    soft_optimal_loss_weight: float,
+    target_softmax_temperature: float,
+    prediction_softmax_temperature: float,
     seen_topology_numbers: torch.Tensor = None,
     unseen_topology_numbers: torch.Tensor = None,
     context_offset: int = 0,
@@ -130,6 +132,9 @@ def validate(
         canonical_imgs = flat_batch["canonical_images"]
         camera_context = flat_batch["camera_context"] # B X 10
         abs_rel_degradation = flat_batch["abs_rel_degradation"]
+        group_degradation = reshape_group_batch(
+            abs_rel_degradation, num_groups, num_candidates
+        )
         rmse_degradation = flat_batch["rmse_degradation"]
         candidate_gt_depth = F.interpolate(
             flat_batch["candidate_depths"].unsqueeze(1),
@@ -164,11 +169,11 @@ def validate(
             group_bias = reshape_group_batch(
                 out["camera_bias"], num_groups, num_candidates
             )
-            optimal_candidate_index = batch["optimal_candidate_index"].to(device)
-            optimal_loss = groupwise_optimal_classification_loss(
+            soft_optimal_loss = groupwise_soft_optimal_loss(
                 group_bias,
-                optimal_candidate_index,
-                optimal_softmax_temperature,
+                group_degradation,
+                target_softmax_temperature,
+                prediction_softmax_temperature,
             )
             group_q = reshape_group_batch(q_score, num_groups, num_candidates)
             group_target_loss = reshape_group_batch(
@@ -188,7 +193,11 @@ def validate(
             nll_loss = mean_loss + lambda_variance * variance_loss
             loss = (
                 nll_loss
-                + (optimal_loss_weight * optimal_loss if use_optimal_loss else 0.0)
+                + (
+                    soft_optimal_loss_weight * soft_optimal_loss
+                    if use_soft_optimal_loss
+                    else 0.0
+                )
                 + list_loss_weight * ranking_loss
             )
 
@@ -220,15 +229,12 @@ def validate(
             & (group_canonical_abs_rel >= 0)
         )
         evaluation_group_degradation = group_candidate_abs_rel - group_canonical_abs_rel
-        group_degradation = reshape_group_batch(
-            abs_rel_degradation, num_groups, num_candidates
-        )
         _update_optimal_selection_stats(
             optimal_stats["all"],
             group_bias,
-            optimal_candidate_index,
             group_degradation,
-            optimal_softmax_temperature,
+            target_softmax_temperature,
+            prediction_softmax_temperature,
         )
         rank_counts = pairwise_rank_counts(
             group_q,
@@ -270,9 +276,9 @@ def validate(
                 _update_optimal_selection_stats(
                     optimal_stats["seen"],
                     group_bias,
-                    optimal_candidate_index,
                     group_degradation,
-                    optimal_softmax_temperature,
+                    target_softmax_temperature,
+                    prediction_softmax_temperature,
                     seen_group_mask,
                 )
                 add_rank_counts(
@@ -298,9 +304,9 @@ def validate(
                 _update_optimal_selection_stats(
                     optimal_stats["unseen"],
                     group_bias,
-                    optimal_candidate_index,
                     group_degradation,
-                    optimal_softmax_temperature,
+                    target_softmax_temperature,
+                    prediction_softmax_temperature,
                     unseen_group_mask,
                 )
                 add_rank_counts(
@@ -347,7 +353,7 @@ def validate(
                 "groupwise_top1_selection_accuracy": (
                     stats["correct"] / num_groups if num_groups else float("nan")
                 ),
-                "optimal_classification_loss": (
+                "soft_optimal_loss": (
                     stats["loss_sum"] / num_groups if num_groups else float("nan")
                 ),
                 "mean_selected_regret": (

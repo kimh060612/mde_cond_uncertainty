@@ -587,18 +587,29 @@ def listwise_camera_ranking_loss(
 
     return -(target_preferences * predicted_log_preferences).sum(dim=1).mean()
 
-def groupwise_optimal_classification_loss(
+def groupwise_soft_optimal_loss(
     group_bias: torch.Tensor,
-    optimal_candidate_index: torch.Tensor,
-    temperature: float,
+    group_degradation: torch.Tensor,
+    target_temperature: float,
+    prediction_temperature: float,
 ) -> torch.Tensor:
     if group_bias.ndim != 2:
         raise ValueError("group_bias must have shape [num_groups, group_size]")
-    if optimal_candidate_index.shape != group_bias.shape[:1]:
-        raise ValueError("optimal_candidate_index must have shape [num_groups]")
-    if temperature <= 0:
-        raise ValueError("optimal_softmax_temperature must be positive")
-    return F.cross_entropy(
-        -group_bias / temperature,
-        optimal_candidate_index.long(),
+    if group_degradation.shape != group_bias.shape:
+        raise ValueError("group_degradation must have the same shape as group_bias")
+    if target_temperature <= 0 or prediction_temperature <= 0:
+        raise ValueError("softmax temperatures must be positive")
+
+    relative_degradation = group_degradation - group_degradation.min(
+        dim=1,
+        keepdim=True,
+    ).values
+    target_probabilities = F.softmax(
+        -relative_degradation / target_temperature,
+        dim=1,
+    ).detach()
+    predicted_log_probabilities = F.log_softmax(
+        -group_bias / prediction_temperature,
+        dim=1,
     )
+    return -(target_probabilities * predicted_log_probabilities).sum(dim=1).mean()

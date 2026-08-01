@@ -11,7 +11,7 @@ from model.loss_fn import (
     scalar_heteroscedastic_loss,
     scale_shift_invariant_depth_loss,
     signed_pairwise_ranknet_loss,
-    groupwise_optimal_classification_loss,
+    groupwise_soft_optimal_loss,
 )
 from model.loss_target import ssi_independent_depth_loss, ssi_independent_meter_space_depth_loss
 from utils.train_utils import reshape_group_batch, tensor_device
@@ -236,9 +236,10 @@ def train_one_epoch(
     listnet_temperature: float,
     use_ranking_loss: bool,
     group_size: int,
-    use_optimal_loss: bool,
-    optimal_loss_weight: float,
-    optimal_softmax_temperature: float,
+    use_soft_optimal_loss: bool,
+    soft_optimal_loss_weight: float,
+    target_softmax_temperature: float,
+    prediction_softmax_temperature: float,
     uncertainty_mode: str,
     grad_clip: float,
     logger: logging.Logger,
@@ -270,7 +271,7 @@ def train_one_epoch(
         "mean_loss": 0.0,
         "variance_loss": 0.0,
         "ranking_loss": 0.0,
-        "optimal_classification_loss": 0.0,
+        "soft_optimal_loss": 0.0,
     }
     rank_correct = 0
     rank_total = 0
@@ -336,11 +337,14 @@ def train_one_epoch(
             group_bias = reshape_group_batch(
                 out["camera_bias"], num_groups, num_candidates
             )
-            optimal_candidate_index = batch["optimal_candidate_index"].to(device)
-            optimal_loss = groupwise_optimal_classification_loss(
+            group_degradation = reshape_group_batch(
+                abs_rel_degradation, num_groups, num_candidates
+            )
+            soft_optimal_loss = groupwise_soft_optimal_loss(
                 group_bias,
-                optimal_candidate_index,
-                optimal_softmax_temperature,
+                group_degradation,
+                target_softmax_temperature,
+                prediction_softmax_temperature,
             )
             ranking_loss = (
                 signed_pairwise_ranknet_loss(
@@ -354,7 +358,11 @@ def train_one_epoch(
             nll_loss = mean_loss + lambda_variance * variance_loss
             loss = (
                 nll_loss
-                + (optimal_loss_weight * optimal_loss if use_optimal_loss else 0.0)
+                + (
+                    soft_optimal_loss_weight * soft_optimal_loss
+                    if use_soft_optimal_loss
+                    else 0.0
+                )
                 + list_loss_weight * ranking_loss
             )
 
@@ -410,7 +418,7 @@ def train_one_epoch(
         running["mean_loss"] += float(mean_loss.item())
         running["variance_loss"] += float(variance_loss.item())
         running["ranking_loss"] += float(ranking_loss.item())
-        running["optimal_classification_loss"] += float(optimal_loss.item())
+        running["soft_optimal_loss"] += float(soft_optimal_loss.item())
         processed_batches += 1
         global_step += 1
 
@@ -425,7 +433,7 @@ def train_one_epoch(
 
         if log_interval > 0 and step % log_interval == 0:
             logger.info(
-                "epoch=%d step=%d/%d avg_loss=%.6f mean_loss=%.6f variance_loss=%.6f ranking_loss=%.6f optimal_loss=%.6f",
+                "epoch=%d step=%d/%d avg_loss=%.6f mean_loss=%.6f variance_loss=%.6f ranking_loss=%.6f soft_optimal_loss=%.6f",
                 epoch,
                 step,
                 len(loader),
@@ -433,7 +441,7 @@ def train_one_epoch(
                 running["mean_loss"] / n,
                 running["variance_loss"] / n,
                 running["ranking_loss"] / n,
-                running["optimal_classification_loss"] / n,
+                running["soft_optimal_loss"] / n,
             )
 
     n = max(processed_batches, 1)
