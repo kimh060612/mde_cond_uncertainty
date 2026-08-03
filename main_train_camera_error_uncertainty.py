@@ -43,6 +43,13 @@ def main(cfg: DictConfig):
     
     seed = cfg.training.seed
     seed_everything(seed)
+    group_size = int(cfg.training.group_size)
+    if cfg.training.batch_size % group_size != 0:
+        raise ValueError(
+            "training.batch_size must be divisible by training.group_size "
+            f"({cfg.training.batch_size} % {group_size} != 0)"
+        )
+    groups_per_batch = cfg.training.batch_size // group_size
     
     if not cfg.training.disable_wandb:
         if wandb is None:
@@ -90,7 +97,7 @@ def main(cfg: DictConfig):
             gain_min=cfg.dataset.gain_min,
             gain_max=cfg.dataset.gain_max,
         ),
-        candidates_per_group=cfg.training.candidates_per_group,
+        candidates_per_group=group_size,
         candidate_sampling="parameter_diverse",
         parameter_normalization="linear",
         context_output_range="zero_one",
@@ -104,6 +111,7 @@ def main(cfg: DictConfig):
         max_time_diff_sec=cfg.dataset.max_pair_time_diff_sec,
         max_registration_translation_px=cfg.dataset.max_registration_translation_px,
         abs_rel_degradation_quantile=cfg.dataset.abs_rel_degradation_quantile,
+        include_canonical_setting_as_candidate=cfg.dataset.include_canonical_setting_as_candidate,
         topologies=cfg.dataset.train_topologies,
         load_images=True,
         load_depth=False,
@@ -116,7 +124,7 @@ def main(cfg: DictConfig):
         foundation_model_name=cfg.model.model_id,
         camera_model_name=cfg.model.camera_model_name,
         parameter_range=train_set.parameter_range,
-        candidates_per_group=cfg.evaluation.min_camera_settings,
+        candidates_per_group=group_size,
         candidate_sampling="parameter_diverse",
         parameter_normalization="linear",
         context_output_range="zero_one",
@@ -130,8 +138,7 @@ def main(cfg: DictConfig):
         max_time_diff_sec=cfg.dataset.max_pair_time_diff_sec,
         max_registration_translation_px=cfg.dataset.max_registration_translation_px,
         abs_rel_degradation_quantile=None,
-        include_canonical_setting_as_candidate=True,
-        use_all_candidates=True,
+        include_canonical_setting_as_candidate=cfg.dataset.include_canonical_setting_as_candidate,
         topologies=list(cfg.dataset.seen_val_topologies) + list(cfg.dataset.unseen_val_topologies),
         load_images=True,
         load_depth=False,
@@ -161,6 +168,7 @@ def main(cfg: DictConfig):
         "seen_validation_topologies": list(seen_val_topologies),
         # "seen_validation_samples": seen_val_count,
         "unseen_validation_topologies": list(unseen_val_topologies),
+        "group_size": group_size,
         # "unseen_validation_samples": unseen_val_count,
     }
     print(
@@ -180,14 +188,14 @@ def main(cfg: DictConfig):
     pin_memory = device.type == "cuda"
     train_loader = DataLoader(
         train_set,
-        batch_size=cfg.training.batch_size,
+        batch_size=groups_per_batch,
         shuffle=True,
         num_workers=cfg.dataset.num_workers,
         pin_memory=pin_memory,
     )
     val_loader = DataLoader(
         val_set,
-        batch_size=1,
+        batch_size=groups_per_batch,
         shuffle=False,
         num_workers=cfg.dataset.num_workers,
         pin_memory=pin_memory,
@@ -274,6 +282,12 @@ def main(cfg: DictConfig):
             lambda_variance=cfg.training.lambda_variance,
             list_loss_weight=cfg.training.list_loss_weight,
             listnet_temperature=cfg.training.listnet_temperature,
+            use_ranking_loss=cfg.training.use_ranking_loss,
+            group_size=group_size,
+            use_soft_optimal_loss=cfg.training.use_soft_optimal_loss,
+            soft_optimal_loss_weight=cfg.training.soft_optimal_loss_weight,
+            target_softmax_temperature=cfg.training.target_softmax_temperature,
+            prediction_softmax_temperature=cfg.training.prediction_softmax_temperature,
             uncertainty_mode=cfg.training.uncertainty_mode,
             grad_clip=cfg.training.grad_clip,
             min_depth=cfg.dataset.min_depth,
@@ -301,6 +315,12 @@ def main(cfg: DictConfig):
             lambda_variance=cfg.training.lambda_variance,
             list_loss_weight=cfg.training.list_loss_weight,
             listnet_temperature=cfg.training.listnet_temperature,
+            use_ranking_loss=cfg.training.use_ranking_loss,
+            group_size=group_size,
+            use_soft_optimal_loss=cfg.training.use_soft_optimal_loss,
+            soft_optimal_loss_weight=cfg.training.soft_optimal_loss_weight,
+            target_softmax_temperature=cfg.training.target_softmax_temperature,
+            prediction_softmax_temperature=cfg.training.prediction_softmax_temperature,
             uncertainty_mode=cfg.training.uncertainty_mode,
             correlation_max_samples=cfg.training.correlation_max_samples,
             min_depth=cfg.dataset.min_depth,
@@ -308,7 +328,7 @@ def main(cfg: DictConfig):
             relative_align_mode=cfg.training.relative_align_mode,
             context_offset=cfg.model.context_offset,
             uncertainty_alpha=cfg.training.get("uncertainty_alpha", 1.0),
-            selection_min_settings=cfg.evaluation.min_camera_settings,
+            selection_min_settings=group_size,
             selection_thresholds=cfg.evaluation.relative_regret_thresholds_percent,
             selection_alpha_values=cfg.evaluation.alpha_sweep_values,
         )

@@ -691,7 +691,9 @@ class FoundationCameraGroupedDataset(Dataset[dict[str, Any]]):
         rng: random.Random,
     ) -> list[tuple[int, int]]:
         if self.use_all_candidates:
-            return setting_ids.copy()
+            selected = setting_ids.copy()
+            rng.shuffle(selected)
+            return selected
         if self.candidate_sampling == "random":
             return self._sample_random_settings(setting_ids, rng)
 

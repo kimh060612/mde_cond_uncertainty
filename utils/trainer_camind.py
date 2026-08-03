@@ -11,12 +11,14 @@ from model.loss_fn import (
     scalar_heteroscedastic_loss,
     scale_shift_invariant_depth_loss,
     signed_pairwise_ranknet_loss,
+    groupwise_soft_optimal_loss,
 )
 from model.loss_target import ssi_independent_depth_loss, ssi_independent_meter_space_depth_loss
 from utils.train_utils import reshape_group_batch, tensor_device
 
 
 _DEGRADATION_EPS = 1e-6
+
 
 def _finite_mean(values: torch.Tensor) -> float:
     values = values.detach().float().flatten()
@@ -232,6 +234,12 @@ def train_one_epoch(
     lambda_variance: float,
     list_loss_weight: float,
     listnet_temperature: float,
+    use_ranking_loss: bool,
+    group_size: int,
+    use_soft_optimal_loss: bool,
+    soft_optimal_loss_weight: float,
+    target_softmax_temperature: float,
+    prediction_softmax_temperature: float,
     uncertainty_mode: str,
     grad_clip: float,
     logger: logging.Logger,
@@ -263,6 +271,7 @@ def train_one_epoch(
         "mean_loss": 0.0,
         "variance_loss": 0.0,
         "ranking_loss": 0.0,
+        "soft_optimal_loss": 0.0,
     }
     rank_correct = 0
     rank_total = 0
@@ -283,6 +292,10 @@ def train_one_epoch(
             continue
 
         num_groups, num_candidates = batch["candidate_images"].shape[:2]
+        if num_candidates != group_size:
+            raise ValueError(
+                f"Expected group_size={group_size}, got {num_candidates} candidates"
+            )
         flat_batch = tensor_device(flatten_group_batch(batch), device)
         candidate_imgs = flat_batch["candidate_images"]
         canonical_imgs = flat_batch["canonical_images"]
@@ -321,13 +334,37 @@ def train_one_epoch(
                 target_loss,
             )
             q_score = out["camera_bias"] + uncertainty_alpha * out["std"]
-            ranking_loss = signed_pairwise_ranknet_loss(
-                reshape_group_batch(q_score, num_groups, num_candidates),
-                reshape_group_batch(target_loss, num_groups, num_candidates), # abs_rel_degradation 
-                temperature=listnet_temperature,
+            group_bias = reshape_group_batch(
+                out["camera_bias"], num_groups, num_candidates
+            )
+            group_degradation = reshape_group_batch(
+                abs_rel_degradation, num_groups, num_candidates
+            )
+            soft_optimal_loss = groupwise_soft_optimal_loss(
+                group_bias,
+                group_degradation,
+                target_softmax_temperature,
+                prediction_softmax_temperature,
+            )
+            ranking_loss = (
+                signed_pairwise_ranknet_loss(
+                    reshape_group_batch(q_score, num_groups, num_candidates),
+                    reshape_group_batch(target_loss, num_groups, num_candidates),
+                    temperature=listnet_temperature,
+                )
+                if use_ranking_loss
+                else group_bias.new_zeros(())
             )
             nll_loss = mean_loss + lambda_variance * variance_loss
-            loss = nll_loss + list_loss_weight * ranking_loss
+            loss = (
+                nll_loss
+                + (
+                    soft_optimal_loss_weight * soft_optimal_loss
+                    if use_soft_optimal_loss
+                    else 0.0
+                )
+                + list_loss_weight * ranking_loss
+            )
 
         scaler.scale(loss).backward()
         if grad_clip > 0:
@@ -381,6 +418,7 @@ def train_one_epoch(
         running["mean_loss"] += float(mean_loss.item())
         running["variance_loss"] += float(variance_loss.item())
         running["ranking_loss"] += float(ranking_loss.item())
+        running["soft_optimal_loss"] += float(soft_optimal_loss.item())
         processed_batches += 1
         global_step += 1
 
@@ -395,7 +433,7 @@ def train_one_epoch(
 
         if log_interval > 0 and step % log_interval == 0:
             logger.info(
-                "epoch=%d step=%d/%d avg_loss=%.6f mean_loss=%.6f variance_loss=%.6f ranking_loss=%.6f",
+                "epoch=%d step=%d/%d avg_loss=%.6f mean_loss=%.6f variance_loss=%.6f ranking_loss=%.6f soft_optimal_loss=%.6f",
                 epoch,
                 step,
                 len(loader),
@@ -403,6 +441,7 @@ def train_one_epoch(
                 running["mean_loss"] / n,
                 running["variance_loss"] / n,
                 running["ranking_loss"] / n,
+                running["soft_optimal_loss"] / n,
             )
 
     n = max(processed_batches, 1)
