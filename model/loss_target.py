@@ -407,13 +407,15 @@ def ssi_depth_guided_meter_space_depth_loss(
         torch.isfinite(candidate_depth)
         & torch.isfinite(candidate_gt_depth)
         & (candidate_depth > 0)
-        & (candidate_gt_depth > 0)
+        & (candidate_gt_depth > min_depth)
+        & (candidate_gt_depth < max_depth)
     )
     canonical_valid = (
         torch.isfinite(canonical_depth)
         & torch.isfinite(canonical_gt_depth)
         & (canonical_depth > 0)
-        & (canonical_gt_depth > 0)
+        & (canonical_gt_depth > min_depth)
+        & (canonical_gt_depth < max_depth)
     )
 
     candidate_meter = align_relative_prediction_to_depth_space(
