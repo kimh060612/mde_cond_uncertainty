@@ -414,14 +414,15 @@ def ssi_depth_guided_meter_space_depth_loss(
         & (canonical_gt_depth > 0)
     )
 
-    candidate_meter_depth = align_relative_prediction_to_depth_space(
+    candidate_meter = align_relative_prediction_to_depth_space(
         candidate_depth,
         candidate_gt_depth,
         candidate_valid,
         align_mode="scale_shift",
         eps=eps,
     )["depth"]
-    canonical_meter_depth = align_relative_prediction_to_depth_space(
+
+    canonical_meter = align_relative_prediction_to_depth_space(
         canonical_depth,
         canonical_gt_depth,
         canonical_valid,
@@ -429,26 +430,46 @@ def ssi_depth_guided_meter_space_depth_loss(
         eps=eps,
     )["depth"]
 
-    candidate_depth_diff = torch.abs(candidate_gt_depth - candidate_meter_depth) / (candidate_gt_depth.clamp_min(eps))
-    canonical_depth_diff = torch.abs(canonical_gt_depth - canonical_meter_depth) / (canonical_gt_depth.clamp_min(eps))
-    
-    comparison_valid = (
-        candidate_valid
-        & canonical_valid
-        & torch.isfinite(candidate_depth_diff)
-        & torch.isfinite(canonical_depth_diff)
-        & (candidate_depth_diff > 0)
-        & (canonical_depth_diff > 0)
+    candidate_error = (
+        torch.abs(candidate_meter - candidate_gt_depth)
+        / candidate_gt_depth.clamp_min(eps)
     )
-    valid_counts = comparison_valid.flatten(1).sum(dim=1)
-    difference = torch.where(
-        comparison_valid,
-        (candidate_depth_diff - canonical_depth_diff).abs() / canonical_depth_diff.clamp_min(eps),
-        torch.zeros_like(candidate_depth_diff),
+    canonical_error = (
+        torch.abs(canonical_meter - canonical_gt_depth)
+        / canonical_gt_depth.clamp_min(eps)
     )
-    loss = difference.flatten(1).sum(dim=1) / valid_counts.clamp_min(1)
+
+    candidate_count = candidate_valid.flatten(1).sum(dim=1)
+    canonical_count = canonical_valid.flatten(1).sum(dim=1)
+
+    candidate_absrel = (
+        torch.where(
+            candidate_valid,
+            candidate_error,
+            torch.zeros_like(candidate_error),
+        )
+        .flatten(1)
+        .sum(dim=1)
+        / candidate_count.clamp_min(1)
+    )
+
+    canonical_absrel = (
+        torch.where(
+            canonical_valid,
+            canonical_error,
+            torch.zeros_like(canonical_error),
+        )
+        .flatten(1)
+        .sum(dim=1)
+        / canonical_count.clamp_min(1)
+    )
+
+    delta = candidate_absrel - canonical_absrel
+
+    valid_sample = (candidate_count > 0) & (canonical_count > 0)
+
     return torch.where(
-        valid_counts > 0,
-        loss,
-        torch.full_like(loss, float("nan")),
+        valid_sample,
+        delta,
+        torch.full_like(delta, float("nan")),
     )
