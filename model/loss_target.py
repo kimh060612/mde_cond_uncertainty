@@ -394,6 +394,8 @@ def ssi_depth_guided_meter_space_depth_loss(
     canonical_depth: torch.Tensor,
     candidate_gt_depth: torch.Tensor,
     canonical_gt_depth: torch.Tensor,
+    min_depth: float = 1e-3,
+    max_depth: float = 10.0,
     eps: float = 1e-6,
 ) -> torch.Tensor:
     candidate_depth = _ensure_bchw(candidate_depth)
@@ -430,6 +432,11 @@ def ssi_depth_guided_meter_space_depth_loss(
         eps=eps,
     )["depth"]
 
+    candidate_meter = candidate_meter.clamp(min=min_depth, max=max_depth)
+    canonical_meter = canonical_meter.clamp(min=min_depth, max=max_depth)
+    candidate_gt_depth = candidate_gt_depth.clamp(min=min_depth, max=max_depth)
+    canonical_gt_depth = canonical_gt_depth.clamp(min=min_depth, max=max_depth)
+    
     candidate_error = (
         torch.abs(candidate_meter - candidate_gt_depth)
         / candidate_gt_depth.clamp_min(eps)
