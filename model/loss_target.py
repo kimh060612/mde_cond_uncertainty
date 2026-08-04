@@ -439,11 +439,11 @@ def ssi_depth_guided_meter_space_depth_loss(
     
     candidate_error = (
         torch.abs(candidate_meter - candidate_gt_depth)
-        / candidate_gt_depth.clamp_min(eps)
+        / (candidate_gt_depth + eps)
     )
     canonical_error = (
         torch.abs(canonical_meter - canonical_gt_depth)
-        / canonical_gt_depth.clamp_min(eps)
+        / (canonical_gt_depth + eps)
     )
 
     candidate_count = candidate_valid.flatten(1).sum(dim=1)
