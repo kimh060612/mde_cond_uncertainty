@@ -429,8 +429,8 @@ def ssi_depth_guided_meter_space_depth_loss(
         eps=eps,
     )["depth"]
 
-    candidate_depth_diff = torch.abs(candidate_gt_depth - canonical_meter_depth) / (candidate_gt_depth.clamp_min(eps))
-    canonical_depth_diff = torch.abs(canonical_gt_depth - candidate_meter_depth) / (canonical_gt_depth.clamp_min(eps))
+    candidate_depth_diff = torch.abs(candidate_gt_depth - candidate_meter_depth) / (candidate_gt_depth.clamp_min(eps))
+    canonical_depth_diff = torch.abs(canonical_gt_depth - canonical_meter_depth) / (canonical_gt_depth.clamp_min(eps))
     
     comparison_valid = (
         candidate_valid
