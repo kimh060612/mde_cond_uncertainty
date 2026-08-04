@@ -8,7 +8,6 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader, Subset
 from tqdm.auto import tqdm
 from transformers import AutoImageProcessor, AutoModelForDepthEstimation
@@ -140,18 +139,6 @@ def parse_args() -> argparse.Namespace:
         help="DataLoader workers. Defaults to config dataset.num_workers.",
     )
     parser.add_argument(
-        "--image-height",
-        type=int,
-        default=None,
-        help="RGB resize height. Defaults to config model.image_height.",
-    )
-    parser.add_argument(
-        "--image-width",
-        type=int,
-        default=None,
-        help="RGB resize width. Defaults to config model.image_width.",
-    )
-    parser.add_argument(
         "--seed",
         type=int,
         default=None,
@@ -192,21 +179,6 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="cuda" if torch.cuda.is_available() else "cpu",
         help="Torch device used for Depth Anything V2 inference.",
-    )
-    parser.add_argument(
-        "--no-amp",
-        action="store_true",
-        help="Disable CUDA autocast during Depth Anything V2 inference.",
-    )
-    parser.add_argument(
-        "--no-normalize",
-        action="store_true",
-        help="Feed resized [0, 1] tensors directly without processor mean/std normalization.",
-    )
-    parser.add_argument(
-        "--no-softplus",
-        action="store_true",
-        help="Do not apply softplus to predicted depth before computing positive-depth losses.",
     )
     parser.add_argument(
         "--correlation-max-samples",
@@ -309,12 +281,14 @@ def parse_path_replacements(
     return result
 
 
-def build_dataset(args: argparse.Namespace, cfg: Any) -> FoundationCameraGroupedDataset:
+def build_dataset(
+    args: argparse.Namespace,
+    cfg: Any,
+    processor: AutoImageProcessor,
+) -> FoundationCameraGroupedDataset:
     csv_path = args.csv_path or Path(str(cfg_get(cfg, "dataset.csv_path")))
     min_depth = float(args.min_depth or cfg_get(cfg, "dataset.min_depth", 1e-3))
     max_depth = float(args.max_depth or cfg_get(cfg, "dataset.max_depth", 10.0))
-    image_height = int(args.image_height or cfg_get(cfg, "model.image_height", 518))
-    image_width = int(args.image_width or cfg_get(cfg, "model.image_width", 518))
     candidates_per_group = int(
         args.candidates_per_group
         or cfg_get(cfg, "training.candidates_per_group", 4)
@@ -347,7 +321,7 @@ def build_dataset(args: argparse.Namespace, cfg: Any) -> FoundationCameraGrouped
             args.path_replacement,
             args.dataset_root,
         ),
-        pair_transform=PairedResizeToTensor(size=(image_height, image_width)),
+        pair_transform=PairedResizeToTensor(image_processor=processor),
         topologies=parse_topologies(args.topologies),
         load_images=True,
         load_depth=True,
@@ -366,63 +340,28 @@ def maybe_subset_dataset(
     return Subset(dataset, range(min(max_groups, len(dataset))))
 
 
-def processor_stats(
-    processor: AutoImageProcessor,
-    device: torch.device,
-    dtype: torch.dtype,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    mean = getattr(processor, "image_mean", None) or [0.485, 0.456, 0.406]
-    std = getattr(processor, "image_std", None) or [0.229, 0.224, 0.225]
-    mean_tensor = torch.tensor(mean, device=device, dtype=dtype).view(1, -1, 1, 1)
-    std_tensor = torch.tensor(std, device=device, dtype=dtype).view(1, -1, 1, 1)
-    return mean_tensor, std_tensor
-
-
-def prepare_pixel_values(
-    images: torch.Tensor,
-    processor: AutoImageProcessor,
-    device: torch.device,
-    normalize: bool,
-) -> torch.Tensor:
-    images = images.to(device=device, dtype=torch.float32, non_blocking=True)
-    if not normalize:
-        return images
-    mean, std = processor_stats(processor, device=images.device, dtype=images.dtype)
-    return (images - mean) / std.clamp_min(1e-12)
-
-
 @torch.inference_mode()
 def predict_depth(
     model: AutoModelForDepthEstimation,
+    processor: AutoImageProcessor,
     pixel_values: torch.Tensor,
     *,
     target_size: tuple[int, int],
     inference_batch_size: int,
-    amp: bool,
-    softplus: bool,
 ) -> torch.Tensor:
     depths: list[torch.Tensor] = []
     batch_size = max(1, int(inference_batch_size))
 
     for start in range(0, pixel_values.shape[0], batch_size):
         chunk = pixel_values[start : start + batch_size]
-        with torch.autocast(device_type=chunk.device.type, enabled=amp):
-            outputs = model(pixel_values=chunk)
-            depth = outputs.predicted_depth
-
-        if depth.ndim == 3:
-            depth = depth.unsqueeze(1)
-        depth = F.interpolate(
-            depth.float(),
-            size=target_size,
-            mode="bicubic",
-            align_corners=False,
+        outputs = model(pixel_values=chunk)
+        processed = processor.post_process_depth_estimation(
+            outputs,
+            target_sizes=[target_size] * chunk.shape[0],
         )
-        if softplus:
-            depth = F.softplus(depth)
-        depths.append(depth)
+        depths.extend(entry["predicted_depth"].float() for entry in processed)
 
-    return torch.cat(depths, dim=0)
+    return torch.stack(depths, dim=0).unsqueeze(1)
 
 
 def finite_stats(values: torch.Tensor) -> tuple[float, float, float, float]:
@@ -501,9 +440,6 @@ def collect_loss_values(
     loader: DataLoader,
     device: torch.device,
     inference_batch_size: int,
-    amp: bool,
-    normalize: bool,
-    softplus: bool,
     max_batches: int | None,
     strict: bool,
 ) -> tuple[
@@ -547,41 +483,32 @@ def collect_loss_values(
                 )
 
             num_groups, num_candidates = candidate_images.shape[:2]
-            target_size = tuple(candidate_images.shape[-2:])
             flat_candidates = candidate_images.reshape(
                 num_groups * num_candidates,
                 *candidate_images.shape[2:],
             )
             unique_canonicals = canonical_images[:, 0]
 
-            candidate_pixel_values = prepare_pixel_values(
-                flat_candidates,
-                processor=processor,
-                device=device,
-                normalize=normalize,
+            candidate_pixel_values = flat_candidates.to(
+                device=device, dtype=torch.float32, non_blocking=True
             )
-            canonical_pixel_values = prepare_pixel_values(
-                unique_canonicals,
-                processor=processor,
-                device=device,
-                normalize=normalize,
+            canonical_pixel_values = unique_canonicals.to(
+                device=device, dtype=torch.float32, non_blocking=True
             )
 
             candidate_depth = predict_depth(
                 model,
+                processor,
                 candidate_pixel_values,
-                target_size=target_size,
+                target_size=tuple(batch["candidate_depths"].shape[-2:]),
                 inference_batch_size=inference_batch_size,
-                amp=amp,
-                softplus=softplus,
             )
             canonical_depth = predict_depth(
                 model,
+                processor,
                 canonical_pixel_values,
-                target_size=target_size,
+                target_size=tuple(batch["canonical_depths"].shape[-2:]),
                 inference_batch_size=inference_batch_size,
-                amp=amp,
-                softplus=softplus,
             ).repeat_interleave(num_candidates, dim=0)
 
             candidate_gt_depth = batch["candidate_depths"].reshape(
@@ -592,16 +519,6 @@ def collect_loss_values(
                 num_groups * num_candidates,
                 *batch["canonical_depths"].shape[2:],
             ).unsqueeze(1).to(device=device, dtype=torch.float32, non_blocking=True)
-            candidate_gt_depth = F.interpolate(
-                candidate_gt_depth,
-                size=target_size,
-                mode="nearest",
-            )
-            canonical_gt_depth = F.interpolate(
-                canonical_gt_depth,
-                size=target_size,
-                mode="nearest",
-            )
 
             log_loss = log_scale_invariant_depth_difference(
                 candidate_depth,
@@ -692,7 +609,6 @@ def main() -> None:
     args = parse_args()
     cfg = load_config(args.config)
     device = torch.device(args.device)
-    amp = device.type == "cuda" and not args.no_amp
 
     depth_model_name = args.depth_model or str(cfg_get(cfg, "model.model_id"))
     model_id = resolve_model_id(depth_model_name)
@@ -702,6 +618,7 @@ def main() -> None:
         model_id,
         cache_dir=cache_dir,
         local_files_only=args.local_files_only,
+        use_fast=False,
     )
     model = AutoModelForDepthEstimation.from_pretrained(
         model_id,
@@ -713,7 +630,7 @@ def main() -> None:
     for parameter in model.parameters():
         parameter.requires_grad_(False)
 
-    dataset = build_dataset(args, cfg)
+    dataset = build_dataset(args, cfg, processor)
     eval_dataset = maybe_subset_dataset(dataset, args.max_groups)
     num_workers = int(args.num_workers if args.num_workers is not None else cfg_get(cfg, "dataset.num_workers", 0))
     loader = DataLoader(
@@ -748,15 +665,10 @@ def main() -> None:
         loader=loader,
         device=device,
         inference_batch_size=args.inference_batch_size,
-        amp=amp,
-        normalize=not args.no_normalize,
-        softplus=not args.no_softplus,
         max_batches=args.max_batches,
         strict=args.strict,
     )
 
-    image_height = int(args.image_height or cfg_get(cfg, "model.image_height", 518))
-    image_width = int(args.image_width or cfg_get(cfg, "model.image_width", 518))
     candidates_per_group = int(
         args.candidates_per_group
         or cfg_get(cfg, "training.candidates_per_group", 4)
@@ -768,10 +680,8 @@ def main() -> None:
         "batch_size": args.batch_size,
         "inference_batch_size": args.inference_batch_size,
         "candidates_per_group": candidates_per_group,
-        "image_height": image_height,
-        "image_width": image_width,
-        "normalized_with_processor_stats": int(not args.no_normalize),
-        "softplus_depth": int(not args.no_softplus),
+        "processor_preprocessing": 1,
+        "softplus_depth": 0,
     }
 
     rows = [
