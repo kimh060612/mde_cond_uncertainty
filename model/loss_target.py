@@ -395,8 +395,8 @@ def ssi_depth_guided_meter_space_depth_loss(
     candidate_gt_depth: torch.Tensor,
     canonical_gt_depth: torch.Tensor,
     min_depth: float = 1e-3,
-    max_depth: float = 10.0,
-    eps: float = 1e-6,
+    max_depth: float = 80.0,
+    eps: float = 1e-8,
 ) -> torch.Tensor:
     candidate_depth = _ensure_bchw(candidate_depth)
     canonical_depth = _ensure_bchw(canonical_depth)
