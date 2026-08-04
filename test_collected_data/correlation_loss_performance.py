@@ -24,6 +24,10 @@ from dataset.ati_dataset_caminduce import (  # noqa: E402
     PairedResizeToTensor,
 )
 from evaluation_utils.eval_metrics import compute_vector_masked_correlations  # noqa: E402
+from evaluation_utils.eval_selection import (  # noqa: E402
+    compute_selection_metrics,
+    compute_selection_metrics_rank_topk,
+)
 from model.dav2_model import MODEL_IDS  # noqa: E402
 from model.loss_fn import (  # noqa: E402
     log_scale_invariant_depth_difference,
@@ -439,6 +443,8 @@ def summarize_loss_correlation(
     loss_name: str,
     loss_values: torch.Tensor,
     degradation_values: torch.Tensor,
+    candidate_abs_rel: torch.Tensor,
+    group_ids: torch.Tensor,
     metadata: dict[str, object],
     max_samples: int,
 ) -> dict[str, object]:
@@ -453,6 +459,20 @@ def summarize_loss_correlation(
     )
     loss_mean, loss_std, loss_min, loss_max = finite_stats(loss_values[valid_mask])
     deg_mean, deg_std, deg_min, deg_max = finite_stats(degradation_values[valid_mask])
+    selection_metrics = {
+        **compute_selection_metrics(
+            loss_values,
+            candidate_abs_rel,
+            group_ids,
+            min_settings_per_group=2,
+        ),
+        **compute_selection_metrics_rank_topk(
+            loss_values,
+            candidate_abs_rel,
+            group_ids,
+            min_settings_per_group=2,
+        ),
+    }
 
     return {
         "loss_name": loss_name,
@@ -468,6 +488,7 @@ def summarize_loss_correlation(
         "abs_rel_degradation_std": deg_std,
         "abs_rel_degradation_min": deg_min,
         "abs_rel_degradation_max": deg_max,
+        **selection_metrics,
         **metadata,
     }
 
@@ -491,6 +512,8 @@ def collect_loss_values(
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
     dict[str, object],
 ]:
     log_losses: list[torch.Tensor] = []
@@ -498,6 +521,8 @@ def collect_loss_values(
     ssi_independent_meter_space_losses: list[torch.Tensor] = []
     ssi_depth_guided_meter_space_losses: list[torch.Tensor] = []
     abs_rel_degradations: list[torch.Tensor] = []
+    candidate_abs_rels: list[torch.Tensor] = []
+    group_ids: list[torch.Tensor] = []
     ordinal_losses: list[torch.Tensor] = []
 
     counters: dict[str, object] = {
@@ -611,6 +636,8 @@ def collect_loss_values(
                 ssi_depth_guided_meter_space_loss.detach().cpu().float()
             )
             abs_rel_degradations.append(degradation.cpu())
+            candidate_abs_rels.append(batch["candidate_abs_rel"].reshape(-1).cpu().float())
+            group_ids.append(batch["group_index"].repeat_interleave(num_candidates).cpu())
 
             counters["num_total_groups"] = int(counters["num_total_groups"]) + num_groups
             counters["num_total_pairs"] = int(counters["num_total_pairs"]) + (
@@ -638,6 +665,8 @@ def collect_loss_values(
         torch.cat(ssi_independent_meter_space_losses, dim=0),
         torch.cat(ssi_depth_guided_meter_space_losses, dim=0),
         torch.cat(abs_rel_degradations, dim=0),
+        torch.cat(candidate_abs_rels, dim=0),
+        torch.cat(group_ids, dim=0),
         counters,
     )
 
@@ -710,6 +739,8 @@ def main() -> None:
         ssi_independent_meter_space_losses,
         ssi_depth_guided_meter_space_losses,
         degradations,
+        candidate_abs_rels,
+        group_ids,
         counters,
     ) = collect_loss_values(
         model=model,
@@ -748,6 +779,8 @@ def main() -> None:
             loss_name="log_scale_invariant_depth_difference",
             loss_values=log_losses,
             degradation_values=degradations,
+            candidate_abs_rel=candidate_abs_rels,
+            group_ids=group_ids,
             metadata=metadata,
             max_samples=args.correlation_max_samples,
         ),
@@ -755,6 +788,8 @@ def main() -> None:
             loss_name="ssi_independent_depth_loss",
             loss_values=ssi_independent_losses,
             degradation_values=degradations,
+            candidate_abs_rel=candidate_abs_rels,
+            group_ids=group_ids,
             metadata=metadata,
             max_samples=args.correlation_max_samples,
         ),
@@ -762,6 +797,8 @@ def main() -> None:
             loss_name="ssi_independent_meter_space_depth_loss",
             loss_values=ssi_independent_meter_space_losses,
             degradation_values=degradations,
+            candidate_abs_rel=candidate_abs_rels,
+            group_ids=group_ids,
             metadata=metadata,
             max_samples=args.correlation_max_samples,
         ),
@@ -769,6 +806,8 @@ def main() -> None:
             loss_name="ssi_depth_guided_meter_space_depth_loss",
             loss_values=ssi_depth_guided_meter_space_losses,
             degradation_values=degradations,
+            candidate_abs_rel=candidate_abs_rels,
+            group_ids=group_ids,
             metadata=metadata,
             max_samples=args.correlation_max_samples,
         )
@@ -782,6 +821,13 @@ def main() -> None:
             f"{row['loss_name']}: "
             f"pearson={format_float(row['pearson'])}, "
             f"spearman={format_float(row['spearman'])}, "
+            f"top1/3/5={format_float(row['selection_top1_accuracy'])}/"
+            f"{format_float(row['selection_top3_accuracy'])}/"
+            f"{format_float(row['selection_top5_accuracy'])}, "
+            f"E<3/5/10%={format_float(row['selection_accuracy_within_3pct'])}/"
+            f"{format_float(row['selection_accuracy_within_5pct'])}/"
+            f"{format_float(row['selection_accuracy_within_10pct'])}, "
+            f"regret={format_float(row['selection_mean_regret_abs_rel'])}, "
             f"n={row['num_valid_pairs']}"
         )
 
