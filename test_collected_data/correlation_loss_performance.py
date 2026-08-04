@@ -32,6 +32,7 @@ from model.loss_target import (  # noqa: E402
     ordinal_structure_failure,
     ssi_independent_depth_loss,
     ssi_independent_meter_space_depth_loss,
+    ssi_depth_guided_meter_space_depth_loss
 )
 
 
@@ -495,6 +496,7 @@ def collect_loss_values(
     log_losses: list[torch.Tensor] = []
     ssi_independent_losses: list[torch.Tensor] = []
     ssi_independent_meter_space_losses: list[torch.Tensor] = []
+    ssi_depth_guided_meter_space_losses: list[torch.Tensor] = []
     abs_rel_degradations: list[torch.Tensor] = []
     ordinal_losses: list[torch.Tensor] = []
 
@@ -592,14 +594,11 @@ def collect_loss_values(
                 candidate_gt_depth,
                 canonical_gt_depth,
             )
-            failure, _ = ordinal_structure_failure(
-                source_depth=candidate_depth,
-                canonical_depth=canonical_depth,
-                grid_size=(12, 16),
-                min_canonical_gap=0.25,
-                required_retention=0.5,
-                temperature=0.1,
-                return_details=True,
+            ssi_depth_guided_meter_space_loss = ssi_depth_guided_meter_space_depth_loss(
+                candidate_depth,
+                canonical_depth,
+                candidate_gt_depth,
+                canonical_gt_depth,
             )
             degradation = batch["abs_rel_degradation"].reshape(-1).float()
 
@@ -608,8 +607,10 @@ def collect_loss_values(
             ssi_independent_meter_space_losses.append(
                 ssi_independent_meter_space_loss.detach().cpu().float()
             )
+            ssi_depth_guided_meter_space_losses.append(
+                ssi_depth_guided_meter_space_loss.detach().cpu().float()
+            )
             abs_rel_degradations.append(degradation.cpu())
-            ordinal_losses.append(failure.detach().cpu().float())
 
             counters["num_total_groups"] = int(counters["num_total_groups"]) + num_groups
             counters["num_total_pairs"] = int(counters["num_total_pairs"]) + (
@@ -635,8 +636,8 @@ def collect_loss_values(
         torch.cat(log_losses, dim=0),
         torch.cat(ssi_independent_losses, dim=0),
         torch.cat(ssi_independent_meter_space_losses, dim=0),
+        torch.cat(ssi_depth_guided_meter_space_losses, dim=0),
         torch.cat(abs_rel_degradations, dim=0),
-        torch.cat(ordinal_losses, dim=0),
         counters,
     )
 
@@ -707,8 +708,8 @@ def main() -> None:
         log_losses,
         ssi_independent_losses,
         ssi_independent_meter_space_losses,
+        ssi_depth_guided_meter_space_losses,
         degradations,
-        ordinal_losses,
         counters,
     ) = collect_loss_values(
         model=model,
@@ -765,8 +766,8 @@ def main() -> None:
             max_samples=args.correlation_max_samples,
         ),
         summarize_loss_correlation(
-            loss_name="ordinal_structure_failure",
-            loss_values=ordinal_losses,
+            loss_name="ssi_depth_guided_meter_space_depth_loss",
+            loss_values=ssi_depth_guided_meter_space_losses,
             degradation_values=degradations,
             metadata=metadata,
             max_samples=args.correlation_max_samples,
