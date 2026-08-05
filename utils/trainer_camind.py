@@ -313,7 +313,7 @@ def train_one_epoch(
                 camera_context[..., context_offset:],
                 target_size=candidate_gt_depth.shape[-2:],
             )
-            target_loss = ssi_depth_guided_meter_space_depth_loss(
+            target_loss = ssi_independent_meter_space_depth_loss(
                 out["candidate_depth"],
                 out["canonical_depth"],
                 candidate_gt_depth,
