@@ -1,6 +1,7 @@
 from collections.abc import Sequence
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
@@ -23,7 +24,7 @@ from model.loss_fn import (
     signed_pairwise_ranknet_loss,
     groupwise_soft_optimal_loss,
 )
-from model.loss_target import ssi_independent_meter_space_depth_loss, ssi_depth_guided_meter_space_depth_loss
+from model.loss_target import ssi_independent_meter_space_depth_loss
 from utils.train_utils import reshape_group_batch, tensor_device
 
 
@@ -135,15 +136,23 @@ def validate(
             abs_rel_degradation, num_groups, num_candidates
         )
         rmse_degradation = flat_batch["rmse_degradation"]
-        candidate_gt_depth = flat_batch["candidate_depths"].unsqueeze(1)
-        canonical_gt_depth = flat_batch["canonical_depths"].unsqueeze(1)
+        candidate_gt_depth = F.interpolate(
+            flat_batch["candidate_depths"].unsqueeze(1),
+            size=candidate_imgs.shape[-2:],
+            mode="nearest",
+        )
+        canonical_gt_depth = F.interpolate(
+            flat_batch["canonical_depths"].unsqueeze(1),
+            size=canonical_imgs.shape[-2:],
+            mode="nearest",
+        )
 
         with torch.autocast(device_type=device.type, enabled=amp):
             out = model(
                 candidate_imgs,
                 canonical_imgs,
                 camera_context[..., context_offset:],
-                target_size=candidate_gt_depth.shape[-2:],
+                target_size=candidate_imgs.shape[-2:],
             )
             target_loss = ssi_independent_meter_space_depth_loss(
                 out["candidate_depth"],

@@ -323,8 +323,8 @@ class CameraInducedErrorModel(nn.Module):
         if target_size is None:
             target_size = candidate_depth.shape[-2:]
 
-        candidate_depth = F.interpolate(candidate_depth, size=target_size, mode="bicubic", align_corners=False)
-        canonical_depth = F.interpolate(canonical_depth, size=target_size, mode="bicubic", align_corners=False)
+        candidate_depth = F.interpolate(candidate_depth, size=target_size, mode="bilinear", align_corners=False)
+        canonical_depth = F.interpolate(canonical_depth, size=target_size, mode="bilinear", align_corners=False)
 
         log_variance = torch.log(variance.clamp_min(1e-8))
         std = torch.sqrt(variance)
@@ -356,7 +356,7 @@ class CameraInducedErrorModel(nn.Module):
         if target_size is None:
             target_size = candidate_depth.shape[-2:]
 
-        candidate_depth = F.interpolate(candidate_depth, size=target_size, mode="bicubic", align_corners=False)
+        candidate_depth = F.interpolate(candidate_depth, size=target_size, mode="bilinear", align_corners=False)
 
         log_variance = torch.log(variance.clamp_min(1e-8))
         std = torch.sqrt(variance)
