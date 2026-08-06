@@ -251,7 +251,7 @@ def train_one_epoch(
     global_step: int = 0,
     log_interval: int = 20,
 ) -> Tuple[Dict[str, float], int]:
-    del model_id, lambda_smooth_logvar, uncertainty_mode, min_depth, max_depth
+    del model_id, lambda_smooth_logvar, uncertainty_mode
 
     loader.dataset.load_depth = True
     if hasattr(loader.dataset, "set_epoch"):

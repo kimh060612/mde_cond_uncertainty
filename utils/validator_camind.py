@@ -99,7 +99,7 @@ def validate(
     ] = DEFAULT_RELATIVE_REGRET_THRESHOLDS,
     selection_alpha_values: Sequence[float] = (0.0, 0.5, 1.0),
 ):
-    del model_id, lambda_smooth_logvar, uncertainty_mode, min_depth, max_depth, relative_align_mode
+    del model_id, lambda_smooth_logvar, uncertainty_mode, relative_align_mode
 
     loader.dataset.load_depth = True
     model.eval()
