@@ -473,7 +473,7 @@ def ssi_depth_guided_meter_space_depth_loss(
         / canonical_count.clamp_min(1)
     )
 
-    delta = (candidate_absrel - canonical_absrel) / (candidate_absrel + eps)
+    delta = (candidate_absrel - canonical_absrel) # / (candidate_absrel + eps)
 
     valid_sample = (candidate_count > 0) & (canonical_count > 0)
 
