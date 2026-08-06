@@ -24,7 +24,7 @@ from model.loss_fn import (
     signed_pairwise_ranknet_loss,
     groupwise_soft_optimal_loss,
 )
-from model.loss_target import ssi_independent_meter_space_depth_loss
+from model.loss_target import ssi_independent_meter_space_depth_loss, ssi_depth_guided_meter_space_depth_loss
 from utils.train_utils import reshape_group_batch, tensor_device
 
 
@@ -154,11 +154,13 @@ def validate(
                 camera_context[..., context_offset:],
                 target_size=candidate_imgs.shape[-2:],
             )
-            target_loss = ssi_independent_meter_space_depth_loss(
+            target_loss = ssi_depth_guided_meter_space_depth_loss(
                 out["candidate_depth"],
                 out["canonical_depth"],
                 candidate_gt_depth,
                 canonical_gt_depth,
+                min_depth=min_depth,
+                max_depth=max_depth
             )
             mean_loss, variance_loss = scalar_heteroscedastic_loss(
                 out["camera_bias"],
