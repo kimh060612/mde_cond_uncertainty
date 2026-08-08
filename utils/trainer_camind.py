@@ -322,13 +322,13 @@ def train_one_epoch(
                 camera_context[..., context_offset:],
                 target_size=candidate_imgs.shape[-2:],
             )
-            target_loss = ssi_independent_meter_space_depth_loss(
+            target_loss = ssi_depth_guided_meter_space_depth_loss(
                 out["candidate_depth"],
                 out["canonical_depth"],
                 candidate_gt_depth,
                 canonical_gt_depth,
-                # min_depth=min_depth,
-                # max_depth=max_depth
+                min_depth=min_depth,
+                max_depth=max_depth
             )
             mean_loss, variance_loss = scalar_heteroscedastic_loss(
                 out["camera_bias"],
