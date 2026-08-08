@@ -201,7 +201,7 @@ def main(cfg: DictConfig):
         pin_memory=pin_memory,
     )
 
-    model = CameraInducedErrorDecompositionModel( # CameraInducedErrorModel( CameraInducedErrorDecompositionModel
+    model = CameraInducedErrorModel( # CameraInducedErrorModel( CameraInducedErrorDecompositionModel
         model_id=model_id,
         context_dim=train_set.condition_dim - cfg.model.context_offset,
         cache_dir=None,
