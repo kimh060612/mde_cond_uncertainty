@@ -336,15 +336,12 @@ def train_one_epoch(
                 target_loss,
             )
             q_score = out["camera_bias"] + uncertainty_alpha * out["std"]
-            group_bias = reshape_group_batch(
-                out["camera_bias"], num_groups, num_candidates
-            )
-            group_degradation = reshape_group_batch(
-                abs_rel_degradation, num_groups, num_candidates
-            )
+            group_bias = reshape_group_batch(out["camera_bias"], num_groups, num_candidates)
+            group_degradation = reshape_group_batch(abs_rel_degradation, num_groups, num_candidates)
+            group_target_loss = reshape_group_batch(target_loss, num_groups, num_candidates)
             soft_optimal_loss = groupwise_soft_optimal_loss(
                 group_bias,
-                group_degradation,
+                group_target_loss,      # group_degradation,
                 target_softmax_temperature,
                 prediction_softmax_temperature,
             )

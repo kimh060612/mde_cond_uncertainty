@@ -171,9 +171,10 @@ def validate(
             group_bias = reshape_group_batch(
                 out["camera_bias"], num_groups, num_candidates
             )
+            group_target_loss = reshape_group_batch(target_loss, num_groups, num_candidates)
             soft_optimal_loss = groupwise_soft_optimal_loss(
                 group_bias,
-                group_degradation,
+                group_target_loss,  # group_degradation,
                 target_softmax_temperature,
                 prediction_softmax_temperature,
             )
