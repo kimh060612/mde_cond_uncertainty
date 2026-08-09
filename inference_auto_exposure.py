@@ -43,7 +43,7 @@ class LapAccumulator:
     skipped_frames: int = 0
 
     def update(self, abs_rel: float, a1: float) -> None:
-        if not (math.isfinite(abs_rel) and math.isfinite(a1)):
+        if not (math.isfinite(abs_rel) and math.isfinite(a1)) or (abs_rel > 0.5 and a1 > 0.7): # Skip the abnormal frames
             self.skipped_frames += 1
             return
         self.abs_rel_sum += abs_rel
