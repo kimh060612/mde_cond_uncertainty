@@ -23,6 +23,7 @@ from model.loss_fn import (
     scalar_heteroscedastic_loss,
     signed_pairwise_ranknet_loss,
     groupwise_soft_optimal_loss,
+    listwise_camera_ranking_loss
 )
 from model.loss_target import ssi_independent_meter_space_depth_loss, ssi_depth_guided_meter_space_depth_loss
 from utils.train_utils import reshape_group_batch, tensor_device
@@ -167,17 +168,22 @@ def validate(
                 out["variance"],
                 target_loss,
             )
+            soft_ce_batchwise_loss = listwise_camera_ranking_loss(
+                out["camera_bias"],
+                target_loss,
+                temperature=listnet_temperature,
+            )
             q_score = out["camera_bias"] + uncertainty_alpha * out["std"]
             group_bias = reshape_group_batch(
                 out["camera_bias"], num_groups, num_candidates
             )
             group_target_loss = reshape_group_batch(target_loss, num_groups, num_candidates)
-            soft_optimal_loss = groupwise_soft_optimal_loss(
-                group_bias,
-                group_target_loss,  # group_degradation,
-                target_softmax_temperature,
-                prediction_softmax_temperature,
-            )
+            # soft_optimal_loss = groupwise_soft_optimal_loss(
+            #     group_bias,
+            #     group_target_loss,  # group_degradation,
+            #     target_softmax_temperature,
+            #     prediction_softmax_temperature,
+            # )
             group_q = reshape_group_batch(q_score, num_groups, num_candidates)
             group_target_loss = reshape_group_batch(
                 target_loss,
@@ -197,7 +203,7 @@ def validate(
             loss = (
                 nll_loss
                 + (
-                    soft_optimal_loss_weight * soft_optimal_loss
+                    soft_optimal_loss_weight * soft_ce_batchwise_loss
                     if use_soft_optimal_loss
                     else 0.0
                 )
