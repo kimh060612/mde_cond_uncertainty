@@ -336,7 +336,7 @@ def train_one_epoch(
                 out["variance"],
                 target_loss,
             )
-            soft_ce_batchwise_loss = listwise_camera_ranking_loss(
+            global_ce_loss = listwise_camera_ranking_loss(
                 out["camera_bias"],
                 target_loss,
                 temperature=listnet_temperature,
@@ -364,7 +364,7 @@ def train_one_epoch(
             loss = (
                 nll_loss
                 + (
-                    soft_optimal_loss_weight * soft_ce_batchwise_loss
+                    soft_optimal_loss_weight * global_ce_loss
                     if use_soft_optimal_loss
                     else 0.0
                 )
@@ -423,7 +423,7 @@ def train_one_epoch(
         running["mean_loss"] += float(mean_loss.item())
         running["variance_loss"] += float(variance_loss.item())
         running["ranking_loss"] += float(ranking_loss.item())
-        running["soft_optimal_loss"] += float(soft_ce_batchwise_loss.item()) # soft_optimal_loss
+        running["soft_optimal_loss"] += float(global_ce_loss.item())
         processed_batches += 1
         global_step += 1
 

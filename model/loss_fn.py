@@ -577,15 +577,14 @@ def listwise_camera_ranking_loss(
     predicted_risk: torch.Tensor,
     target_risk: torch.Tensor,
     temperature: float = 0.5,
-    eps: float = 1e-6,
 ) -> torch.Tensor:
-    pred_score = torch.log(predicted_risk + eps)
-    target_score = torch.log(target_risk.detach() + eps)
+    predicted_logits = -predicted_risk.flatten() / temperature
+    target_logits = -target_risk.detach().flatten() / temperature
 
-    target_preferences = F.softmax(-target_score / temperature, dim=1)
-    predicted_log_preferences = F.log_softmax(-pred_score / temperature, dim=1)
+    target_preferences = F.softmax(target_logits, dim=0)
+    predicted_log_preferences = F.log_softmax(predicted_logits, dim=0)
 
-    return -(target_preferences * predicted_log_preferences).sum(dim=1).mean()
+    return -(target_preferences * predicted_log_preferences).sum()
 
 def groupwise_soft_optimal_loss(
     group_bias: torch.Tensor,

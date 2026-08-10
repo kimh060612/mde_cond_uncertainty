@@ -168,7 +168,7 @@ def validate(
                 out["variance"],
                 target_loss,
             )
-            soft_ce_batchwise_loss = listwise_camera_ranking_loss(
+            global_ce_loss = listwise_camera_ranking_loss(
                 out["camera_bias"],
                 target_loss,
                 temperature=listnet_temperature,
@@ -203,7 +203,7 @@ def validate(
             loss = (
                 nll_loss
                 + (
-                    soft_optimal_loss_weight * soft_ce_batchwise_loss
+                    soft_optimal_loss_weight * global_ce_loss
                     if use_soft_optimal_loss
                     else 0.0
                 )
