@@ -536,7 +536,7 @@ def forward_with_rgb_model(
 ) -> Dict[str, torch.Tensor]:
     with torch.no_grad():
         candidate_depth = mde_model(pixel_values=candidate_img).predicted_depth
-        canonical_depth = mde_model(pixel_values=candidate_img).predicted_depth
+        canonical_depth = mde_model(pixel_values=canonical_img).predicted_depth
         if target_size is None:
             target_size = candidate_depth.shape[-2:]
         candidate_depth = F.interpolate(candidate_depth.unsqueeze(1), size=target_size, mode="bilinear", align_corners=False)
