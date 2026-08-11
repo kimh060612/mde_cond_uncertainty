@@ -351,21 +351,21 @@ def train_one_epoch(
                 out["variance"],
                 target_loss,
             )
-            global_ce_loss = listwise_camera_ranking_loss(
-                out["camera_bias"],
-                target_loss,
-                temperature=listnet_temperature,
-            )
+            # global_ce_loss = listwise_camera_ranking_loss(
+            #     out["camera_bias"],
+            #     target_loss,
+            #     temperature=listnet_temperature,
+            # )
             q_score = out["camera_bias"] + uncertainty_alpha * out["std"]
             group_bias = reshape_group_batch(out["camera_bias"], num_groups, num_candidates)
             group_degradation = reshape_group_batch(abs_rel_degradation, num_groups, num_candidates)
             group_target_loss = reshape_group_batch(target_loss, num_groups, num_candidates)
-            # soft_optimal_loss = groupwise_soft_optimal_loss(
-            #     group_bias,
-            #     group_target_loss,      # group_degradation,
-            #     target_softmax_temperature,
-            #     prediction_softmax_temperature,
-            # )
+            soft_optimal_loss = groupwise_soft_optimal_loss(
+                group_bias,
+                group_target_loss,      # group_degradation,
+                target_softmax_temperature,
+                prediction_softmax_temperature,
+            )
             ranking_loss = (
                 signed_pairwise_ranknet_loss(
                     reshape_group_batch(q_score, num_groups, num_candidates),
@@ -379,7 +379,7 @@ def train_one_epoch(
             loss = (
                 nll_loss
                 + (
-                    soft_optimal_loss_weight * global_ce_loss
+                    soft_optimal_loss_weight * soft_optimal_loss
                     if use_soft_optimal_loss
                     else 0.0
                 )
@@ -438,7 +438,7 @@ def train_one_epoch(
         running["mean_loss"] += float(mean_loss.item())
         running["variance_loss"] += float(variance_loss.item())
         running["ranking_loss"] += float(ranking_loss.item())
-        running["soft_optimal_loss"] += float(global_ce_loss.item())
+        running["soft_optimal_loss"] += float(soft_optimal_loss.item())
         processed_batches += 1
         global_step += 1
 
