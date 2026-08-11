@@ -1,8 +1,16 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple, Any, Literal
+from collections.abc import Callable, Mapping, Sequence
+
 import re
 import math
+import numpy as np
+import torch
+from PIL import Image
+
 
 @dataclass(frozen=True)
 class ATIFrameItem:
@@ -108,3 +116,198 @@ def log_normalize(value: float, min_value: float, max_value: float) -> float:
     log_min = math.log(min_value)
     log_max = math.log(max_value)
     return 2.0 * (log_value - log_min) / (log_max - log_min) - 1.0
+
+
+ImagePairTransform = Callable[
+    [Image.Image, Image.Image, Mapping[str, Any]],
+    tuple[torch.Tensor, torch.Tensor],
+]
+
+LIGHT_LEVELS = ("normal", "dim", "dark")
+MOTION_LEVELS = ("fast", "slow", "stop", "rotate", "spin")
+
+
+def normalize_topology_name(topology: str) -> str:
+    topology = str(topology).strip()
+    return topology if topology.startswith("topology") else f"topology{topology}"
+
+
+def _topology_number(topology: str) -> int:
+    topology = normalize_topology_name(topology)
+    topology_suffix = topology[len("topology"):]
+    if not topology_suffix.isdigit():
+        raise ValueError(f"Expected numeric topology name, got {topology}")
+    return int(topology_suffix)
+
+
+def _topology_from_scene(scene: str) -> str:
+    matches = [part for part in str(scene).split("_") if part.startswith("topology")]
+    if len(matches) != 1:
+        raise ValueError(f"Cannot infer topology from scene: {scene}")
+    return normalize_topology_name(matches[0])
+
+
+@dataclass(frozen=True)
+class CameraParameterRange:
+    """
+    한 physical camera model에 대해 train/inference에서 공통으로 사용하는
+    exposure/gain 허용 범위입니다.
+
+    이 값은 dataset에서 자동 추정하기보다 camera API/실험 설계에서 정한
+    고정 범위를 명시하는 것을 권장합니다.
+    """
+    exposure_min: float
+    exposure_max: float
+    gain_min: float
+    gain_max: float
+
+    def __post_init__(self) -> None:
+        if not self.exposure_max > self.exposure_min:
+            raise ValueError("exposure_max must be greater than exposure_min.")
+        if not self.gain_max > self.gain_min:
+            raise ValueError("gain_max must be greater than gain_min.")
+
+
+def validate_camera_parameter_normalization(
+    parameter_range: CameraParameterRange,
+    scale: Literal["linear", "log"],
+    output_range: Literal["zero_one", "minus_one_one"],
+) -> None:
+    if scale not in {"linear", "log"}:
+        raise ValueError("scale must be 'linear' or 'log'.")
+    if output_range not in {"zero_one", "minus_one_one"}:
+        raise ValueError("output_range must be 'zero_one' or 'minus_one_one'.")
+    if scale == "log":
+        if parameter_range.exposure_min <= 0:
+            raise ValueError("Log normalization requires exposure_min > 0.")
+        if parameter_range.gain_min <= 0:
+            raise ValueError("Log normalization requires gain_min > 0.")
+
+
+def _normalize_camera_value(
+    value: torch.Tensor,
+    minimum: float,
+    maximum: float,
+    *,
+    scale: Literal["linear", "log"],
+    output_range: Literal["zero_one", "minus_one_one"],
+    clip: bool,
+) -> torch.Tensor:
+    value = value.to(dtype=torch.float32)
+    if scale == "log":
+        value = torch.log(value.clamp_min(torch.finfo(value.dtype).tiny))
+        minimum = math.log(minimum)
+        maximum = math.log(maximum)
+
+    normalized = (value - minimum) / (maximum - minimum)
+    if clip:
+        normalized = normalized.clamp(0.0, 1.0)
+    if output_range == "minus_one_one":
+        normalized = normalized.mul(2.0).sub(1.0)
+    return normalized
+
+
+def normalize_camera_parameters(
+    exposure: torch.Tensor,
+    gain: torch.Tensor,
+    parameter_range: CameraParameterRange,
+    *,
+    scale: Literal["linear", "log"] = "linear",
+    output_range: Literal["zero_one", "minus_one_one"] = "zero_one",
+    clip: bool = True,
+) -> torch.Tensor:
+    if exposure.shape != gain.shape:
+        raise ValueError("exposure and gain must have the same shape.")
+
+    validate_camera_parameter_normalization(parameter_range, scale, output_range)
+    exposure_norm = _normalize_camera_value(
+        exposure,
+        parameter_range.exposure_min,
+        parameter_range.exposure_max,
+        scale=scale,
+        output_range=output_range,
+        clip=clip,
+    )
+    gain_norm = _normalize_camera_value(
+        gain,
+        parameter_range.gain_min,
+        parameter_range.gain_max,
+        scale=scale,
+        output_range=output_range,
+        clip=clip,
+    )
+    return torch.stack([exposure_norm, gain_norm], dim=-1)
+
+
+@dataclass(frozen=True)
+class GroupStatistics:
+    num_rows: int
+    num_groups: int
+    num_distinct_camera_settings: int
+    min_settings_per_group: int
+    median_settings_per_group: float
+    max_settings_per_group: int
+    foundation_model_name: str
+    camera_model_name: str
+
+
+class PairedResizeToTensor:
+    """
+    Canonical/candidate image에 동일한 deterministic resize를 적용합니다.
+
+    Camera-induced appearance difference를 supervision으로 사용하므로
+    candidate에만 color jitter를 적용하면 안 됩니다. Random spatial
+    augmentation을 사용할 경우 canonical/candidate에 같은 parameter를
+    적용하는 pair transform을 작성하십시오.
+    """
+
+    def __init__(
+        self,
+        size: tuple[int, int] | None = None,
+        image_processor: Any | None = None,
+    ) -> None:
+        """
+        Args:
+            size:
+                (height, width). None이면 원본 크기를 유지합니다.
+            image_processor:
+                CSV metric 생성에 사용한 Hugging Face image processor.
+                지정하면 processor의 resize/rescale/normalize를 그대로 사용합니다.
+        """
+        self.size = size
+        self.image_processor = image_processor
+
+    @staticmethod
+    def _to_tensor(image: Image.Image) -> torch.Tensor:
+        array = np.asarray(image, dtype=np.float32)
+
+        if array.ndim == 2:
+            array = array[..., None]
+
+        array = np.ascontiguousarray(array.transpose(2, 0, 1))
+        return torch.from_numpy(array).div_(255.0)
+
+    def __call__(
+        self,
+        canonical_image: Image.Image,
+        candidate_image: Image.Image,
+        _: Mapping[str, Any],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.image_processor is not None:
+            pixel_values = self.image_processor(
+                images=[canonical_image, candidate_image],
+                return_tensors="pt",
+            )["pixel_values"]
+            return pixel_values[0], pixel_values[1]
+
+        if self.size is not None:
+            height, width = self.size
+            resize_size = (width, height)
+
+            canonical_image = canonical_image.resize(resize_size, resample=Image.Resampling.BILINEAR)
+            candidate_image = candidate_image.resize(resize_size, resample=Image.Resampling.BILINEAR)
+
+        return (
+            self._to_tensor(canonical_image),
+            self._to_tensor(candidate_image),
+        )
