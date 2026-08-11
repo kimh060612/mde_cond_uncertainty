@@ -370,6 +370,202 @@ class CameraInducedErrorModel(nn.Module):
             "std": std,
         }
 
+class CameraInducedErrorModelRGBInput(nn.Module):
+    def __init__(
+        self,
+        context_dim: int,
+        feature_channels: int = 128,
+        hidden_channels: int = 64,
+        film_hidden_dim: int = 128,
+        max_bias: Optional[float] = None,
+        min_log_variance: float = -10.0,
+        max_log_variance: float = 10.0,
+        initial_std: float = 0.5,
+        variance_head_init_std: float = 1e-3,
+    ):
+        super().__init__()
+
+        self.context_dim = context_dim
+        self.max_bias = max_bias
+        self.min_log_variance = min_log_variance
+        self.initial_std = initial_std
+        self.max_log_variance = max_log_variance
+        self.variance_head_init_std = variance_head_init_std
+
+        self.image_encoder = nn.Sequential(
+            nn.Conv2d(3, feature_channels // 4, 3, stride=2, padding=1, bias=False),
+            nn.GroupNorm(self._valid_groups(feature_channels // 4),feature_channels // 4),
+            nn.GELU(),
+            nn.Conv2d(feature_channels // 4,feature_channels // 2,3,stride=2,padding=1,bias=False),
+            nn.GroupNorm(self._valid_groups(feature_channels // 2),feature_channels // 2),
+            nn.GELU(),
+            nn.Conv2d(feature_channels // 2,feature_channels,3,stride=2,padding=1,bias=False),
+            nn.GroupNorm(self._valid_groups(feature_channels),feature_channels),
+            nn.GELU(),
+        )
+
+        # Project encoded RGB feature into a compact shared feature.
+        self.feature_projection = nn.Sequential(
+            nn.Conv2d(feature_channels,hidden_channels,kernel_size=3,padding=1,bias=False),
+            nn.GroupNorm(self._valid_groups(hidden_channels),hidden_channels),
+            nn.GELU(),
+        )
+
+        # Camera context -> FiLM gamma and beta.
+        self.film_generator = nn.Sequential(
+            nn.LayerNorm(context_dim),
+            nn.Linear(context_dim, film_hidden_dim),
+            nn.GELU(),
+            nn.Linear(film_hidden_dim,hidden_channels * 2),
+        )
+
+        # Image-level camera-induced loss mean.
+        self.bias_head = nn.Sequential(
+            nn.Conv2d(hidden_channels,hidden_channels,kernel_size=3,padding=1,bias=False),
+            nn.GroupNorm(self._valid_groups(hidden_channels),hidden_channels),
+            nn.GELU(),
+            nn.Conv2d(hidden_channels,hidden_channels // 2,kernel_size=3,padding=1),
+            nn.GELU(),
+            nn.Conv2d(hidden_channels // 2,1,kernel_size=1),
+        )
+
+        # Image-level camera-induced loss variance.
+        self.variance_head = nn.Sequential(
+            nn.Conv2d(hidden_channels,hidden_channels,kernel_size=3,padding=1,bias=False),
+            nn.GroupNorm(self._valid_groups(hidden_channels),hidden_channels),
+            nn.GELU(),
+            nn.Conv2d(hidden_channels,hidden_channels // 2,kernel_size=3,padding=1),
+            nn.GELU(),
+            nn.Conv2d(hidden_channels // 2,1,kernel_size=1),
+        )
+        self._initialize_heads()
+
+    @staticmethod
+    def _valid_groups(
+        channels: int,
+        preferred_groups: int = 8,
+    ) -> int:
+        groups = min(channels, preferred_groups)
+
+        while channels % groups != 0:
+            groups -= 1
+
+        return groups
+
+    def _initialize_heads(self) -> None:
+        # Initial FiLM is identity:
+        # (1 + gamma) * F + beta = F
+        final_film = self.film_generator[-1]
+        nn.init.zeros_(final_film.weight)
+        nn.init.zeros_(final_film.bias)
+
+        # Initial camera bias is zero.
+        final_bias = self.bias_head[-1]
+        nn.init.zeros_(final_bias.weight)
+        nn.init.zeros_(final_bias.bias)
+
+        # Start near a chosen variance scale while retaining tiny spatial variation.
+        final_variance = self.variance_head[-1]
+        nn.init.normal_(
+            final_variance.weight,
+            mean=0.0,
+            std=self.variance_head_init_std,
+        )
+        variance_floor = math.exp(self.min_log_variance)
+        target_variance = max(self.initial_std ** 2, variance_floor + 1e-6)
+        if self.max_log_variance is not None:
+            target_variance = min(target_variance, math.exp(self.max_log_variance))
+        softplus_target = max(target_variance - variance_floor, 1e-6)
+        raw_bias = math.log(math.expm1(softplus_target))
+        nn.init.constant_(final_variance.bias, raw_bias)
+    
+    def _predict(
+        self,
+        image: torch.Tensor,
+        context: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        feature = self.feature_projection(self.image_encoder(image))
+        gamma, beta = self.film_generator(context).chunk(2, dim=1)
+        feature = (1.0 + gamma[:, :, None, None]) * feature + beta[:, :, None, None]
+
+        camera_bias = self.bias_head(feature).flatten(1).mean(dim=1)
+        if self.max_bias is not None:
+            camera_bias = self.max_bias * torch.tanh(camera_bias)
+
+        raw_variance = self.variance_head(feature).flatten(1).mean(dim=1)
+        variance = torch.exp(
+            raw_variance.new_tensor(self.min_log_variance)
+        ) + F.softplus(raw_variance)
+        if self.max_log_variance is not None:
+            variance = variance.clamp_max(
+                torch.exp(raw_variance.new_tensor(self.max_log_variance))
+            )
+
+        return {
+            "predicted_loss": camera_bias,
+            "camera_bias": camera_bias,
+            "log_variance": torch.log(variance.clamp_min(1e-8)),
+            "variance": variance,
+            "std": torch.sqrt(variance),
+        }
+
+    def forward(
+        self,
+        candidate_img: torch.Tensor,
+        canonical_img: torch.Tensor,
+        context: torch.Tensor,
+        target_size: Optional[tuple[int, int]] = None,
+    ) -> Dict[str, torch.Tensor]:
+        return self._predict(candidate_img, context)
+
+    def inference(
+        self,
+        candidate_img: torch.Tensor,
+        context: torch.Tensor,
+        target_size: Optional[tuple[int, int]] = None,
+    ) -> Dict[str, torch.Tensor]:
+        return self._predict(candidate_img, context)
+
+def forward_with_rgb_model(
+    model: CameraInducedErrorModelRGBInput,
+    mde_model: nn.Module,
+    candidate_img: torch.Tensor,
+    canonical_img: torch.Tensor,
+    context: torch.Tensor,
+    target_size: Optional[tuple[int, int]] = None,
+) -> Dict[str, torch.Tensor]:
+    with torch.no_grad():
+        candidate_depth = mde_model(pixel_values=candidate_img).predicted_depth
+        canonical_depth = mde_model(pixel_values=candidate_img).predicted_depth
+        if target_size is None:
+            target_size = candidate_depth.shape[-2:]
+        candidate_depth = F.interpolate(candidate_depth.unsqueeze(1), size=target_size, mode="bilinear", align_corners=False)
+        canonical_depth = F.interpolate(canonical_depth.unsqueeze(1), size=target_size, mode="bilinear", align_corners=False)
+    predictions = model.forward(candidate_img, canonical_img, context, target_size)
+    return {
+        "candidate_depth": candidate_depth,
+        "canonical_depth": canonical_depth,
+        **predictions,
+    }
+
+def inference_with_rgb_model(
+    model: CameraInducedErrorModelRGBInput,
+    mde_model: nn.Module,
+    candidate_img: torch.Tensor,
+    context: torch.Tensor,
+    target_size: Optional[tuple[int, int]] = None,
+) -> Dict[str, torch.Tensor]:
+    with torch.no_grad():
+        candidate_depth = mde_model(pixel_values=candidate_img).predicted_depth
+        if target_size is None:
+            target_size = candidate_depth.shape[-2:]
+        candidate_depth = F.interpolate(candidate_depth.unsqueeze(1), size=target_size, mode="bilinear", align_corners=False)
+    predictions = model.inference(candidate_img, context, target_size)
+    return {
+        "candidate_depth": candidate_depth,
+        **predictions,
+    }
+
 class CameraInducedErrorDecompositionModel(nn.Module):
     """
     Frozen depth foundation model + image-level camera-induced error prediction.

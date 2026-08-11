@@ -5,8 +5,10 @@ import torch
 import torch.nn.functional as F
 from tqdm.auto import tqdm
 
+from transformers import AutoModelForDepthEstimation
 from dataset.ati_dataset_caminduce import flatten_group_batch
 from evaluation_utils.eval_metrics import compute_vector_masked_correlations
+from model.dav2_camerror_model import forward_with_rgb_model, inference_with_rgb_model
 from model.loss_fn import (
     scalar_heteroscedastic_loss,
     scale_shift_invariant_depth_loss,
@@ -19,7 +21,6 @@ from utils.train_utils import reshape_group_batch, tensor_device
 
 
 _DEGRADATION_EPS = 1e-6
-
 
 def _finite_mean(values: torch.Tensor) -> float:
     values = values.detach().float().flatten()
@@ -252,11 +253,17 @@ def train_one_epoch(
     global_step: int = 0,
     log_interval: int = 20,
 ) -> Tuple[Dict[str, float], int]:
-    del model_id, lambda_smooth_logvar, uncertainty_mode
+    del lambda_smooth_logvar, uncertainty_mode
 
     loader.dataset.load_depth = True
     if hasattr(loader.dataset, "set_epoch"):
         loader.dataset.set_epoch(epoch)
+
+    mde_model = AutoModelForDepthEstimation.from_pretrained(
+        model_id,
+        cache_dir=None,
+    ).to(device)
+    mde_model.eval()
 
     model.train()
     progress_bar = tqdm(
@@ -317,12 +324,20 @@ def train_one_epoch(
         optimizer.zero_grad(set_to_none=True)
 
         with torch.autocast(device_type=device.type, enabled=amp):
-            out = model(
+            out = forward_with_rgb_model(
+                model,
+                mde_model,
                 candidate_imgs,
                 canonical_imgs,
                 camera_context[..., context_offset:],
                 target_size=candidate_imgs.shape[-2:],
             )
+            # model(
+            #     candidate_imgs,
+            #     canonical_imgs,
+            #     camera_context[..., context_offset:],
+            #     target_size=candidate_imgs.shape[-2:],
+            # )
             target_loss = ssi_independent_meter_space_depth_loss(
                 out["candidate_depth"],
                 out["canonical_depth"],

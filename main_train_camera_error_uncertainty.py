@@ -16,7 +16,7 @@ from dataset.ati_dataset_caminduce import (
 from dataset.ati_dataset_caminduce import *
 from evaluation_utils.eval_selection import plot_selection_alpha_sweep
 from model.dav2_ati_model import MODEL_IDS
-from model.dav2_camerror_model import CameraInducedErrorModel, CameraInducedErrorDecompositionModel
+from model.dav2_camerror_model import CameraInducedErrorModel, CameraInducedErrorDecompositionModel, CameraInducedErrorModelRGBInput
 from omegaconf import DictConfig, OmegaConf
 from utils.train_utils import *
 from utils.trainer_camind import train_one_epoch
@@ -201,10 +201,22 @@ def main(cfg: DictConfig):
         pin_memory=pin_memory,
     )
 
-    model = CameraInducedErrorDecompositionModel( # CameraInducedErrorModel( CameraInducedErrorDecompositionModel
-        model_id=model_id,
+    # model = CameraInducedErrorModel( # CameraInducedErrorModel( CameraInducedErrorDecompositionModel
+    #     model_id=model_id,
+    #     context_dim=train_set.condition_dim - cfg.model.context_offset,
+    #     cache_dir=None,
+    #     feature_channels=cfg.model.uncertainty_width,
+    #     hidden_channels=cfg.model.uncertainty_width,
+    #     film_hidden_dim=cfg.model.film_layer_width,
+    #     max_bias=cfg.training.max_bias,
+    #     min_log_variance=cfg.training.min_log_var,
+    #     max_log_variance=cfg.training.max_log_var,
+    #     initial_std=cfg.training.initial_std,
+    #     variance_head_init_std=cfg.training.variance_head_init_std,
+    # ).to(device)
+    
+    model = CameraInducedErrorModelRGBInput(
         context_dim=train_set.condition_dim - cfg.model.context_offset,
-        cache_dir=None,
         feature_channels=cfg.model.uncertainty_width,
         hidden_channels=cfg.model.uncertainty_width,
         film_hidden_dim=cfg.model.film_layer_width,

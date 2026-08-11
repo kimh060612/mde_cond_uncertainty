@@ -19,6 +19,8 @@ from evaluation_utils.eval_utils import (
     new_validation_accumulator,
     pairwise_rank_counts,
 )
+from transformers import AutoModelForDepthEstimation
+from model.dav2_camerror_model import forward_with_rgb_model, inference_with_rgb_model
 from model.loss_fn import (
     scalar_heteroscedastic_loss,
     signed_pairwise_ranknet_loss,
@@ -100,8 +102,14 @@ def validate(
     ] = DEFAULT_RELATIVE_REGRET_THRESHOLDS,
     selection_alpha_values: Sequence[float] = (0.0, 0.5, 1.0),
 ):
-    del model_id, lambda_smooth_logvar, uncertainty_mode, relative_align_mode
+    del lambda_smooth_logvar, uncertainty_mode, relative_align_mode
 
+    mde_model = AutoModelForDepthEstimation.from_pretrained(
+        model_id,
+        cache_dir=None,
+    ).to(device)
+    mde_model.eval()
+    
     loader.dataset.load_depth = True
     model.eval()
     total_accumulator = new_validation_accumulator()
@@ -149,12 +157,20 @@ def validate(
         )
 
         with torch.autocast(device_type=device.type, enabled=amp):
-            out = model(
+            out = forward_with_rgb_model(
+                model,
+                mde_model,
                 candidate_imgs,
                 canonical_imgs,
                 camera_context[..., context_offset:],
                 target_size=candidate_imgs.shape[-2:],
             )
+            # model(
+            #     candidate_imgs,
+            #     canonical_imgs,
+            #     camera_context[..., context_offset:],
+            #     target_size=candidate_imgs.shape[-2:],
+            # )
             target_loss = ssi_independent_meter_space_depth_loss(
                 out["candidate_depth"],
                 out["canonical_depth"],
