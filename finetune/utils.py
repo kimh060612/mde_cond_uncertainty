@@ -96,6 +96,31 @@ def predict_metric3d(
     return prediction * (focal_length * resize_scale / 1000.0)
 
 
+def metric3d_decoder_only(model) -> torch.nn.Module:
+    depth_model = getattr(model, "depth_model", None)
+    if depth_model is None or not hasattr(depth_model, "encoder") or not hasattr(depth_model, "decoder"):
+        raise ValueError("Metric3D model does not expose depth_model.encoder/decoder.")
+    depth_model.encoder.requires_grad_(False).eval()
+    depth_model.decoder.requires_grad_(True)
+    return depth_model.decoder
+
+
+def predict_metric3d_decoder_only(
+    model,
+    rgb: torch.Tensor,
+    output_size: tuple[int, int],
+    focal_length: float,
+) -> torch.Tensor:
+    model_input, padding, resize_scale = metric3d_input(rgb)
+    depth_model = model.depth_model
+    depth_model.encoder.eval()
+    with torch.no_grad():
+        features = depth_model.encoder(model_input)
+    prediction = depth_model.decoder(features)["prediction"]
+    prediction = remove_padding(prediction, padding, output_size).squeeze(1)
+    return prediction * (focal_length * resize_scale / 1000.0)
+
+
 def metric3d_input(rgb: torch.Tensor) -> tuple[torch.Tensor, tuple[int, ...], float]:
     """공식 Metric3D v2 ViT letterbox/normalization 전처리."""
     input_height, input_width = 616, 1064

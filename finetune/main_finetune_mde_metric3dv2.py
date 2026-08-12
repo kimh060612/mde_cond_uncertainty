@@ -8,7 +8,12 @@ from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
 
 from finetune.finetune_dataset import MDEFineTuningDataset, split_dataset
-from finetune.utils import predict_metric3d, run_epoch, seed_everything
+from finetune.utils import (
+    metric3d_decoder_only,
+    predict_metric3d_decoder_only,
+    run_epoch,
+    seed_everything,
+)
 
 
 @hydra.main(config_path="../config", config_name="base_finetune", version_base=None)
@@ -58,8 +63,12 @@ def main(cfg: DictConfig) -> None:
         pretrain=True,
         trust_repo=True,
     ).to(device)
+    decoder = metric3d_decoder_only(model)
+    trainable = sum(parameter.numel() for parameter in decoder.parameters())
+    total = sum(parameter.numel() for parameter in model.parameters())
+    print(f"decoder-only trainable parameters: {trainable:,}/{total:,}")
     optimizer = torch.optim.AdamW(
-        model.parameters(),
+        decoder.parameters(),
         lr=cfg.training.lr_finetune,
         weight_decay=cfg.training.weight_decay,
     )
@@ -74,7 +83,7 @@ def main(cfg: DictConfig) -> None:
     )
     scaler = torch.amp.GradScaler(device.type, enabled=device.type == "cuda")
     metric3d_predictor = partial(
-        predict_metric3d,
+        predict_metric3d_decoder_only,
         focal_length=cfg.evaluation.metric3d_focal_length,
     )
     run = wandb.init(
