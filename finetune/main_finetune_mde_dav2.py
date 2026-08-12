@@ -112,6 +112,7 @@ def main(cfg: DictConfig) -> None:
                     "mde_finetune_val/a1": val_metrics["a1"],
                 },
                 step=epoch,
+                commit=True
             )
             print(
                 f"epoch {epoch:03d} "
