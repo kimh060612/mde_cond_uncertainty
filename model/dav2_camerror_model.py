@@ -397,7 +397,7 @@ class CameraInducedErrorModelRGBInput(nn.Module):
             nn.GroupNorm(self._valid_groups(feature_channels // 4),feature_channels // 4),
             nn.GELU(),
             nn.Conv2d(feature_channels // 4,feature_channels // 4,3,stride=2,padding=1,bias=False),
-            nn.GroupNorm(self._valid_groups(feature_channels // 2),feature_channels // 2),
+            nn.GroupNorm(self._valid_groups(feature_channels // 2),feature_channels // 4),
             nn.GELU(),
             nn.Conv2d(feature_channels // 4,feature_channels // 2,3,stride=2,padding=1,bias=False),
             nn.GroupNorm(self._valid_groups(feature_channels // 2),feature_channels // 2),
