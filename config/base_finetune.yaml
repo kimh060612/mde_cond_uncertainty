@@ -17,26 +17,24 @@ dataset:
   exposure_max: 32000
   gain_min: 16
   gain_max: 128
-  train_topologies:
+  training_ratio: 0.8
+  topology_sets:
     - "topology1"
-    - "topology3"
-    - "topology5"
-  seen_val_topologies:
-    - "topology1"
-    - "topology3"
-    - "topology4"
-  unseen_val_topologies:
     - "topology2"
+    - "topology3"
     - "topology4"
+    - "topology5"
 
 model:
   model_id: "small"
   image_height: 518
   image_width: 518
+  metric3d_output_dir: ./metric3dv2_ati_finetune_ckpt
 
 training:
   seed: 2026
   batch_size: 32
+  metric3d_batch_size: 4
   num_epochs: 50
   lr_finetune: 1e-4
   weight_decay: 1e-4

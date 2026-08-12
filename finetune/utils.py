@@ -3,6 +3,7 @@ import random
 import numpy as np
 import torch
 import torch.nn.functional as F
+from tqdm.auto import tqdm
 
 
 def seed_everything(seed: int) -> None:
@@ -12,15 +13,28 @@ def seed_everything(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def run_epoch(model, loader, device, optimizer=None, scaler=None) -> dict[str, float]:
+def run_epoch(
+    model,
+    loader,
+    device,
+    optimizer=None,
+    scaler=None,
+    predict_depth=None,
+    description="train",
+    min_depth=1e-3,
+    max_depth=10.0,
+) -> dict[str, float]:
     training = optimizer is not None
     model.train(training)
     totals = {"loss": 0.0, "abs_rel": 0.0, "a1": 0.0, "pixels": 0}
 
-    for batch in loader:
+    progress = tqdm(loader, desc=description, dynamic_ncols=True, leave=False)
+    for batch in progress:
         pixel_values = batch["pixel_values"].to(device, non_blocking=True)
         depth = batch["depth"].to(device, non_blocking=True)
         valid = batch["valid_mask"].to(device, non_blocking=True)
+        if not valid.any():
+            continue
 
         if training:
             optimizer.zero_grad(set_to_none=True)
@@ -28,13 +42,16 @@ def run_epoch(model, loader, device, optimizer=None, scaler=None) -> dict[str, f
         with torch.set_grad_enabled(training), torch.autocast(
             device_type=device.type, enabled=device.type == "cuda"
         ):
-            prediction = model(pixel_values=pixel_values).predicted_depth.unsqueeze(1)
-            prediction = F.interpolate(
-                prediction,
-                size=depth.shape[-2:],
-                mode="bicubic",
-                align_corners=False,
-            ).squeeze(1)
+            if predict_depth is None:
+                prediction = model(pixel_values=pixel_values).predicted_depth.unsqueeze(1)
+                prediction = F.interpolate(
+                    prediction,
+                    size=depth.shape[-2:],
+                    mode="bicubic",
+                    align_corners=False,
+                ).squeeze(1)
+            else:
+                prediction = predict_depth(model, pixel_values, depth.shape[-2:])
             loss = F.smooth_l1_loss(prediction[valid], depth[valid])
 
         if training:
@@ -43,7 +60,7 @@ def run_epoch(model, loader, device, optimizer=None, scaler=None) -> dict[str, f
             scaler.update()
 
         with torch.no_grad():
-            pred = prediction.float().clamp(1e-3, 10.0)
+            pred = prediction.float().clamp(min_depth, max_depth)
             target = depth.float()
             count = int(valid.sum())
             ratio = torch.maximum(
@@ -55,9 +72,28 @@ def run_epoch(model, loader, device, optimizer=None, scaler=None) -> dict[str, f
             )
             totals["a1"] += float((ratio < 1.25).sum())
             totals["pixels"] += count
+        progress.set_postfix(
+            loss=f"{totals['loss'] / totals['pixels']:.4f}",
+            abs_rel=f"{totals['abs_rel'] / totals['pixels']:.4f}",
+            a1=f"{totals['a1'] / totals['pixels']:.4f}",
+        )
 
     pixels = totals.pop("pixels")
+    if pixels == 0:
+        raise ValueError(f"{description} contained no valid depth pixels.")
     return {name: value / pixels for name, value in totals.items()}
+
+
+def predict_metric3d(
+    model,
+    rgb: torch.Tensor,
+    output_size: tuple[int, int],
+    focal_length: float,
+) -> torch.Tensor:
+    model_input, padding, resize_scale = metric3d_input(rgb)
+    prediction, _, _ = model({"input": model_input})
+    prediction = remove_padding(prediction, padding, output_size).squeeze(1)
+    return prediction * (focal_length * resize_scale / 1000.0)
 
 
 def metric3d_input(rgb: torch.Tensor) -> tuple[torch.Tensor, tuple[int, ...], float]:

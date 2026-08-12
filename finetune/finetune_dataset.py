@@ -5,7 +5,24 @@ import numpy as np
 import pandas as pd
 import torch
 from PIL import Image
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, Subset, random_split
+
+
+def split_dataset(
+    dataset: Dataset,
+    training_ratio: float,
+    seed: int,
+) -> tuple[Subset, Subset]:
+    if not 0.0 < training_ratio < 1.0:
+        raise ValueError("dataset.training_ratio must be between 0 and 1.")
+    train_size = int(len(dataset) * training_ratio)
+    if train_size == 0 or train_size == len(dataset):
+        raise ValueError("Dataset is too small for a non-empty train/validation split.")
+    return random_split(
+        dataset,
+        [train_size, len(dataset) - train_size],
+        generator=torch.Generator().manual_seed(seed),
+    )
 
 
 class MDEFineTuningDataset(Dataset):
@@ -27,6 +44,7 @@ class MDEFineTuningDataset(Dataset):
         min_depth: float,
         max_depth: float,
         topologies: Sequence[str] | None = None,
+        image_size: tuple[int, int] | None = None,
         path_replacements: Mapping[str, str] | None = None,
         valid_match_status: str = "matched",
         valid_registration_status: str = "registered",
@@ -67,6 +85,7 @@ class MDEFineTuningDataset(Dataset):
             raise ValueError("No optimal RGB/depth pairs remain after filtering.")
 
         self.image_processor = image_processor
+        self.image_size = image_size
         self.depth_scale = 1000.0 if camera_model_name.startswith("Orbbec") else 1.0
         self.min_depth = min_depth
         self.max_depth = max_depth
@@ -89,9 +108,16 @@ class MDEFineTuningDataset(Dataset):
         row = self.data.iloc[index]
         with Image.open(self._path(row["matched_rgb_path"])) as image:
             rgb = image.convert("RGB")
-            pixel_values = self.image_processor(
-                images=rgb, return_tensors="pt"
-            )["pixel_values"][0]
+            if self.image_processor is None:
+                if self.image_size is not None:
+                    rgb = rgb.resize(self.image_size[::-1], Image.Resampling.BILINEAR)
+                pixel_values = torch.from_numpy(
+                    np.array(rgb, dtype=np.float32).transpose(2, 0, 1) / 255.0
+                )
+            else:
+                pixel_values = self.image_processor(
+                    images=rgb, return_tensors="pt"
+                )["pixel_values"][0]
 
         depth = np.load(self._path(row["matched_depth_path"])).astype(np.float32)
         depth = np.squeeze(depth) / self.depth_scale
