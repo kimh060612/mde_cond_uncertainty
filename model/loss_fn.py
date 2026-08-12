@@ -586,29 +586,63 @@ def listwise_camera_ranking_loss(
 
     return -(target_preferences * predicted_log_preferences).sum()
 
-def groupwise_soft_optimal_loss(
-    group_bias: torch.Tensor,
-    group_degradation: torch.Tensor,
-    target_temperature: float,
-    prediction_temperature: float,
+def groupwise_pairwise_probit_loss(
+    group_mean: torch.Tensor,
+    group_variance: torch.Tensor,
+    group_abs_rel: torch.Tensor,
+    m_switch: float,
+    tie_eps_percent: float,
+    detach_pair_std: bool = True,
+    eps: float = 1e-6,
 ) -> torch.Tensor:
-    if group_bias.ndim != 2:
-        raise ValueError("group_bias must have shape [num_groups, group_size]")
-    if group_degradation.shape != group_bias.shape:
-        raise ValueError("group_degradation must have the same shape as group_bias")
-    if target_temperature <= 0 or prediction_temperature <= 0:
-        raise ValueError("softmax temperatures must be positive")
+    """Mean probit NLL per group over non-tie unordered candidate pairs."""
+    if group_mean.ndim != 2 or group_variance.shape != group_mean.shape:
+        raise ValueError("group_mean and group_variance must have shape [G, K]")
+    if group_abs_rel.shape != group_mean.shape:
+        raise ValueError("group_abs_rel must have the same shape as group_mean")
 
-    relative_degradation = group_degradation - group_degradation.min(
-        dim=1,
-        keepdim=True,
-    ).values
-    target_probabilities = F.softmax(
-        -relative_degradation / target_temperature,
-        dim=1,
-    ).detach()
-    predicted_log_probabilities = F.log_softmax(
-        -group_bias / prediction_temperature,
-        dim=1,
+    _, num_candidates = group_mean.shape
+    if num_candidates < 2:
+        return (group_mean.sum() + group_variance.sum()) * 0.0
+
+    pair_i, pair_j = torch.triu_indices(
+        num_candidates, num_candidates, offset=1, device=group_mean.device
     )
-    return -(target_probabilities * predicted_log_probabilities).sum(dim=1).mean()
+    abs_i = group_abs_rel[:, pair_i].detach()
+    abs_j = group_abs_rel[:, pair_j].detach()
+    gap_percent = (abs_i - abs_j).abs() / (torch.minimum(abs_i, abs_j) + eps) * 100.0
+    valid = (
+        torch.isfinite(group_mean[:, pair_i])
+        & torch.isfinite(group_mean[:, pair_j])
+        & torch.isfinite(group_variance[:, pair_i])
+        & torch.isfinite(group_variance[:, pair_j])
+        & torch.isfinite(abs_i)
+        & torch.isfinite(abs_j)
+        & (group_variance[:, pair_i] >= 0)
+        & (group_variance[:, pair_j] >= 0)
+        & (abs_i >= 0)
+        & (abs_j >= 0)
+        & (gap_percent >= tie_eps_percent)
+    )
+    pair_std = torch.sqrt(
+        (group_variance[:, pair_i] + group_variance[:, pair_j]).clamp_min(0)
+    )
+    if detach_pair_std:
+        pair_std = pair_std.detach()
+    z = (
+        group_mean[:, pair_i] - group_mean[:, pair_j] - m_switch
+    ) / (pair_std + eps)
+    sign = torch.where(abs_j < abs_i, 1.0, -1.0).to(z.dtype)
+    pair_loss = -torch.special.log_ndtr(
+        torch.where(valid, sign * z, torch.zeros_like(z)).float()
+    )
+    pair_count = valid.sum(dim=1)
+    group_loss = torch.where(
+        pair_count > 0,
+        torch.where(valid, pair_loss, 0.0).sum(dim=1) / pair_count.clamp_min(1),
+        0.0,
+    )
+    valid_groups = pair_count > 0
+    if not valid_groups.any():
+        return (group_mean.sum() + group_variance.sum()) * 0.0
+    return group_loss[valid_groups].mean()

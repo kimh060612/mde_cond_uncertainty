@@ -5,16 +5,14 @@ import torch
 import torch.nn.functional as F
 from tqdm.auto import tqdm
 
-from transformers import AutoModelForDepthEstimation
+# from transformers import AutoModelForDepthEstimation
 from dataset.ati_dataset_caminduce import flatten_group_batch
 from evaluation_utils.eval_metrics import compute_vector_masked_correlations
-from model.dav2_camerror_model import forward_with_rgb_model, inference_with_rgb_model
+# from model.dav2_camerror_model import forward_with_rgb_model, inference_with_rgb_model
 from model.loss_fn import (
+    groupwise_pairwise_probit_loss,
     scalar_heteroscedastic_loss,
     scale_shift_invariant_depth_loss,
-    signed_pairwise_ranknet_loss,
-    groupwise_soft_optimal_loss,
-    listwise_camera_ranking_loss
 )
 from model.loss_target import ssi_depth_guided_meter_space_depth_loss, ssi_independent_meter_space_depth_loss
 from utils.train_utils import reshape_group_batch, tensor_device
@@ -234,14 +232,11 @@ def train_one_epoch(
     amp: bool,
     lambda_smooth_logvar: float,
     lambda_variance: float,
-    list_loss_weight: float,
-    listnet_temperature: float,
-    use_ranking_loss: bool,
     group_size: int,
-    use_soft_optimal_loss: bool,
-    soft_optimal_loss_weight: float,
-    target_softmax_temperature: float,
-    prediction_softmax_temperature: float,
+    pairwise_m_switch: float,
+    pairwise_train_tie_eps_percent: float,
+    pairwise_loss_weight: float,
+    detach_pair_std: bool,
     uncertainty_mode: str,
     grad_clip: float,
     logger: logging.Logger,
@@ -259,11 +254,11 @@ def train_one_epoch(
     if hasattr(loader.dataset, "set_epoch"):
         loader.dataset.set_epoch(epoch)
 
-    mde_model = AutoModelForDepthEstimation.from_pretrained(
-        model_id,
-        cache_dir=None,
-    ).to(device)
-    mde_model.eval()
+    # mde_model = AutoModelForDepthEstimation.from_pretrained(
+    #     model_id,
+    #     cache_dir=None,
+    # ).to(device)
+    # mde_model.eval()
 
     model.train()
     progress_bar = tqdm(
@@ -279,7 +274,7 @@ def train_one_epoch(
         "mean_loss": 0.0,
         "variance_loss": 0.0,
         "ranking_loss": 0.0,
-        "soft_optimal_loss": 0.0,
+        "pairwise_policy_loss": 0.0,
     }
     rank_correct = 0
     rank_total = 0
@@ -324,15 +319,15 @@ def train_one_epoch(
         optimizer.zero_grad(set_to_none=True)
 
         with torch.autocast(device_type=device.type, enabled=amp):
-            out = forward_with_rgb_model(
-                model,
-                mde_model,
+            out = model(
                 candidate_imgs,
                 canonical_imgs,
                 camera_context[..., context_offset:],
                 target_size=candidate_imgs.shape[-2:],
             )
-            # model(
+            # forward_with_rgb_model(
+            #     model,
+            #     mde_model,
             #     candidate_imgs,
             #     canonical_imgs,
             #     camera_context[..., context_offset:],
@@ -351,40 +346,19 @@ def train_one_epoch(
                 out["variance"],
                 target_loss,
             )
-            # global_ce_loss = listwise_camera_ranking_loss(
-            #     out["camera_bias"],
-            #     target_loss,
-            #     temperature=listnet_temperature,
-            # )
             q_score = out["camera_bias"] + uncertainty_alpha * out["std"]
             group_bias = reshape_group_batch(out["camera_bias"], num_groups, num_candidates)
-            group_degradation = reshape_group_batch(abs_rel_degradation, num_groups, num_candidates)
-            group_target_loss = reshape_group_batch(target_loss, num_groups, num_candidates)
-            soft_optimal_loss = groupwise_soft_optimal_loss(
+            pairwise_policy_loss = groupwise_pairwise_probit_loss(
                 group_bias,
-                group_target_loss,      # group_degradation,
-                target_softmax_temperature,
-                prediction_softmax_temperature,
+                reshape_group_batch(out["variance"], num_groups, num_candidates),
+                reshape_group_batch(flat_batch["candidate_abs_rel"], num_groups, num_candidates),
+                m_switch=pairwise_m_switch,
+                tie_eps_percent=pairwise_train_tie_eps_percent,
+                detach_pair_std=detach_pair_std,
             )
-            ranking_loss = (
-                signed_pairwise_ranknet_loss(
-                    reshape_group_batch(q_score, num_groups, num_candidates),
-                    reshape_group_batch(target_loss, num_groups, num_candidates),
-                    temperature=listnet_temperature,
-                )
-                if use_ranking_loss
-                else group_bias.new_zeros(())
-            )
+            ranking_loss = group_bias.new_zeros(())
             nll_loss = mean_loss + lambda_variance * variance_loss
-            loss = (
-                nll_loss
-                + (
-                    soft_optimal_loss_weight * soft_optimal_loss
-                    if use_soft_optimal_loss
-                    else 0.0
-                )
-                + list_loss_weight * ranking_loss
-            )
+            loss = nll_loss + pairwise_loss_weight * pairwise_policy_loss
 
         scaler.scale(loss).backward()
         if grad_clip > 0:
@@ -438,7 +412,7 @@ def train_one_epoch(
         running["mean_loss"] += float(mean_loss.item())
         running["variance_loss"] += float(variance_loss.item())
         running["ranking_loss"] += float(ranking_loss.item())
-        running["soft_optimal_loss"] += float(soft_optimal_loss.item())
+        running["pairwise_policy_loss"] += float(pairwise_policy_loss.item())
         processed_batches += 1
         global_step += 1
 
@@ -453,15 +427,14 @@ def train_one_epoch(
 
         if log_interval > 0 and step % log_interval == 0:
             logger.info(
-                "epoch=%d step=%d/%d avg_loss=%.6f mean_loss=%.6f variance_loss=%.6f ranking_loss=%.6f soft_optimal_loss=%.6f",
+                "epoch=%d step=%d/%d avg_loss=%.6f mean_loss=%.6f variance_loss=%.6f pairwise_policy_loss=%.6f",
                 epoch,
                 step,
                 len(loader),
                 running["loss"] / n,
                 running["mean_loss"] / n,
                 running["variance_loss"] / n,
-                running["ranking_loss"] / n,
-                running["soft_optimal_loss"] / n,
+                running["pairwise_policy_loss"] / n,
             )
 
     n = max(processed_batches, 1)

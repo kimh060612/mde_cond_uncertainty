@@ -82,6 +82,14 @@ training:
   lr_scheduler_cooldown: 0
   lr_scheduler_min_lr_ratio: 0.05
 
+pairwise_policy:
+  m_switch: 0.01
+  beta: 0.07
+  train_tie_eps_percent: 3.0
+  eval_tie_eps_percent: [3.0, 5.0, 10.0]
+  loss_weight: 0.1
+  detach_pair_std: true
+
 evaluation:
   csv_path: /home/kimh060612/ati_workspace/mde_cond_uncertainty/orbbec_canonical_parameter_frame_matches_by_scene
   dataset_root: /datasets/ATI/MDE/orbbec_realworld_dataset

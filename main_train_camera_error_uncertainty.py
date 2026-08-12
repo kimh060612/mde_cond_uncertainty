@@ -14,7 +14,6 @@ from dataset.ati_dataset_caminduce import (
     FoundationCameraGroupedDataset
 )
 from dataset.ati_dataset_caminduce import *
-from evaluation_utils.eval_selection import plot_selection_alpha_sweep
 from model.dav2_ati_model import MODEL_IDS
 from model.dav2_camerror_model import CameraInducedErrorModel, CameraInducedErrorDecompositionModel, CameraInducedErrorModelRGBInput
 from omegaconf import DictConfig, OmegaConf
@@ -29,6 +28,24 @@ try:
     import wandb
 except ImportError:
     wandb = None
+
+
+_REMOVED_WANDB_METRICS = {
+    "selection_accuracy",
+    "selection_mean_regret_abs_rel",
+    "groupwise_top1_selection_accuracy",
+    "mean_selected_regret",
+    "selection_alpha_sweep",
+}
+
+
+def _wandb_validation_metrics(split, metrics):
+    return {
+        f"{split}/{key}": value
+        for key, value in metrics.items()
+        if key not in _REMOVED_WANDB_METRICS
+        and not key.startswith("selection_")
+    }
 
 
 @hydra.main(config_path="config", config_name="base_caminduce")
@@ -201,22 +218,10 @@ def main(cfg: DictConfig):
         pin_memory=pin_memory,
     )
 
-    # model = CameraInducedErrorModel( # CameraInducedErrorModel( CameraInducedErrorDecompositionModel
-    #     model_id=model_id,
-    #     context_dim=train_set.condition_dim - cfg.model.context_offset,
-    #     cache_dir=None,
-    #     feature_channels=cfg.model.uncertainty_width,
-    #     hidden_channels=cfg.model.uncertainty_width,
-    #     film_hidden_dim=cfg.model.film_layer_width,
-    #     max_bias=cfg.training.max_bias,
-    #     min_log_variance=cfg.training.min_log_var,
-    #     max_log_variance=cfg.training.max_log_var,
-    #     initial_std=cfg.training.initial_std,
-    #     variance_head_init_std=cfg.training.variance_head_init_std,
-    # ).to(device)
-    
-    model = CameraInducedErrorModelRGBInput(
+    model = CameraInducedErrorModel( # CameraInducedErrorModel( CameraInducedErrorDecompositionModel
+        model_id=model_id,
         context_dim=train_set.condition_dim - cfg.model.context_offset,
+        cache_dir=None,
         feature_channels=cfg.model.uncertainty_width,
         hidden_channels=cfg.model.uncertainty_width,
         film_hidden_dim=cfg.model.film_layer_width,
@@ -226,6 +231,18 @@ def main(cfg: DictConfig):
         initial_std=cfg.training.initial_std,
         variance_head_init_std=cfg.training.variance_head_init_std,
     ).to(device)
+
+    # model = CameraInducedErrorModelRGBInput(
+    #     context_dim=train_set.condition_dim - cfg.model.context_offset,
+    #     feature_channels=cfg.model.uncertainty_width,
+    #     hidden_channels=cfg.model.uncertainty_width,
+    #     film_hidden_dim=cfg.model.film_layer_width,
+    #     max_bias=cfg.training.max_bias,
+    #     min_log_variance=cfg.training.min_log_var,
+    #     max_log_variance=cfg.training.max_log_var,
+    #     initial_std=cfg.training.initial_std,
+    #     variance_head_init_std=cfg.training.variance_head_init_std,
+    # ).to(device)
     
     backbone_params = []
     uncertainty_params = []
@@ -292,14 +309,11 @@ def main(cfg: DictConfig):
             context_offset=cfg.model.context_offset,
             lambda_smooth_logvar=cfg.training.lambda_smooth_logvar,
             lambda_variance=cfg.training.lambda_variance,
-            list_loss_weight=cfg.training.list_loss_weight,
-            listnet_temperature=cfg.training.listnet_temperature,
-            use_ranking_loss=cfg.training.use_ranking_loss,
             group_size=group_size,
-            use_soft_optimal_loss=cfg.training.use_soft_optimal_loss,
-            soft_optimal_loss_weight=cfg.training.soft_optimal_loss_weight,
-            target_softmax_temperature=cfg.training.target_softmax_temperature,
-            prediction_softmax_temperature=cfg.training.prediction_softmax_temperature,
+            pairwise_m_switch=cfg.pairwise_policy.m_switch,
+            pairwise_train_tie_eps_percent=cfg.pairwise_policy.train_tie_eps_percent,
+            pairwise_loss_weight=cfg.pairwise_policy.loss_weight,
+            detach_pair_std=cfg.pairwise_policy.detach_pair_std,
             uncertainty_mode=cfg.training.uncertainty_mode,
             grad_clip=cfg.training.grad_clip,
             min_depth=cfg.dataset.min_depth,
@@ -313,7 +327,7 @@ def main(cfg: DictConfig):
             val_total_metrics,
             val_seen_metrics,
             val_unseen_metrics,
-            selection_sweeps,
+            pairwise_roc_figures,
         ) = validate(
             epoch=epoch,
             model_id=model_id,
@@ -325,14 +339,13 @@ def main(cfg: DictConfig):
             unseen_topology_numbers=unseen_topology_idx,
             lambda_smooth_logvar=cfg.training.lambda_smooth_logvar,
             lambda_variance=cfg.training.lambda_variance,
-            list_loss_weight=cfg.training.list_loss_weight,
-            listnet_temperature=cfg.training.listnet_temperature,
-            use_ranking_loss=cfg.training.use_ranking_loss,
             group_size=group_size,
-            use_soft_optimal_loss=cfg.training.use_soft_optimal_loss,
-            soft_optimal_loss_weight=cfg.training.soft_optimal_loss_weight,
-            target_softmax_temperature=cfg.training.target_softmax_temperature,
-            prediction_softmax_temperature=cfg.training.prediction_softmax_temperature,
+            pairwise_m_switch=cfg.pairwise_policy.m_switch,
+            pairwise_beta=cfg.pairwise_policy.beta,
+            pairwise_train_tie_eps_percent=cfg.pairwise_policy.train_tie_eps_percent,
+            pairwise_eval_tie_eps_percent=cfg.pairwise_policy.eval_tie_eps_percent,
+            pairwise_loss_weight=cfg.pairwise_policy.loss_weight,
+            detach_pair_std=cfg.pairwise_policy.detach_pair_std,
             uncertainty_mode=cfg.training.uncertainty_mode,
             correlation_max_samples=cfg.training.correlation_max_samples,
             min_depth=cfg.dataset.min_depth,
@@ -340,9 +353,6 @@ def main(cfg: DictConfig):
             relative_align_mode=cfg.training.relative_align_mode,
             context_offset=cfg.model.context_offset,
             uncertainty_alpha=cfg.training.get("uncertainty_alpha", 1.0),
-            selection_min_settings=group_size,
-            selection_thresholds=cfg.evaluation.relative_regret_thresholds_percent,
-            selection_alpha_values=cfg.evaluation.alpha_sweep_values,
         )
         
         print(f"[epoch {epoch}] train={train_metrics}")
@@ -387,7 +397,6 @@ def main(cfg: DictConfig):
                 wandb_run.summary["best_epoch"] = epoch
 
         if wandb_run is not None:
-            selection_figure = plot_selection_alpha_sweep(selection_sweeps)
             wandb_run.log({
                 "epoch": epoch,
                 "best/q_abs_rel_degradation_spearman": best_abs_rel_correlation,
@@ -398,46 +407,15 @@ def main(cfg: DictConfig):
                     for group_idx, group in enumerate(optimizer.param_groups)
                 },
                 **{f"train/{key}": value for key, value in train_metrics.items()},
-                **{
-                    f"val/{key}": value
-                    for key, value in val_total_metrics.items()
-                    if not key.startswith("selection_")
-                },
-                **{
-                    f"val_seen/{key}": value
-                    for key, value in val_seen_metrics.items()
-                    if not key.startswith("selection_")
-                },
-                **{
-                    f"val_unseen/{key}": value
-                    for key, value in val_unseen_metrics.items()
-                    if not key.startswith("selection_")
-                },
-                "val_seen/selection_accuracy": val_seen_metrics[
-                    "selection_accuracy"
-                ],
-                "val_seen/selection_mean_regret_abs_rel": val_seen_metrics[
-                    "selection_mean_regret_abs_rel"
-                ],
-                "val_unseen/selection_accuracy": val_unseen_metrics[
-                    "selection_accuracy"
-                ],
-                "val_unseen/selection_mean_regret_abs_rel": val_unseen_metrics[
-                    "selection_mean_regret_abs_rel"
-                ],
-                "val/selection_accuracy_within_3pct": val_total_metrics[
-                    "selection_accuracy_within_3pct"
-                ],
-                "val/selection_accuracy_within_5pct": val_total_metrics[
-                    "selection_accuracy_within_5pct"
-                ],
-                "val/selection_accuracy_within_10pct": val_total_metrics[
-                    "selection_accuracy_within_10pct"
-                ],
-                "val/selection_alpha_sweep": wandb.Image(selection_figure),
+                **_wandb_validation_metrics("val", val_total_metrics),
+                **_wandb_validation_metrics("val_seen", val_seen_metrics),
+                **_wandb_validation_metrics("val_unseen", val_unseen_metrics),
+                "val_seen/pairwise_policy_roc": wandb.Image(pairwise_roc_figures["seen"]),
+                "val_unseen/pairwise_policy_roc": wandb.Image(pairwise_roc_figures["unseen"]),
             }, step=epoch, commit=True)
-            import matplotlib.pyplot as plt
-            plt.close(selection_figure)
+        import matplotlib.pyplot as plt
+        for figure in pairwise_roc_figures.values():
+            plt.close(figure)
     
     if wandb_run is not None:
         wandb_run.finish()
