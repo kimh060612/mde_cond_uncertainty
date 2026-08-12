@@ -20,7 +20,7 @@ dataset:
   train_topologies:
     - "topology1"
     - "topology3"
-    - "topology5
+    - "topology5"
   seen_val_topologies:
     - "topology1"
     - "topology3"
