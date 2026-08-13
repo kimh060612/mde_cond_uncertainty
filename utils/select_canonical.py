@@ -10,6 +10,7 @@ from tqdm import tqdm
 import cv2
 import numpy as np
 import torch
+import torch.nn.functional as F
 from PIL import Image
 from transformers import AutoImageProcessor, AutoModelForDepthEstimation
 from itertools import product
@@ -43,6 +44,7 @@ MODEL_IDS = {
     "metric-outdoor-base": "depth-anything/Depth-Anything-V2-Metric-Outdoor-Base-hf",
 }
 MODEL_ID = MODEL_IDS["small"]
+DA3_SMALL_MODEL_ID = "depth-anything/da3-small"
 HF_CACHE_DIR = os.environ.get("HF_HOME") or None
 LOCAL_FILES_ONLY = os.environ.get("DEPTH_ANYTHING_LOCAL_FILES_ONLY", "1") != "0"
 EVAL_BATCH_SIZE = int(os.environ.get("DEPTH_EVAL_BATCH_SIZE", "64"))
@@ -55,6 +57,7 @@ ORACLE_TOPK_METRIC_CANDIDATES = int(os.environ.get("ORACLE_TOPK_METRIC_CANDIDATE
 ORACLE_PRIMARY_METRIC = "abs_rel"
 ORACLE_TIEBREAKER_METRIC = "a1"
 MATCH_POLICY = f"oracle_{ORACLE_PRIMARY_METRIC}_primary_{ORACLE_TIEBREAKER_METRIC}_tiebreak"
+DA3_MATCH_POLICY = f"da3_small_{MATCH_POLICY}"
 RGB_MATCH_PATCH_SIZE = 256
 DTW_DEPTH_FEATURE_SIZE = (8, 8)
 DTW_MAX_SEQUENCE_LENGTH = 120
@@ -236,6 +239,392 @@ class SelectCanonicalandMatchFrames:
             outputs = model(**inputs)
         processed = processor.post_process_depth_estimation(outputs, target_sizes=target_shapes)
         return [entry["predicted_depth"].to(device=device, dtype=torch.float32) for entry in processed]
+
+    def _load_da3_model(self, model_id, device):
+        try:
+            from depth_anything_3.api import DepthAnything3
+        except ImportError as exc:
+            raise ImportError(
+                "Depth Anything 3 is required to migrate canonical CSV files."
+            ) from exc
+
+        model = DepthAnything3.from_pretrained(
+            model_id,
+            cache_dir=HF_CACHE_DIR,
+            local_files_only=LOCAL_FILES_ONLY,
+        )
+        return model.eval().to(device)
+
+    def _predict_da3_depth_batch(
+        self,
+        model,
+        rgb_paths,
+        device,
+        process_res,
+        process_res_method,
+    ):
+        inputs = [
+            model.input_processor(
+                [str(rgb_path)],
+                process_res=process_res,
+                process_res_method=process_res_method,
+                num_workers=1,
+                print_progress=False,
+                sequential=True,
+            )[0]
+            for rgb_path in rgb_paths
+        ]
+        predictions = [None] * len(inputs)
+        shape_groups = {}
+        for index, input_tensor in enumerate(inputs):
+            shape_groups.setdefault(tuple(input_tensor.shape), []).append(index)
+
+        for indices in shape_groups.values():
+            batch = torch.stack([inputs[index] for index in indices], dim=0).to(device)
+            output = model(batch, export_feat_layers=[])
+            depth = output["depth"].float()
+            if depth.ndim == 5 and depth.shape[2] == 1:
+                depth = depth[:, :, 0]
+            if depth.ndim == 4 and depth.shape[1] == 1:
+                depth = depth[:, 0]
+            if depth.ndim != 3 or depth.shape[0] != len(indices):
+                raise RuntimeError(f"Unexpected DA3 depth shape: {tuple(depth.shape)}")
+            for batch_index, input_index in enumerate(indices):
+                predictions[input_index] = depth[batch_index]
+        return predictions
+
+    def _da3_metrics_for_prediction(self, prediction, depth_path, device):
+        target = torch.from_numpy(self._load_depth_meters(depth_path)).to(
+            device=device,
+            dtype=torch.float32,
+        )[None, None]
+        prediction = F.interpolate(
+            prediction[None, None],
+            size=target.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+        valid_mask = (
+            torch.isfinite(target)
+            & torch.isfinite(prediction)
+            & (target > MIN_DEPTH)
+            & (target < MAX_DEPTH)
+            & (prediction > 0)
+        )
+        if int(valid_mask.sum()) < 10:
+            return {metric: NO_MATCH_VALUE for metric in DEPTH_PERFORMANCE_METRICS}
+
+        aligned = align_relative_prediction_to_depth_space(
+            prediction,
+            target,
+            valid_mask,
+            align_mode="scale_shift",
+        )["depth"]
+        values = compute_comprehensive_depth_metrics(
+            aligned,
+            target,
+            valid_mask,
+            min_depth=MIN_DEPTH,
+            max_depth=MAX_DEPTH,
+        )
+        metrics = {metric: NO_MATCH_VALUE for metric in DEPTH_PERFORMANCE_METRICS}
+        metrics.update({name: float(value[0].cpu()) for name, value in values.items()})
+        if not all(np.isfinite(value) for value in metrics.values() if value != NO_MATCH_VALUE):
+            return {metric: NO_MATCH_VALUE for metric in DEPTH_PERFORMANCE_METRICS}
+        return metrics
+
+    def _csv_source_record(self, row, csv_dir):
+        frame_index = int(float(row["source_frame_index"]))
+        scene = row["scene"]
+        pair_dir = row["source_pair_dir"]
+        lap_dir = row["source_lap_dir"]
+
+        def resolve_path(column, folder, suffix):
+            path = Path(row[column])
+            candidates = [path]
+            if not path.is_absolute():
+                candidates.append(csv_dir / path)
+            candidates.append(
+                Path(self.data_path)
+                / scene
+                / pair_dir
+                / lap_dir
+                / folder
+                / f"{frame_index:06d}{suffix}"
+            )
+            for candidate in candidates:
+                if candidate.is_file():
+                    return str(candidate.resolve())
+            raise FileNotFoundError(f"Cannot resolve {column}: {row[column]}")
+
+        return {
+            "scene": scene,
+            "pair_index": int(float(row["source_pair_index"])),
+            "pair_dir": pair_dir,
+            "exposure": int(float(row["source_exposure"])),
+            "gain": int(float(row["source_gain"])),
+            "lap_dir_name": lap_dir,
+            "frame_index": frame_index,
+            "time_sec": float(row["source_time_sec"]),
+            "motion_label": row["source_motion_label"],
+            "rgb_path": resolve_path("source_rgb_path", "rgb", ".png"),
+            "depth_path": resolve_path("source_depth_path", "depth", ".npy"),
+        }
+
+    @staticmethod
+    def _record_identity(record):
+        return (
+            record["scene"],
+            int(record["pair_index"]),
+            record["lap_dir_name"],
+            int(record["frame_index"]),
+        )
+
+    @staticmethod
+    def _old_match_identity(row):
+        try:
+            return (
+                row["scene"],
+                int(float(row["canonical_pair_index"])),
+                row["matched_lap_dir"],
+                int(float(row["matched_frame_index"])),
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _camera_parameter(record):
+        return int(record["exposure"]), int(record["gain"])
+
+    @staticmethod
+    def _old_camera_parameter(row):
+        try:
+            return int(float(row["canonical_exposure"])), int(float(row["canonical_gain"]))
+        except (KeyError, TypeError, ValueError):
+            return None
+
+    def _prepare_da3_metric_list(self, records, metrics_by_rgb_path):
+        self.metric_list = {}
+        self.performance_metric_lookup_cache.clear()
+        for record in records:
+            metrics = metrics_by_rgb_path[record["rgb_path"]]
+            scene_metrics = self.metric_list.setdefault(record["scene"], {})
+            pair_metrics = scene_metrics.setdefault(record["pair_dir"], {})
+            pair_metrics.setdefault(record["motion_label"], []).append({
+                "curr_time": record["time_sec"],
+                "rgb_path": record["rgb_path"],
+                **metrics,
+            })
+
+    def _evaluate_da3_records(
+        self,
+        records,
+        model,
+        device,
+        batch_size,
+        process_res,
+        process_res_method,
+    ):
+        unique_records = {record["rgb_path"]: record for record in records}
+        items = list(unique_records.values())
+        metrics = {}
+        for start in tqdm(range(0, len(items), batch_size), desc="DA3 canonical metrics"):
+            batch_records = items[start:start + batch_size]
+            predictions = self._predict_da3_depth_batch(
+                model,
+                [record["rgb_path"] for record in batch_records],
+                device,
+                process_res,
+                process_res_method,
+            )
+            for record, prediction in zip(batch_records, predictions):
+                metrics[record["rgb_path"]] = self._da3_metrics_for_prediction(
+                    prediction,
+                    record["depth_path"],
+                    device,
+                )
+        return metrics
+
+    def _migrate_da3_row(
+        self,
+        old_row,
+        source_record,
+        source_lap_records,
+        oracle_entry,
+        records_by_identity,
+    ):
+        candidates = self._oracle_candidate_records_for_source(
+            source_record,
+            source_lap_records,
+            oracle_entry,
+        )
+        proposed_record = candidates[0][3] if candidates else source_record
+        old_parameter = self._old_camera_parameter(old_row)
+        proposed_parameter = self._camera_parameter(proposed_record)
+
+        if old_row.get("match_status") == "matched" and old_parameter == proposed_parameter:
+            row = dict(old_row)
+            canonical_record = records_by_identity.get(self._old_match_identity(old_row))
+            if canonical_record is None:
+                raise ValueError(
+                    "Existing matched canonical frame is absent from the input CSV."
+                )
+            row.update(self._performance_metric_fields(source_record, canonical_record))
+            row["match_policy"] = DA3_MATCH_POLICY
+            return row, "reused"
+
+        best_match = self._find_best_oracle_match(
+            source_record,
+            source_lap_records,
+            oracle_entry,
+        )
+        row = dict(old_row)
+        if best_match is None:
+            row.update(self._performance_metric_fields(source_record=source_record))
+            row.update(
+                self._no_match_fields(
+                    "registration_failed",
+                    registration_status="registration_failed",
+                )
+            )
+            row["match_policy"] = DA3_MATCH_POLICY
+            return row, "failed"
+
+        canonical_param = self._record_param_tuple(best_match["record"])
+        row.update(self._match_fields(best_match, canonical_param, source_record))
+        row["match_policy"] = DA3_MATCH_POLICY
+        return row, best_match["registration_status"]
+
+    def _migrate_one_csv_to_da3(
+        self,
+        input_csv,
+        output_csv,
+        model,
+        device,
+        batch_size,
+        process_res,
+        process_res_method,
+    ):
+        with input_csv.open("r", newline="", encoding="utf-8") as csv_file:
+            reader = csv.DictReader(csv_file)
+            fieldnames = reader.fieldnames or []
+            missing = set(CSV_COLUMNS) - set(fieldnames)
+            if missing:
+                raise ValueError(
+                    f"{input_csv} is missing columns: {', '.join(sorted(missing))}"
+                )
+            old_rows = list(reader)
+
+        row_records = [
+            self._csv_source_record(row, input_csv.parent)
+            for row in old_rows
+        ]
+        unique_records = {
+            self._record_identity(record): record
+            for record in row_records
+        }
+        records = list(unique_records.values())
+        metrics = self._evaluate_da3_records(
+            records,
+            model,
+            device,
+            batch_size,
+            process_res,
+            process_res_method,
+        )
+        self._prepare_da3_metric_list(records, metrics)
+
+        pair_records = {}
+        lap_records = {}
+        for record in records:
+            scene_pairs = pair_records.setdefault(record["scene"], {})
+            scene_pairs.setdefault(
+                (record["pair_index"], record["pair_dir"]), []
+            ).append(record)
+            lap_records.setdefault(
+                (record["scene"], record["pair_dir"], record["lap_dir_name"]), []
+            ).append(record)
+        for records_in_lap in lap_records.values():
+            records_in_lap.sort(key=lambda record: record["time_sec"])
+
+        oracle_index = self._build_oracle_frame_index(
+            list(pair_records),
+            csv_pair_records=pair_records,
+        )
+        counts = {"reused": 0, "registered": 0, "self_oracle": 0, "failed": 0}
+        migrated_rows = []
+        for old_row, source_record in zip(old_rows, row_records):
+            source_lap_records = lap_records[
+                (source_record["scene"], source_record["pair_dir"], source_record["lap_dir_name"])
+            ]
+            oracle_entry = oracle_index[source_record["scene"]][source_record["motion_label"]]
+            row, action = self._migrate_da3_row(
+                old_row,
+                source_record,
+                source_lap_records,
+                oracle_entry,
+                unique_records,
+            )
+            counts[action] = counts.get(action, 0) + 1
+            migrated_rows.append(row)
+
+        output_csv.parent.mkdir(parents=True, exist_ok=True)
+        with output_csv.open("x", newline="", encoding="utf-8") as csv_file:
+            writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(migrated_rows)
+
+        return {
+            "input_csv": input_csv,
+            "output_csv": output_csv,
+            "rows": len(migrated_rows),
+            **counts,
+        }
+
+    def migrate_csvs_to_da3(
+        self,
+        input_csv_paths,
+        output_dir,
+        model_id=DA3_SMALL_MODEL_ID,
+        device=None,
+        batch_size=EVAL_BATCH_SIZE,
+        process_res=504,
+        process_res_method="upper_bound_resize",
+    ):
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive.")
+        input_csv_paths = [Path(path).resolve() for path in input_csv_paths]
+        if not input_csv_paths:
+            raise ValueError("At least one input CSV is required.")
+        output_dir = Path(output_dir).resolve()
+        output_paths = [output_dir / path.name for path in input_csv_paths]
+        if len(set(output_paths)) != len(output_paths):
+            raise ValueError("Input CSV basenames must be unique.")
+        for input_csv, output_csv in zip(input_csv_paths, output_paths):
+            if not input_csv.is_file():
+                raise FileNotFoundError(input_csv)
+            if input_csv == output_csv or output_csv.exists():
+                raise FileExistsError(
+                    f"Refusing to overwrite CSV; choose a new output path: {output_csv}"
+                )
+
+        device = torch.device(
+            device or os.environ.get("DEVICE") or ("cuda:0" if torch.cuda.is_available() else "cpu")
+        )
+        print(f"Using Depth Anything 3 model: {model_id} on {device}")
+        model = self._load_da3_model(model_id, device)
+        return [
+            self._migrate_one_csv_to_da3(
+                input_csv,
+                output_csv,
+                model,
+                device,
+                batch_size,
+                process_res,
+                process_res_method,
+            )
+            for input_csv, output_csv in zip(input_csv_paths, output_paths)
+        ]
 
     @staticmethod
     def _frame_time_sec(frame_metadata):
@@ -551,7 +940,7 @@ class SelectCanonicalandMatchFrames:
     def _same_frame_record(self, left_record, right_record):
         return str(left_record.get("rgb_path")) == str(right_record.get("rgb_path"))
 
-    def _build_oracle_frame_index(self, scene_names=None):
+    def _build_oracle_frame_index(self, scene_names=None, csv_pair_records=None):
         if scene_names is None:
             scene_names = list(self.metric_list.keys())
         elif isinstance(scene_names, str):
@@ -566,12 +955,21 @@ class SelectCanonicalandMatchFrames:
         }
 
         for scene_name in scene_names:
-            for pair_index, (exposure, gain, p_prefix) in enumerate(self.param_pairs):
-                if exposure == 2000:
-                    continue
+            if csv_pair_records is None:
+                pair_groups = []
+                for pair_index, (exposure, gain, p_prefix) in enumerate(self.param_pairs):
+                    if exposure == 2000:
+                        continue
+                    pair_dir = f"pair_{pair_index:03d}_{p_prefix}"
+                    pair_groups.append(
+                        self._get_pair_records(
+                            scene_name, exposure, gain, pair_index, pair_dir
+                        )
+                    )
+            else:
+                pair_groups = csv_pair_records.get(scene_name, {}).values()
 
-                pair_dir = f"pair_{pair_index:03d}_{p_prefix}"
-                pair_records = self._get_pair_records(scene_name, exposure, gain, pair_index, pair_dir)
+            for pair_records in pair_groups:
                 pair_records = [
                     record for record in pair_records
                     if Path(record["rgb_path"]).exists() and Path(record["depth_path"]).exists()

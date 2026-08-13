@@ -15,7 +15,12 @@ from dataset.ati_dataset_caminduce import (
 )
 from dataset.ati_dataset_caminduce import *
 from model.dav2_ati_model import MODEL_IDS
-from model.dav2_camerror_model import CameraInducedErrorModel, CameraInducedErrorDecompositionModel, CameraInducedErrorModelRGBInput
+from model.dav2_camerror_model import (
+    CameraInducedErrorModel, 
+    CameraInducedErrorDecompositionModel, 
+    CameraInducedErrorModelRGBInput, 
+    CameraInducedErrorModelDAv3
+)
 from omegaconf import DictConfig, OmegaConf
 from utils.train_utils import *
 from utils.trainer_camind import train_one_epoch
@@ -218,7 +223,7 @@ def main(cfg: DictConfig):
         pin_memory=pin_memory,
     )
 
-    model = CameraInducedErrorModel( # CameraInducedErrorModel( CameraInducedErrorDecompositionModel
+    model = CameraInducedErrorModelDAv3( # CameraInducedErrorModel( CameraInducedErrorDecompositionModel CameraInducedErrorModelDAv3
         model_id=model_id,
         context_dim=train_set.condition_dim - cfg.model.context_offset,
         cache_dir=None,

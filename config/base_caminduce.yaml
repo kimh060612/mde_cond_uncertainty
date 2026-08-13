@@ -99,3 +99,9 @@ evaluation:
   inference_batch_size: 8
   checkpoint_path: null
   output_dir: ./selection_evaluation
+  pairwise_beta_sweep:
+    min: 0.0
+    max: 2.326
+    num_points: 201
+    selection_split: seen
+    objective: accuracy

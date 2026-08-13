@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import math
 from glob import glob
 from pathlib import Path
 
@@ -24,6 +25,270 @@ from evaluation_utils.eval_selection import (
 from model.dav2_ati_model import MODEL_IDS
 from model.dav2_camerror_model import CameraInducedErrorModel
 from utils.train_utils import seed_everything, topology_id
+
+
+PAIRWISE_METRIC_COLUMNS = [
+    "auroc", "accuracy", "balanced_accuracy", "precision", "recall",
+    "specificity", "f1", "switch_rate", "coverage", "num_pairs",
+    "tp", "fp", "tn", "fn",
+]
+
+
+def normal_cdf(value: float) -> float:
+    return 0.5 * (1.0 + math.erf(value / math.sqrt(2.0)))
+
+
+def beta_grid(cfg: DictConfig) -> list[float]:
+    sweep = cfg.evaluation.pairwise_beta_sweep
+    values = torch.linspace(
+        float(sweep.min), float(sweep.max), int(sweep.num_points),
+        dtype=torch.float64,
+    ).tolist()
+    return sorted(set(values + [float(cfg.pairwise_policy.beta)]))
+
+
+def ordered_pairwise_data(
+    mean: torch.Tensor,
+    std: torch.Tensor,
+    abs_rel: torch.Tensor,
+    group_id: torch.Tensor,
+    m_switch: float,
+    tie_eps_percent: float,
+    eps: float = 1e-6,
+) -> dict[str, torch.Tensor | float]:
+    scores, labels, gaps = [], [], []
+    for value in torch.unique(group_id):
+        mask = group_id == value
+        group_mean, group_std, group_abs_rel = mean[mask], std[mask], abs_rel[mask]
+        pair_i, pair_j = torch.triu_indices(
+            group_mean.numel(), group_mean.numel(), offset=1
+        )
+        valid = (
+            torch.isfinite(group_mean[pair_i])
+            & torch.isfinite(group_mean[pair_j])
+            & torch.isfinite(group_std[pair_i])
+            & torch.isfinite(group_std[pair_j])
+            & torch.isfinite(group_abs_rel[pair_i])
+            & torch.isfinite(group_abs_rel[pair_j])
+            & (group_std[pair_i] >= 0)
+            & (group_std[pair_j] >= 0)
+            & (group_abs_rel[pair_i] >= 0)
+            & (group_abs_rel[pair_j] >= 0)
+        )
+        pair_i, pair_j = pair_i[valid], pair_j[valid]
+        if pair_i.numel() == 0:
+            continue
+        pair_std = torch.hypot(group_std[pair_i], group_std[pair_j])
+        gap = (group_abs_rel[pair_i] - group_abs_rel[pair_j]).abs() / (
+            torch.minimum(group_abs_rel[pair_i], group_abs_rel[pair_j]) + eps
+        ) * 100.0
+        scores.append(torch.cat([
+            (group_mean[pair_i] - group_mean[pair_j] - m_switch) / (pair_std + eps),
+            (group_mean[pair_j] - group_mean[pair_i] - m_switch) / (pair_std + eps),
+        ]))
+        labels.append(torch.cat([
+            group_abs_rel[pair_j] < group_abs_rel[pair_i],
+            group_abs_rel[pair_i] < group_abs_rel[pair_j],
+        ]))
+        gaps.append(torch.cat([gap, gap]))
+
+    if not scores:
+        empty = torch.empty(0)
+        return {"scores": empty, "labels": empty.bool(), "coverage": float("nan")}
+    scores, labels, gaps = torch.cat(scores), torch.cat(labels), torch.cat(gaps)
+    keep = gaps >= tie_eps_percent
+    return {
+        "scores": scores[keep],
+        "labels": labels[keep],
+        "coverage": float(keep.float().mean()),
+    }
+
+
+def roc_curve(scores: torch.Tensor, labels: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, float]:
+    positives, negatives = int(labels.sum()), int((~labels).sum())
+    if not scores.numel() or not positives or not negatives:
+        nan = scores.new_tensor(float("nan"))
+        return nan[None], nan[None], float("nan")
+    order = torch.argsort(scores, descending=True)
+    scores, labels = scores[order], labels[order]
+    ends = torch.cat([
+        torch.nonzero(scores[:-1] != scores[1:], as_tuple=False).flatten(),
+        torch.tensor([scores.numel() - 1]),
+    ])
+    tp = labels.long().cumsum(0)[ends].float()
+    fp = (~labels).long().cumsum(0)[ends].float()
+    tpr = torch.cat([torch.zeros(1), tp / positives])
+    fpr = torch.cat([torch.zeros(1), fp / negatives])
+    return fpr, tpr, float(torch.trapz(tpr, fpr))
+
+
+def policy_metrics(
+    pair_data: dict[str, torch.Tensor | float],
+    beta: float,
+    auroc: float,
+) -> dict[str, float | int]:
+    scores, labels = pair_data["scores"], pair_data["labels"]
+    decisions = scores > beta
+    tp = int((decisions & labels).sum())
+    fp = int((decisions & ~labels).sum())
+    tn = int((~decisions & ~labels).sum())
+    fn = int((~decisions & labels).sum())
+    total = tp + fp + tn + fn
+    precision = tp / (tp + fp) if tp + fp else float("nan")
+    recall = tp / (tp + fn) if tp + fn else float("nan")
+    specificity = tn / (tn + fp) if tn + fp else float("nan")
+    f1_denominator = 2 * tp + fp + fn
+    return {
+        "auroc": auroc,
+        "accuracy": (tp + tn) / total if total else float("nan"),
+        "balanced_accuracy": (recall + specificity) / 2,
+        "precision": precision,
+        "recall": recall,
+        "specificity": specificity,
+        "f1": (
+            float("nan") if math.isnan(precision)
+            else 2 * tp / f1_denominator if f1_denominator else float("nan")
+        ),
+        "switch_rate": (tp + fp) / total if total else float("nan"),
+        "coverage": pair_data["coverage"],
+        "num_pairs": total,
+        "tp": tp, "fp": fp, "tn": tn, "fn": fn,
+    }
+
+
+def evaluate_pairwise_policy(
+    predictions: dict[str, torch.Tensor],
+    split_masks: dict[str, torch.Tensor],
+    cfg: DictConfig,
+) -> tuple[list[dict], list[dict], dict]:
+    betas = beta_grid(cfg)
+    tie_values = list(map(float, cfg.pairwise_policy.eval_tie_eps_percent))
+    m_switch = float(cfg.pairwise_policy.m_switch)
+    pair_data, sweep_rows = {}, []
+    for split, mask in split_masks.items():
+        for tie_eps in tie_values:
+            data = ordered_pairwise_data(
+                predictions["camera_bias"][mask], predictions["camera_std"][mask],
+                predictions["candidate_abs_rel"][mask], predictions["group_id"][mask],
+                m_switch, tie_eps,
+            )
+            pair_data[split, tie_eps] = data
+            _, _, auroc = roc_curve(data["scores"], data["labels"])
+            for beta in betas:
+                sweep_rows.append({
+                    "split": split,
+                    "tie_eps_percent": tie_eps,
+                    "beta": beta,
+                    "switch_probability": normal_cdf(beta),
+                    "m_switch": m_switch,
+                    **policy_metrics(data, beta, auroc),
+                })
+
+    selection_split = str(cfg.evaluation.pairwise_beta_sweep.selection_split)
+    if selection_split != "seen":
+        raise ValueError("pairwise beta selection_split must be 'seen'.")
+    objective = str(cfg.evaluation.pairwise_beta_sweep.objective)
+    if objective not in PAIRWISE_METRIC_COLUMNS:
+        raise ValueError(f"Unknown pairwise beta objective: {objective}")
+    selected, summary_rows = {}, []
+    for tie_eps in tie_values:
+        candidates = [
+            row for row in sweep_rows
+            if row["split"] == selection_split and row["tie_eps_percent"] == tie_eps
+        ]
+        best = max(
+            candidates,
+            key=lambda row: (
+                -math.inf if math.isnan(float(row[objective])) else float(row[objective]),
+                -math.inf if math.isnan(float(row["precision"])) else float(row["precision"]),
+                float(row["beta"]),
+            ),
+        )
+        selected[tie_eps] = float(best["beta"])
+        for split in split_masks:
+            row = next(
+                value for value in sweep_rows
+                if value["split"] == split
+                and value["tie_eps_percent"] == tie_eps
+                and value["beta"] == best["beta"]
+            )
+            summary_rows.append({
+                "tie_eps_percent": tie_eps,
+                "selection_split": selection_split,
+                "objective": objective,
+                "selected_beta": best["beta"],
+                "selected_switch_probability": best["switch_probability"],
+                "evaluation_split": split,
+                **{key: row[key] for key in PAIRWISE_METRIC_COLUMNS},
+            })
+    return sweep_rows, summary_rows, {"pairs": pair_data, "selected": selected}
+
+
+def write_rows(path: Path, fieldnames: list[str], rows: list[dict]) -> None:
+    with path.open("w", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def plot_pairwise_policy(
+    split: str,
+    sweep_rows: list[dict],
+    plot_data: dict,
+    configured_beta: float,
+    output_path: Path,
+) -> None:
+    import matplotlib.pyplot as plt
+
+    figure, axes = plt.subplots(2, 2, figsize=(13, 10))
+    roc_axis, accuracy_axis, precision_axis, recall_axis = axes.flatten()
+    tie_values = sorted(plot_data["selected"])
+    colors = plt.get_cmap("tab10").colors
+    for index, tie_eps in enumerate(tie_values):
+        color = colors[index]
+        data = plot_data["pairs"][split, tie_eps]
+        fpr, tpr, auroc = roc_curve(data["scores"], data["labels"])
+        roc_axis.plot(fpr, tpr, color=color, label=f"tie<{tie_eps:g}% AUROC={auroc:.3f}")
+        rows = [
+            row for row in sweep_rows
+            if row["split"] == split and row["tie_eps_percent"] == tie_eps
+        ]
+        betas = [row["beta"] for row in rows]
+        for axis, metric in (
+            (accuracy_axis, "accuracy"),
+            (precision_axis, "precision"),
+            (recall_axis, "recall"),
+        ):
+            axis.plot(betas, [row[metric] for row in rows], color=color, label=f"tie<{tie_eps:g}%")
+            selected_beta = plot_data["selected"][tie_eps]
+            axis.axvline(selected_beta, color=color, linestyle="-", alpha=0.55)
+
+    roc_axis.plot([0, 1], [0, 1], "k--", alpha=0.4)
+    roc_axis.set(xlabel="False positive rate", ylabel="True positive rate", title="ROC")
+    roc_axis.legend()
+    accuracy_axis.axhline(0.5, color="gray", linestyle=":", label="always stay")
+    for axis, title, ylabel in (
+        (accuracy_axis, "Accuracy vs beta", "Accuracy"),
+        (precision_axis, "Precision vs beta", "Precision"),
+        (recall_axis, "Recall vs beta", "Recall"),
+    ):
+        axis.axvline(configured_beta, color="black", linestyle="--", label="configured beta")
+        axis.set(xlabel="beta", ylabel=ylabel, title=title)
+        axis.grid(alpha=0.25)
+        axis.legend(fontsize="small")
+    probability_note = (
+        f"configured: beta={configured_beta:g}, Phi={normal_cdf(configured_beta):.4f}\n"
+        + ", ".join(
+            f"tie {tie:g}%: beta={plot_data['selected'][tie]:.4g}, "
+            f"Phi={normal_cdf(plot_data['selected'][tie]):.4f}"
+            for tie in tie_values
+        )
+    )
+    figure.text(0.5, 0.01, probability_note, ha="center", fontsize="small")
+    figure.suptitle(f"Pairwise policy — {split}")
+    figure.tight_layout(rect=(0, 0.06, 1, 0.96))
+    figure.savefig(output_path, dpi=200)
+    plt.close(figure)
 
 
 def resolve_checkpoint_path(cfg: DictConfig) -> Path:
@@ -299,10 +564,46 @@ def main(cfg: DictConfig) -> None:
     import matplotlib.pyplot as plt
     plt.close(figure)
 
+    pairwise_rows, pairwise_summary, pairwise_plot_data = evaluate_pairwise_policy(
+        predictions, split_masks, cfg
+    )
+    pairwise_csv_path = output_dir / "pairwise_beta_sweep.csv"
+    write_rows(
+        pairwise_csv_path,
+        [
+            "split", "tie_eps_percent", "beta", "switch_probability",
+            "m_switch", *PAIRWISE_METRIC_COLUMNS,
+        ],
+        pairwise_rows,
+    )
+    pairwise_summary_path = output_dir / "pairwise_beta_summary.csv"
+    write_rows(
+        pairwise_summary_path,
+        [
+            "tie_eps_percent", "selection_split", "objective", "selected_beta",
+            "selected_switch_probability", "evaluation_split",
+            *PAIRWISE_METRIC_COLUMNS,
+        ],
+        pairwise_summary,
+    )
+    pairwise_plot_dir = output_dir / "pairwise_policy"
+    pairwise_plot_dir.mkdir(parents=True, exist_ok=True)
+    for split in ("seen", "unseen"):
+        plot_pairwise_policy(
+            split,
+            pairwise_rows,
+            pairwise_plot_data,
+            float(cfg.pairwise_policy.beta),
+            pairwise_plot_dir / f"pairwise_policy_{split}.png",
+        )
+
     print(f"checkpoint: {checkpoint_path}")
     print(f"validation groups: {len(dataset):,}")
     print(f"selection CSV: {csv_path}")
     print(f"alpha-sweep curve: {curve_path}")
+    print(f"pairwise beta sweep: {pairwise_csv_path}")
+    print(f"pairwise beta summary: {pairwise_summary_path}")
+    print(f"pairwise policy figures: {pairwise_plot_dir}")
 
 
 if __name__ == "__main__":
