@@ -29,11 +29,14 @@ model:
   model_id: "small"
   image_height: 518
   image_width: 518
+  dav3_process_res: 504
+  dav3_output_dir: ./dav3_ati_finetune_ckpt
   metric3d_output_dir: ./metric3dv2_ati_finetune_ckpt
 
 training:
   seed: 2026
   batch_size: 32
+  dav3_batch_size: 4
   metric3d_batch_size: 4
   num_epochs: 50
   lr_finetune: 1e-4

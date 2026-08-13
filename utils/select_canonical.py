@@ -44,6 +44,7 @@ MODEL_IDS = {
     "metric-outdoor-base": "depth-anything/Depth-Anything-V2-Metric-Outdoor-Base-hf",
 }
 MODEL_ID = MODEL_IDS["small"]
+DAV2_METRIC_SMALL_MODEL_ID = MODEL_IDS["metric-indoor-small"]
 DA3_SMALL_MODEL_ID = "depth-anything/da3-small"
 HF_CACHE_DIR = os.environ.get("HF_HOME") or None
 LOCAL_FILES_ONLY = os.environ.get("DEPTH_ANYTHING_LOCAL_FILES_ONLY", "1") != "0"
@@ -255,6 +256,94 @@ class SelectCanonicalandMatchFrames:
         )
         return model.eval().to(device)
 
+    @staticmethod
+    def _load_checkpoint_state(checkpoint_path):
+        checkpoint_path = Path(checkpoint_path)
+        if checkpoint_path.suffix == ".safetensors":
+            from safetensors.torch import load_file
+
+            state = load_file(str(checkpoint_path), device="cpu")
+        else:
+            state = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        if isinstance(state, dict):
+            for key in ("model_state_dict", "state_dict"):
+                if key in state and isinstance(state[key], dict):
+                    state = state[key]
+                    break
+        if not isinstance(state, dict) or not state:
+            raise ValueError(f"Checkpoint does not contain a state dict: {checkpoint_path}")
+        if all(key.startswith("module.") for key in state):
+            state = {key.removeprefix("module."): value for key, value in state.items()}
+        depth_state = {
+            key.removeprefix("depth_model."): value
+            for key, value in state.items()
+            if key.startswith("depth_model.")
+        }
+        if depth_state:
+            state = depth_state
+        return state
+
+    def _load_metric_checkpoint(
+        self,
+        model_version,
+        checkpoint_path,
+        model_id,
+        device,
+    ):
+        checkpoint_path = Path(checkpoint_path).expanduser().absolute()
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(checkpoint_path)
+
+        if model_version == "dav2":
+            local_model_dir = checkpoint_path if checkpoint_path.is_dir() else None
+            if (checkpoint_path.parent / "config.json").is_file():
+                local_model_dir = checkpoint_path.parent
+            model_source = local_model_dir or model_id
+            processor_source = model_id
+            if (checkpoint_path.parent / "preprocessor_config.json").is_file():
+                processor_source = checkpoint_path.parent
+            if local_model_dir is not None and (
+                local_model_dir / "preprocessor_config.json"
+            ).is_file():
+                processor_source = local_model_dir
+            processor = AutoImageProcessor.from_pretrained(
+                processor_source,
+                cache_dir=HF_CACHE_DIR,
+                local_files_only=LOCAL_FILES_ONLY,
+                use_fast=False,
+            )
+            model = AutoModelForDepthEstimation.from_pretrained(
+                model_source,
+                cache_dir=HF_CACHE_DIR,
+                local_files_only=LOCAL_FILES_ONLY,
+            )
+            if checkpoint_path.is_file() and not (
+                local_model_dir is not None
+                and checkpoint_path.name in {"model.safetensors", "pytorch_model.bin"}
+            ):
+                model.load_state_dict(self._load_checkpoint_state(checkpoint_path), strict=True)
+            return model.eval().to(device), processor
+
+        if model_version == "dav3":
+            local_model_dir = checkpoint_path if checkpoint_path.is_dir() else None
+            if (checkpoint_path.parent / "config.json").is_file():
+                local_model_dir = checkpoint_path.parent
+            model_source = local_model_dir or model_id
+            model = self._load_da3_model(
+                model_source,
+                device,
+            )
+            if checkpoint_path.is_file() and not (
+                local_model_dir is not None
+                and checkpoint_path.name in {"model.safetensors", "pytorch_model.bin"}
+            ):
+                state = self._load_checkpoint_state(checkpoint_path)
+                target = model if any(key.startswith("model.") for key in state) else model.model
+                target.load_state_dict(state, strict=True)
+            return model, None
+
+        raise ValueError("model_version must be 'dav2' or 'dav3'.")
+
     def _predict_da3_depth_batch(
         self,
         model,
@@ -322,6 +411,41 @@ class SelectCanonicalandMatchFrames:
         )["depth"]
         values = compute_comprehensive_depth_metrics(
             aligned,
+            target,
+            valid_mask,
+            min_depth=MIN_DEPTH,
+            max_depth=MAX_DEPTH,
+        )
+        metrics = {metric: NO_MATCH_VALUE for metric in DEPTH_PERFORMANCE_METRICS}
+        metrics.update({name: float(value[0].cpu()) for name, value in values.items()})
+        if not all(np.isfinite(value) for value in metrics.values() if value != NO_MATCH_VALUE):
+            return {metric: NO_MATCH_VALUE for metric in DEPTH_PERFORMANCE_METRICS}
+        return metrics
+
+    def _metric_metrics_for_prediction(self, prediction, depth_path, device):
+        """Evaluate metric depth directly; only spatial resizing is applied."""
+        target = torch.from_numpy(self._load_depth_meters(depth_path)).to(
+            device=device,
+            dtype=torch.float32,
+        )[None, None]
+        prediction = F.interpolate(
+            prediction[None, None],
+            size=target.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+        valid_mask = (
+            torch.isfinite(target)
+            & torch.isfinite(prediction)
+            & (target > MIN_DEPTH)
+            & (target < MAX_DEPTH)
+            & (prediction > 0)
+        )
+        if int(valid_mask.sum()) < 10:
+            return {metric: NO_MATCH_VALUE for metric in DEPTH_PERFORMANCE_METRICS}
+
+        values = compute_comprehensive_depth_metrics(
+            prediction,
             target,
             valid_mask,
             min_depth=MIN_DEPTH,
@@ -445,6 +569,52 @@ class SelectCanonicalandMatchFrames:
                 )
         return metrics
 
+    def _evaluate_metric_checkpoint_records(
+        self,
+        records,
+        model_version,
+        model,
+        processor,
+        device,
+        batch_size,
+        process_res,
+        process_res_method,
+    ):
+        unique_records = {record["rgb_path"]: record for record in records}
+        items = list(unique_records.values())
+        metrics = {}
+        for start in tqdm(range(0, len(items), batch_size), desc="Metric checkpoint canonical metrics"):
+            batch_records = items[start:start + batch_size]
+            if model_version == "dav2":
+                images = [
+                    cv2.imread(record["rgb_path"], cv2.IMREAD_COLOR)
+                    for record in batch_records
+                ]
+                if any(image is None for image in images):
+                    raise FileNotFoundError("Failed to read an RGB image from the input CSV.")
+                predictions = self._predict_metric_depth_batch(
+                    model,
+                    processor,
+                    images,
+                    [self._load_depth_meters(record["depth_path"]).shape for record in batch_records],
+                    device,
+                )
+            else:
+                predictions = self._predict_da3_depth_batch(
+                    model,
+                    [record["rgb_path"] for record in batch_records],
+                    device,
+                    process_res,
+                    process_res_method,
+                )
+            for record, prediction in zip(batch_records, predictions):
+                metrics[record["rgb_path"]] = self._metric_metrics_for_prediction(
+                    prediction,
+                    record["depth_path"],
+                    device,
+                )
+        return metrics
+
     def _migrate_da3_row(
         self,
         old_row,
@@ -452,6 +622,7 @@ class SelectCanonicalandMatchFrames:
         source_lap_records,
         oracle_entry,
         records_by_identity,
+        match_policy=DA3_MATCH_POLICY,
     ):
         candidates = self._oracle_candidate_records_for_source(
             source_record,
@@ -470,7 +641,7 @@ class SelectCanonicalandMatchFrames:
                     "Existing matched canonical frame is absent from the input CSV."
                 )
             row.update(self._performance_metric_fields(source_record, canonical_record))
-            row["match_policy"] = DA3_MATCH_POLICY
+            row["match_policy"] = match_policy
             return row, "reused"
 
         best_match = self._find_best_oracle_match(
@@ -487,12 +658,12 @@ class SelectCanonicalandMatchFrames:
                     registration_status="registration_failed",
                 )
             )
-            row["match_policy"] = DA3_MATCH_POLICY
+            row["match_policy"] = match_policy
             return row, "failed"
 
         canonical_param = self._record_param_tuple(best_match["record"])
         row.update(self._match_fields(best_match, canonical_param, source_record))
-        row["match_policy"] = DA3_MATCH_POLICY
+        row["match_policy"] = match_policy
         return row, best_match["registration_status"]
 
     def _migrate_one_csv_to_da3(
@@ -504,6 +675,8 @@ class SelectCanonicalandMatchFrames:
         batch_size,
         process_res,
         process_res_method,
+        metric_evaluator=None,
+        match_policy=DA3_MATCH_POLICY,
     ):
         with input_csv.open("r", newline="", encoding="utf-8") as csv_file:
             reader = csv.DictReader(csv_file)
@@ -524,13 +697,17 @@ class SelectCanonicalandMatchFrames:
             for record in row_records
         }
         records = list(unique_records.values())
-        metrics = self._evaluate_da3_records(
-            records,
-            model,
-            device,
-            batch_size,
-            process_res,
-            process_res_method,
+        metrics = (
+            self._evaluate_da3_records(
+                records,
+                model,
+                device,
+                batch_size,
+                process_res,
+                process_res_method,
+            )
+            if metric_evaluator is None
+            else metric_evaluator(records)
         )
         self._prepare_da3_metric_list(records, metrics)
 
@@ -564,6 +741,7 @@ class SelectCanonicalandMatchFrames:
                 source_lap_records,
                 oracle_entry,
                 unique_records,
+                match_policy=match_policy,
             )
             counts[action] = counts.get(action, 0) + 1
             migrated_rows.append(row)
@@ -622,6 +800,80 @@ class SelectCanonicalandMatchFrames:
                 batch_size,
                 process_res,
                 process_res_method,
+            )
+            for input_csv, output_csv in zip(input_csv_paths, output_paths)
+        ]
+
+    def migrate_csvs_to_metric_checkpoint(
+        self,
+        input_csv_paths,
+        output_dir,
+        checkpoint_path,
+        model_version,
+        model_id=None,
+        device=None,
+        batch_size=EVAL_BATCH_SIZE,
+        process_res=504,
+        process_res_method="upper_bound_resize",
+    ):
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive.")
+        if model_version not in {"dav2", "dav3"}:
+            raise ValueError("model_version must be 'dav2' or 'dav3'.")
+
+        input_csv_paths = [Path(path).resolve() for path in input_csv_paths]
+        if not input_csv_paths:
+            raise ValueError("At least one input CSV is required.")
+        output_dir = Path(output_dir).resolve()
+        output_paths = [output_dir / path.name for path in input_csv_paths]
+        if len(set(output_paths)) != len(output_paths):
+            raise ValueError("Input CSV basenames must be unique.")
+        for input_csv, output_csv in zip(input_csv_paths, output_paths):
+            if not input_csv.is_file():
+                raise FileNotFoundError(input_csv)
+            if input_csv == output_csv or output_csv.exists():
+                raise FileExistsError(
+                    f"Refusing to overwrite CSV; choose a new output path: {output_csv}"
+                )
+
+        device = torch.device(
+            device or os.environ.get("DEVICE") or ("cuda:0" if torch.cuda.is_available() else "cpu")
+        )
+        model_id = model_id or (
+            DAV2_METRIC_SMALL_MODEL_ID if model_version == "dav2" else DA3_SMALL_MODEL_ID
+        )
+        print(
+            f"Using {model_version.upper()} metric checkpoint: "
+            f"{Path(checkpoint_path).resolve()} on {device}"
+        )
+        model, processor = self._load_metric_checkpoint(
+            model_version,
+            checkpoint_path,
+            model_id,
+            device,
+        )
+        evaluator = lambda records: self._evaluate_metric_checkpoint_records(
+            records,
+            model_version,
+            model,
+            processor,
+            device,
+            batch_size,
+            process_res,
+            process_res_method,
+        )
+        match_policy = f"{model_version}_metric_checkpoint_{MATCH_POLICY}"
+        return [
+            self._migrate_one_csv_to_da3(
+                input_csv,
+                output_csv,
+                model,
+                device,
+                batch_size,
+                process_res,
+                process_res_method,
+                metric_evaluator=evaluator,
+                match_policy=match_policy,
             )
             for input_csv, output_csv in zip(input_csv_paths, output_paths)
         ]

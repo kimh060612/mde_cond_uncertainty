@@ -9,7 +9,7 @@ from utils.select_canonical import (
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Rebuild Depth Anything v2 canonical CSV files for DA3-Small."
+        description="Rebuild canonical CSV files with relative DA3 or a metric-depth checkpoint."
     )
     parser.add_argument(
         "--input-csv",
@@ -21,10 +21,26 @@ def parse_args():
         "--output-dir",
         type=Path,
         required=True,
-        help="New directory for DA3 CSV files; existing files are never overwritten.",
+        help="New directory for generated CSV files; existing files are never overwritten.",
     )
     parser.add_argument("--dataset-root", type=Path)
-    parser.add_argument("--model-id", default=DA3_SMALL_MODEL_ID)
+    parser.add_argument(
+        "--checkpoint",
+        "--checkpoint-path",
+        dest="checkpoint",
+        type=Path,
+        help="Fine-tuned metric-depth checkpoint file or save_pretrained directory.",
+    )
+    parser.add_argument(
+        "--model-version",
+        choices=("dav2", "dav3"),
+        help="Checkpoint architecture; required with --checkpoint.",
+    )
+    parser.add_argument(
+        "--model-id",
+        default=None,
+        help="Base model id for a state-dict checkpoint; defaults to the Small architecture.",
+    )
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--process-res", type=int, default=504)
     parser.add_argument(
@@ -52,15 +68,30 @@ def main():
     selector = SelectCanonicalandMatchFrames(
         data_path=str(args.dataset_root.resolve()) if args.dataset_root else None
     )
-    summaries = selector.migrate_csvs_to_da3(
+    common = dict(
         input_csv_paths=input_csv_paths,
         output_dir=args.output_dir,
-        model_id=args.model_id,
         device=args.device,
         batch_size=args.batch_size,
         process_res=args.process_res,
         process_res_method=args.process_res_method,
     )
+    if args.checkpoint is not None:
+        if args.model_version is None:
+            raise ValueError("--model-version is required with --checkpoint.")
+        summaries = selector.migrate_csvs_to_metric_checkpoint(
+            **common,
+            checkpoint_path=args.checkpoint,
+            model_version=args.model_version,
+            model_id=args.model_id,
+        )
+    else:
+        if args.model_version is not None:
+            raise ValueError("--model-version requires --checkpoint.")
+        summaries = selector.migrate_csvs_to_da3(
+            **common,
+            model_id=args.model_id or DA3_SMALL_MODEL_ID,
+        )
     for summary in summaries:
         print(
             f"Saved {summary['rows']} rows to {summary['output_csv']} "
