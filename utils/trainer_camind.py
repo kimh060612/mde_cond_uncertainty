@@ -277,6 +277,7 @@ def train_one_epoch(
         "variance_loss": 0.0,
         "ranking_loss": 0.0,
         "pairwise_policy_loss": 0.0,
+        "soft_optimal_loss": 0.0
     }
     rank_correct = 0
     rank_total = 0

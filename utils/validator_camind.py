@@ -328,7 +328,6 @@ def validate(
         total_accumulator["mean_loss"] += float(mean_loss.item())
         total_accumulator["variance_loss"] += float(variance_loss.item())
         total_accumulator["ranking_loss"] += float(ranking_loss.item())
-        total_accumulator["soft_optimal_loss"] += float(soft_optimal_loss.item())
         total_accumulator["processed_batches"] += 1
         add_rank_counts(total_accumulator, rank_counts)
         append_accumulator_vectors(total_accumulator, **batch_vectors)
