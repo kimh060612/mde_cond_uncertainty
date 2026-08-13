@@ -13,6 +13,7 @@ from model.loss_fn import (
     groupwise_pairwise_probit_loss,
     scalar_heteroscedastic_loss,
     scale_shift_invariant_depth_loss,
+    groupwise_soft_optimal_loss
 )
 from model.loss_target import ssi_depth_guided_meter_space_depth_loss, ssi_independent_meter_space_depth_loss
 from utils.train_utils import reshape_group_batch, tensor_device
@@ -240,6 +241,7 @@ def train_one_epoch(
     uncertainty_mode: str,
     grad_clip: float,
     logger: logging.Logger,
+    soft_optimal_loss_weight: float = 0.1,
     context_offset: int = 0,
     min_depth: float = 1e-3,
     max_depth: float = 80.0,
@@ -348,6 +350,7 @@ def train_one_epoch(
             )
             q_score = out["camera_bias"] + uncertainty_alpha * out["std"]
             group_bias = reshape_group_batch(out["camera_bias"], num_groups, num_candidates)
+            group_degradation = reshape_group_batch(abs_rel_degradation, num_groups, num_candidates)
             pairwise_policy_loss = groupwise_pairwise_probit_loss(
                 group_bias,
                 reshape_group_batch(out["variance"], num_groups, num_candidates),
@@ -356,9 +359,15 @@ def train_one_epoch(
                 tie_eps_percent=pairwise_train_tie_eps_percent,
                 detach_pair_std=detach_pair_std,
             )
+            soft_optimal_loss = groupwise_soft_optimal_loss(
+                group_bias,
+                group_degradation,
+                0.02,
+                0.02,
+            )
             ranking_loss = group_bias.new_zeros(())
             nll_loss = mean_loss + lambda_variance * variance_loss
-            loss = nll_loss + pairwise_loss_weight * pairwise_policy_loss
+            loss = nll_loss + pairwise_loss_weight * pairwise_policy_loss + soft_optimal_loss_weight * soft_optimal_loss
 
         scaler.scale(loss).backward()
         if grad_clip > 0:
@@ -413,6 +422,7 @@ def train_one_epoch(
         running["variance_loss"] += float(variance_loss.item())
         running["ranking_loss"] += float(ranking_loss.item())
         running["pairwise_policy_loss"] += float(pairwise_policy_loss.item())
+        running["soft_optimal_loss"] += float(soft_optimal_loss.item())
         processed_batches += 1
         global_step += 1
 

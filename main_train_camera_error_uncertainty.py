@@ -311,6 +311,7 @@ def main(cfg: DictConfig):
             epoch=epoch,
             amp=amp,
             logger=logger,
+            soft_optimal_loss_weight=cfg.training.soft_optimal_loss_weight,
             context_offset=cfg.model.context_offset,
             lambda_smooth_logvar=cfg.training.lambda_smooth_logvar,
             lambda_variance=cfg.training.lambda_variance,
@@ -353,6 +354,7 @@ def main(cfg: DictConfig):
             detach_pair_std=cfg.pairwise_policy.detach_pair_std,
             uncertainty_mode=cfg.training.uncertainty_mode,
             correlation_max_samples=cfg.training.correlation_max_samples,
+            soft_optimal_loss_weight=cfg.training.soft_optimal_loss_weight,
             min_depth=cfg.dataset.min_depth,
             max_depth=cfg.dataset.max_depth,
             relative_align_mode=cfg.training.relative_align_mode,
@@ -380,7 +382,7 @@ def main(cfg: DictConfig):
                 scheduler_metric,
             )
         
-        best_metric = float(val_total_metrics.get(fallback_monitor, float("-inf")))
+        best_metric = float(val_unseen_metrics.get(fallback_monitor, float("-inf")))
         is_best = best_metric > best_abs_rel_correlation
         if is_best:
             best_abs_rel_correlation = best_metric

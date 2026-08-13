@@ -646,3 +646,31 @@ def groupwise_pairwise_probit_loss(
     if not valid_groups.any():
         return (group_mean.sum() + group_variance.sum()) * 0.0
     return group_loss[valid_groups].mean()
+
+
+def groupwise_soft_optimal_loss(
+    group_bias: torch.Tensor,
+    group_degradation: torch.Tensor,
+    target_temperature: float,
+    prediction_temperature: float,
+) -> torch.Tensor:
+    if group_bias.ndim != 2:
+        raise ValueError("group_bias must have shape [num_groups, group_size]")
+    if group_degradation.shape != group_bias.shape:
+        raise ValueError("group_degradation must have the same shape as group_bias")
+    if target_temperature <= 0 or prediction_temperature <= 0:
+        raise ValueError("softmax temperatures must be positive")
+
+    relative_degradation = group_degradation - group_degradation.min(
+        dim=1,
+        keepdim=True,
+    ).values
+    target_probabilities = F.softmax(
+        -relative_degradation / target_temperature,
+        dim=1,
+    ).detach()
+    predicted_log_probabilities = F.log_softmax(
+        -group_bias / prediction_temperature,
+        dim=1,
+    )
+    return -(target_probabilities * predicted_log_probabilities).sum(dim=1).mean()

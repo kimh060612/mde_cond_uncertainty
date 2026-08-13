@@ -20,6 +20,7 @@ from evaluation_utils.eval_utils import (
 from model.loss_fn import (
     groupwise_pairwise_probit_loss,
     scalar_heteroscedastic_loss,
+    groupwise_soft_optimal_loss
 )
 from model.loss_target import ssi_independent_meter_space_depth_loss, ssi_depth_guided_meter_space_depth_loss
 from utils.train_utils import reshape_group_batch, tensor_device
@@ -174,6 +175,7 @@ def validate(
     detach_pair_std: bool,
     seen_topology_numbers: torch.Tensor = None,
     unseen_topology_numbers: torch.Tensor = None,
+    soft_optimal_loss_weight: float = 0.1, 
     context_offset: int = 0,
     correlation_max_samples: int = 100_000,
     min_depth: float = 1e-3,
@@ -257,9 +259,8 @@ def validate(
                 target_loss,
             )
             q_score = out["camera_bias"] + uncertainty_alpha * out["std"]
-            group_bias = reshape_group_batch(
-                out["camera_bias"], num_groups, num_candidates
-            )
+            group_bias = reshape_group_batch(out["camera_bias"], num_groups, num_candidates)
+            group_degradation = reshape_group_batch(abs_rel_degradation, num_groups, num_candidates)
             pairwise_policy_loss = groupwise_pairwise_probit_loss(
                 group_bias,
                 reshape_group_batch(out["variance"], num_groups, num_candidates),
@@ -268,10 +269,16 @@ def validate(
                 tie_eps_percent=pairwise_train_tie_eps_percent,
                 detach_pair_std=detach_pair_std,
             )
+            soft_optimal_loss = groupwise_soft_optimal_loss(
+                group_bias,
+                group_degradation,
+                0.02,
+                0.02,
+            )
             group_q = reshape_group_batch(q_score, num_groups, num_candidates)
             ranking_loss = group_bias.new_zeros(())
             nll_loss = mean_loss + lambda_variance * variance_loss
-            loss = nll_loss + pairwise_loss_weight * pairwise_policy_loss
+            loss = nll_loss + pairwise_loss_weight * pairwise_policy_loss + soft_optimal_loss_weight * soft_optimal_loss
 
         batch_vectors = {
             "target_ssi_loss": target_loss,
@@ -321,6 +328,7 @@ def validate(
         total_accumulator["mean_loss"] += float(mean_loss.item())
         total_accumulator["variance_loss"] += float(variance_loss.item())
         total_accumulator["ranking_loss"] += float(ranking_loss.item())
+        total_accumulator["soft_optimal_loss"] += float(soft_optimal_loss.item())
         total_accumulator["processed_batches"] += 1
         add_rank_counts(total_accumulator, rank_counts)
         append_accumulator_vectors(total_accumulator, **batch_vectors)
