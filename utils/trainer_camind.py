@@ -352,17 +352,18 @@ def train_one_epoch(
             q_score = out["camera_bias"] + uncertainty_alpha * out["std"]
             group_bias = reshape_group_batch(out["camera_bias"], num_groups, num_candidates)
             group_degradation = reshape_group_batch(abs_rel_degradation, num_groups, num_candidates)
+            group_target_loss = reshape_group_batch(target_loss, num_groups, num_candidates)
             pairwise_policy_loss = groupwise_pairwise_probit_loss(
                 group_bias,
                 reshape_group_batch(out["variance"], num_groups, num_candidates),
-                reshape_group_batch(flat_batch["candidate_abs_rel"], num_groups, num_candidates),
+                group_target_loss,  # reshape_group_batch(flat_batch["candidate_abs_rel"], num_groups, num_candidates),
                 m_switch=pairwise_m_switch,
                 tie_eps_percent=pairwise_train_tie_eps_percent,
                 detach_pair_std=detach_pair_std,
             )
             soft_optimal_loss = groupwise_soft_optimal_loss(
                 group_bias,
-                group_degradation,
+                group_target_loss, # group_degradation
                 0.02,
                 0.02,
             )
