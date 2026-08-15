@@ -44,6 +44,28 @@ _REMOVED_WANDB_METRICS = {
 }
 
 
+class _DAv3ImageProcessor:
+    """Adapt DA3's native processor to the Hugging Face processor interface."""
+
+    def __init__(self) -> None:
+        from depth_anything_3.utils.io.input_processor import InputProcessor
+
+        self.processor = InputProcessor()
+
+    def __call__(self, images, return_tensors="pt"):
+        if return_tensors != "pt":
+            raise ValueError("DA3 image processing only supports return_tensors='pt'.")
+
+        pixel_values, _, _ = self.processor(
+            images,
+            process_res=504,
+            process_res_method="upper_bound_resize",
+            num_workers=1,
+            sequential=True,
+        )
+        return {"pixel_values": pixel_values}
+
+
 def _wandb_validation_metrics(split, metrics):
     return {
         f"{split}/{key}": value
@@ -86,11 +108,14 @@ def main(cfg: DictConfig):
             config=OmegaConf.to_container(cfg, resolve=True),
         )
         
-    image_processor = AutoImageProcessor.from_pretrained(
-        model_id,
-        cache_dir=None,
-        use_fast=False,
-    )
+    if cfg.model.model_id == "da3small":
+        image_processor = _DAv3ImageProcessor()
+    else:
+        image_processor = AutoImageProcessor.from_pretrained(
+            model_id,
+            cache_dir=None,
+            use_fast=False,
+        )
     
     seen_val_topologies = [ str(topology).strip() for topology in cfg.dataset.seen_val_topologies ]
     unseen_val_topologies = [ str(topology).strip() for topology in cfg.dataset.unseen_val_topologies ]
@@ -235,6 +260,7 @@ def main(cfg: DictConfig):
         max_log_variance=cfg.training.max_log_var,
         initial_std=cfg.training.initial_std,
         variance_head_init_std=cfg.training.variance_head_init_std,
+        canonical_group_size=group_size,
     ).to(device)
 
     # model = CameraInducedErrorModelRGBInput(
