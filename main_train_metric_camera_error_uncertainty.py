@@ -1,10 +1,12 @@
 import math
+import json
 import torch
 from torch.utils.data import DataLoader, Subset
 import hydra
 import logging
 from glob import glob
 from pathlib import Path
+from hydra.utils import to_absolute_path
 from transformers import AutoImageProcessor
 from dataset.ati_dataset_caminduce import (
     CameraParameterRange,
@@ -15,25 +17,58 @@ from dataset.ati_dataset_caminduce import (
 )
 from dataset.ati_dataset_caminduce import *
 from evaluation_utils.eval_selection import plot_selection_alpha_sweep
-from model.dav2_ati_model import MODEL_IDS
-from model.dav2_camerror_model import (
-    CameraInducedErrorModel, 
-    CameraInducedErrorDecompositionModel, 
-    CameraInducedErrorModelRGBInput, 
-    CameraInducedErrorModelDAv3
+from model.dav2_camerror_model import ( 
+    CameraInducedErrorMetricModel,
+    CameraInducedErrorMetricModelDAv3
 )
 from omegaconf import DictConfig, OmegaConf
 from utils.train_utils import *
-from utils.trainer_camind import train_one_epoch
-from utils.validator_camind import validate
+from utils.trainer_camind_metric import train_metric_one_epoch
+from utils.validator_camind_metric import validate_metric
 from utils.logger import setup_logger
-
 from torch.utils.data import DataLoader
 
 try:
     import wandb
 except ImportError:
     wandb = None
+
+
+class _DA3ImageProcessor:
+    def __init__(self, process_res: int):
+        try:
+            from depth_anything_3.utils.io.input_processor import InputProcessor
+        except ImportError as exc:
+            raise ImportError(
+                "Depth Anything 3 requires the depth-anything-3 package."
+            ) from exc
+        self.process_res = process_res
+        self.processor = InputProcessor()
+
+    def __call__(self, images, return_tensors="pt"):
+        if return_tensors != "pt":
+            raise ValueError("DA3 image processing only supports return_tensors='pt'.")
+        images = list(images) if isinstance(images, (list, tuple)) else [images]
+        pixel_values, _, _ = self.processor(
+            images,
+            process_res=self.process_res,
+            process_res_method="upper_bound_resize",
+            num_workers=1,
+            sequential=True,
+        )
+        if pixel_values.ndim != 4:
+            raise RuntimeError(
+                f"Unexpected DA3 processor output shape: {tuple(pixel_values.shape)}"
+            )
+        return {"pixel_values": pixel_values}
+
+    def save_pretrained(self, output_dir):
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+        (output_path / "da3_preprocessor_config.json").write_text(
+            json.dumps({"process_res": self.process_res}, indent=2) + "\n",
+            encoding="utf-8",
+        )
 
 
 _REMOVED_WANDB_METRICS = {
@@ -54,13 +89,22 @@ def _wandb_validation_metrics(split, metrics):
     }
 
 
-@hydra.main(config_path="config", config_name="base_caminduce")
+@hydra.main(config_path="config", config_name="metric_caminduce")
 def main(cfg: DictConfig):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     amp = (device.type == "cuda") and (not cfg.training.no_amp)
     wandb_run = None
-    model_id = MODEL_IDS[cfg.model.model_id]
-    print(f"Using model: {model_id}")
+    checkpoint_value = cfg.training.get("metric_checkpoint")
+    if not checkpoint_value:
+        raise ValueError("training.metric_checkpoint must point to a checkpoint directory.")
+    checkpoint_path = Path(to_absolute_path(str(checkpoint_value)))
+    if not checkpoint_path.is_dir():
+        raise FileNotFoundError(
+            f"Expected a save_pretrained checkpoint directory: {checkpoint_path}"
+        )
+    is_dav3 = str(cfg.model.model_id).startswith("da3")
+    model_id = str(checkpoint_path)
+    print(f"Using {'DAv3' if is_dav3 else 'DAv2'} checkpoint: {checkpoint_path}")
     print(f"dataset root: {cfg.dataset.dataset_root}")
     print(f"wandb project: {cfg.training.wandb_entity}/{cfg.training.wandb_project}")
     
@@ -87,10 +131,14 @@ def main(cfg: DictConfig):
             config=OmegaConf.to_container(cfg, resolve=True),
         )
         
-    image_processor = AutoImageProcessor.from_pretrained(
-        model_id,
-        cache_dir=None,
-        use_fast=False,
+    image_processor = (
+        _DA3ImageProcessor(int(cfg.model.get("dav3_process_res", 504)))
+        if is_dav3
+        else AutoImageProcessor.from_pretrained(
+            model_id,
+            cache_dir=None,
+            use_fast=False,
+        )
     )
     
     seen_val_topologies = [ str(topology).strip() for topology in cfg.dataset.seen_val_topologies ]
@@ -224,9 +272,15 @@ def main(cfg: DictConfig):
         pin_memory=pin_memory,
     )
 
-    model = CameraInducedErrorModel( # CameraInducedErrorModel( CameraInducedErrorDecompositionModel CameraInducedErrorModelDAv3
+    model_class = (
+        CameraInducedErrorMetricModelDAv3
+        if is_dav3
+        else CameraInducedErrorMetricModel
+    )
+    model = model_class(
         model_id=model_id,
         context_dim=train_set.condition_dim - cfg.model.context_offset,
+        checkpoint_path=checkpoint_path,
         cache_dir=None,
         feature_channels=cfg.model.uncertainty_width,
         hidden_channels=cfg.model.uncertainty_width,
@@ -302,7 +356,7 @@ def main(cfg: DictConfig):
     logger.info("Model: %s", model_id)
     
     for epoch in range(1, cfg.training.num_epochs + 1):
-        train_metrics, global_step = train_one_epoch(
+        train_metrics, global_step = train_metric_one_epoch(
             model_id=model_id,
             model=model,
             loader=train_loader,
@@ -337,7 +391,7 @@ def main(cfg: DictConfig):
             val_seen_metrics,
             val_unseen_metrics,
             selection_sweeps,
-        ) = validate(
+        ) = validate_metric(
             epoch=epoch,
             model_id=model_id,
             model=model,

@@ -16,7 +16,7 @@ from model.loss_fn import (
     scale_shift_invariant_depth_loss,
     signed_pairwise_ranknet_loss,
 )
-from model.loss_target import ssi_depth_guided_meter_space_depth_loss, ssi_independent_meter_space_depth_loss
+from model.loss_target import metric_meter_space_depth_loss
 from utils.train_utils import reshape_group_batch, tensor_device
 
 
@@ -223,7 +223,7 @@ def _summarize_epoch_vectors(
     return metrics
 
 
-def train_one_epoch(
+def train_metric_one_epoch(
     model_id: str,
     model,
     loader,
@@ -253,7 +253,7 @@ def train_one_epoch(
     global_step: int = 0,
     log_interval: int = 20,
 ) -> Tuple[Dict[str, float], int]:
-    del model_id, lambda_smooth_logvar, uncertainty_mode, min_depth, max_depth
+    del model_id, lambda_smooth_logvar, uncertainty_mode
 
     loader.dataset.load_depth = True
     if hasattr(loader.dataset, "set_epoch"):
@@ -324,11 +324,11 @@ def train_one_epoch(
                 camera_context[..., context_offset:],
                 target_size=candidate_imgs.shape[-2:],
             )
-            target_loss = ssi_independent_meter_space_depth_loss(
+            target_loss = metric_meter_space_depth_loss(
                 out["candidate_depth"],
                 out["canonical_depth"],
-                candidate_gt_depth,
-                canonical_gt_depth,
+                min_depth=min_depth,
+                max_depth=max_depth
             )
             mean_loss, variance_loss = scalar_heteroscedastic_loss(
                 out["camera_bias"],

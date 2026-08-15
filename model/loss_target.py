@@ -389,6 +389,37 @@ def ssi_independent_meter_space_depth_loss(
         torch.full_like(loss, float("nan")),
     )
 
+def metric_meter_space_depth_loss(
+    candidate_depth: torch.Tensor,
+    canonical_depth: torch.Tensor,
+    min_depth: float = 1e-3,
+    max_depth: float = 10.0,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """
+    Depth Target Risk for meter scale
+    """
+    
+    candidate_depth = _ensure_bchw(candidate_depth)
+    canonical_depth = _ensure_bchw(canonical_depth)
+
+    candidate_valid = torch.isfinite(candidate_depth) & (candidate_depth > min_depth) & (candidate_depth < max_depth)
+    canonical_valid = torch.isfinite(canonical_depth) & (canonical_depth > min_depth) & (canonical_depth < max_depth)
+    comparison_valid = candidate_valid & canonical_valid
+    
+    valid_counts = comparison_valid.flatten(1).sum(dim=1)
+    difference = torch.where(
+        comparison_valid,
+        (candidate_depth - canonical_depth).abs() / canonical_depth.clamp_min(eps),
+        torch.zeros_like(candidate_depth),
+    )
+    loss = difference.flatten(1).sum(dim=1) / valid_counts.clamp_min(1)
+    return torch.where(
+        valid_counts > 0,
+        loss,
+        torch.full_like(loss, float("nan")),
+    )
+
 def ssi_depth_guided_meter_space_depth_loss(
     candidate_depth: torch.Tensor,
     canonical_depth: torch.Tensor,
