@@ -19,7 +19,6 @@ from model.dav2_ati_model import MODEL_IDS
 from model.dav2_camerror_model import (
     CameraInducedErrorModel, 
     CameraInducedErrorDecompositionModel, 
-    CameraInducedErrorModelRGBInput, 
     CameraInducedErrorModelDAv3
 )
 from omegaconf import DictConfig, OmegaConf
