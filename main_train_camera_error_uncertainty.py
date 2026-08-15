@@ -1,4 +1,5 @@
 import math
+import json
 import torch
 from torch.utils.data import DataLoader, Subset
 import hydra
@@ -50,6 +51,7 @@ class _DAv3ImageProcessor:
     def __init__(self) -> None:
         from depth_anything_3.utils.io.input_processor import InputProcessor
 
+        self.process_res = 504
         self.processor = InputProcessor()
 
     def __call__(self, images, return_tensors="pt"):
@@ -58,12 +60,20 @@ class _DAv3ImageProcessor:
 
         pixel_values, _, _ = self.processor(
             images,
-            process_res=504,
+            process_res=self.process_res,
             process_res_method="upper_bound_resize",
             num_workers=1,
             sequential=True,
         )
         return {"pixel_values": pixel_values}
+
+    def save_pretrained(self, output_dir):
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+        (output_path / "da3_preprocessor_config.json").write_text(
+            json.dumps({"process_res": self.process_res}, indent=2) + "\n",
+            encoding="utf-8",
+        )
 
 
 def _wandb_validation_metrics(split, metrics):
