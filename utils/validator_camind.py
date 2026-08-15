@@ -27,7 +27,11 @@ from model.loss_fn import (
     scalar_heteroscedastic_loss,
     signed_pairwise_ranknet_loss,
 )
-from model.loss_target import ssi_independent_meter_space_depth_loss, ssi_depth_guided_meter_space_depth_loss
+from model.loss_target import (
+    ssi_depth_guided_meter_space_depth_loss,
+    ssi_independent_da3_meter_space_depth_loss,
+    ssi_independent_meter_space_depth_loss,
+)
 from utils.train_utils import reshape_group_batch, tensor_device
 
 
@@ -231,6 +235,11 @@ def validate(
     ] = DEFAULT_RELATIVE_REGRET_THRESHOLDS,
     selection_alpha_values: Sequence[float] = (0.0, 0.5, 1.0),
 ):
+    target_depth_loss = (
+        ssi_independent_da3_meter_space_depth_loss
+        if model_id.lower().rsplit("/", 1)[-1].startswith("da3")
+        else ssi_independent_meter_space_depth_loss
+    )
     del model_id, lambda_smooth_logvar, uncertainty_mode, min_depth, max_depth, relative_align_mode
 
     loader.dataset.load_depth = True
@@ -286,7 +295,7 @@ def validate(
                 camera_context[..., context_offset:],
                 target_size=candidate_imgs.shape[-2:],
             )
-            target_loss = ssi_independent_meter_space_depth_loss(
+            target_loss = target_depth_loss(
                 out["candidate_depth"],
                 out["canonical_depth"],
                 candidate_gt_depth,

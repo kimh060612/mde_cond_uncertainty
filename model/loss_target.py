@@ -389,6 +389,66 @@ def ssi_independent_meter_space_depth_loss(
         torch.full_like(loss, float("nan")),
     )
 
+
+def ssi_independent_da3_meter_space_depth_loss(
+    candidate_depth: torch.Tensor,
+    canonical_depth: torch.Tensor,
+    candidate_gt_depth: torch.Tensor,
+    canonical_gt_depth: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Align DA3 depth predictions directly to metric depth before comparison."""
+    predictions = torch.stack(
+        (_ensure_bchw(candidate_depth), _ensure_bchw(canonical_depth)), dim=1
+    )
+    targets = torch.stack(
+        (_ensure_bchw(candidate_gt_depth), _ensure_bchw(canonical_gt_depth)), dim=1
+    )
+    valid = (
+        torch.isfinite(predictions)
+        & torch.isfinite(targets)
+        & (predictions > 0)
+        & (targets > 0)
+    )
+
+    values = torch.where(valid, predictions, torch.zeros_like(predictions))
+    target_values = torch.where(valid, targets, torch.zeros_like(targets))
+    counts = valid.flatten(2).sum(dim=2).to(predictions.dtype)
+    safe_counts = counts.clamp_min(1.0)
+    sum_x = values.flatten(2).sum(dim=2)
+    sum_y = target_values.flatten(2).sum(dim=2)
+    sum_xx = values.square().flatten(2).sum(dim=2)
+    sum_xy = (values * target_values).flatten(2).sum(dim=2)
+    denominator = safe_counts * sum_xx - sum_x.square()
+    raw_scale = (
+        safe_counts * sum_xy - sum_x * sum_y
+    ) / denominator.clamp_min(eps)
+    stable = (counts > 1) & (denominator > eps) & (raw_scale > 0)
+    scale = torch.where(stable, raw_scale, torch.zeros_like(raw_scale))
+    shift = torch.where(
+        counts > 0,
+        (sum_y - scale * sum_x) / safe_counts,
+        torch.zeros_like(scale),
+    )
+    aligned = (
+        scale[:, :, None, None, None] * predictions
+        + shift[:, :, None, None, None]
+    ).clamp_min(eps)
+
+    comparison_valid = valid[:, 0] & valid[:, 1]
+    valid_counts = comparison_valid.flatten(1).sum(dim=1)
+    difference = torch.where(
+        comparison_valid,
+        (aligned[:, 0] - aligned[:, 1]).abs() / aligned[:, 1],
+        torch.zeros_like(aligned[:, 0]),
+    )
+    loss = difference.flatten(1).sum(dim=1) / valid_counts.clamp_min(1)
+    return torch.where(
+        valid_counts > 0,
+        loss,
+        torch.full_like(loss, float("nan")),
+    )
+
 def metric_meter_space_depth_loss(
     candidate_depth: torch.Tensor,
     canonical_depth: torch.Tensor,

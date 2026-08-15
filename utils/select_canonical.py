@@ -21,6 +21,7 @@ from evaluation_utils.eval_utils import (
 from evaluation_utils.eval_metrics import (
     compute_comprehensive_depth_metrics,
 )
+from finetune.utils import align_affine_depth
 
 from bisect import bisect_left
 from functools import lru_cache
@@ -403,12 +404,7 @@ class SelectCanonicalandMatchFrames:
         if int(valid_mask.sum()) < 10:
             return {metric: NO_MATCH_VALUE for metric in DEPTH_PERFORMANCE_METRICS}
 
-        aligned = align_relative_prediction_to_depth_space(
-            prediction,
-            target,
-            valid_mask,
-            align_mode="scale_shift",
-        )["depth"]
+        aligned = align_affine_depth(prediction, target, valid_mask)
         values = compute_comprehensive_depth_metrics(
             aligned,
             target,
