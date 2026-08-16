@@ -22,10 +22,9 @@ from evaluation_utils.eval_selection import (
     compute_selection_alpha_sweep,
     plot_selection_alpha_sweep,
 )
-from model.dav2_ati_model import MODEL_IDS
 from model.dav2_camerror_model import (
-    CameraInducedErrorModel,
-    CameraInducedErrorModelDAv3,
+    CameraInducedErrorMetricModel,
+    CameraInducedErrorMetricModelDAv3,
 )
 from utils.train_utils import seed_everything, topology_id
 
@@ -365,7 +364,7 @@ def build_validation_dataset(
     cfg: DictConfig,
     image_processor,
 ) -> FoundationCameraGroupedDataset:
-    csv_root = Path(to_absolute_path(str(cfg.evaluation.csv_path)))
+    csv_root = Path(to_absolute_path(str(cfg.dataset.csv_path)))
     csv_paths = (
         [str(csv_root)]
         if csv_root.is_file()
@@ -495,26 +494,28 @@ def collect_predictions(
 @hydra.main(
     version_base=None,
     config_path="config",
-    config_name="base_caminduce",
+    config_name="metric_caminduce",
 )
 def main(cfg: DictConfig) -> None:
     seed_everything(cfg.training.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     amp = device.type == "cuda" and not cfg.training.no_amp
     checkpoint_path = resolve_checkpoint_path(cfg)
-    model_key = str(cfg.model.model_id)
-    model_id = MODEL_IDS[model_key]
-    is_dav3 = model_key == "da3small"
+    metric_checkpoint_value = cfg.training.get("metric_checkpoint")
+    if not metric_checkpoint_value:
+        raise ValueError("training.metric_checkpoint must point to a checkpoint directory.")
+    metric_checkpoint = Path(
+        to_absolute_path(str(metric_checkpoint_value))
+    )
+    if not metric_checkpoint.is_dir():
+        raise FileNotFoundError(metric_checkpoint)
+    is_dav3 = str(cfg.model.model_id).startswith("da3")
+    model_id = str(metric_checkpoint)
 
     image_processor = (
         _DA3ImageProcessor(int(cfg.model.get("dav3_process_res", 504)))
         if is_dav3
-        else AutoImageProcessor.from_pretrained(
-            str(checkpoint_path.parent)
-            if (checkpoint_path.parent / "preprocessor_config.json").is_file()
-            else model_id,
-            use_fast=False,
-        )
+        else AutoImageProcessor.from_pretrained(model_id, use_fast=False)
     )
     dataset = build_validation_dataset(cfg, image_processor)
     loader = DataLoader(
@@ -525,10 +526,15 @@ def main(cfg: DictConfig) -> None:
         pin_memory=device.type == "cuda",
     )
 
-    model_class = CameraInducedErrorModelDAv3 if is_dav3 else CameraInducedErrorModel
+    model_class = (
+        CameraInducedErrorMetricModelDAv3
+        if is_dav3
+        else CameraInducedErrorMetricModel
+    )
     model = model_class(
         model_id=model_id,
         context_dim=dataset.condition_dim - cfg.model.context_offset,
+        checkpoint_path=metric_checkpoint,
         cache_dir=None,
         feature_channels=cfg.model.uncertainty_width,
         hidden_channels=cfg.model.uncertainty_width,
@@ -676,7 +682,8 @@ def main(cfg: DictConfig) -> None:
             pairwise_plot_dir / f"pairwise_policy_{split}.png",
         )
 
-    print(f"checkpoint: {checkpoint_path}")
+    print(f"risk checkpoint: {checkpoint_path}")
+    print(f"metric depth checkpoint: {metric_checkpoint}")
     print(f"validation groups: {len(dataset):,}")
     print(f"selection CSV: {csv_path}")
     print(f"alpha-sweep curve: {curve_path}")
