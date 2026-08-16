@@ -85,6 +85,50 @@ def mean_relative_selection_regret(
     return float(torch.stack(regrets).mean()) if regrets else float("nan")
 
 
+def mean_candidate_degradation(
+    candidate_abs_rel: torch.Tensor,
+    canonical_abs_rel: torch.Tensor,
+    group_id: torch.Tensor,
+    is_canonical_setting: torch.Tensor,
+    min_settings_per_group: int,
+    eps: float = 1e-8,
+) -> dict[str, float]:
+    candidate_abs_rel = candidate_abs_rel.detach().float().flatten()
+    canonical_abs_rel = canonical_abs_rel.detach().float().flatten()
+    group_id = group_id.detach().flatten()
+    is_canonical_setting = is_canonical_setting.detach().bool().flatten()
+    valid = (
+        torch.isfinite(candidate_abs_rel)
+        & torch.isfinite(canonical_abs_rel)
+        & (candidate_abs_rel >= 0)
+        & (canonical_abs_rel >= 0)
+        & torch.isfinite(group_id.float())
+    )
+    absolute, relative = [], []
+    for value in torch.unique(group_id[valid]):
+        group_mask = valid & (group_id == value)
+        if int(group_mask.sum()) < min_settings_per_group:
+            continue
+        candidate_mask = group_mask & ~is_canonical_setting
+        if not candidate_mask.any():
+            continue
+        degradation = (
+            candidate_abs_rel[candidate_mask] - canonical_abs_rel[candidate_mask]
+        ).clamp_min(0)
+        absolute.append(degradation.mean())
+        relative.append(
+            (degradation / canonical_abs_rel[candidate_mask].clamp_min(eps) * 100.0).mean()
+        )
+    return {
+        "candidate_mean_degradation_abs_rel": (
+            float(torch.stack(absolute).mean()) if absolute else float("nan")
+        ),
+        "candidate_mean_relative_degradation_percent": (
+            float(torch.stack(relative).mean()) if relative else float("nan")
+        ),
+    }
+
+
 def normal_cdf(value: float) -> float:
     return 0.5 * (1.0 + math.erf(value / math.sqrt(2.0)))
 
@@ -436,6 +480,8 @@ def collect_predictions(
         "camera_bias": [],
         "camera_std": [],
         "candidate_abs_rel": [],
+        "canonical_abs_rel": [],
+        "is_canonical_setting": [],
         "group_id": [],
         "topology": [],
     }
@@ -477,6 +523,13 @@ def collect_predictions(
         collected["camera_std"].append(torch.cat(std_chunks))
         collected["candidate_abs_rel"].append(
             batch["candidate_abs_rel"].flatten().float()
+        )
+        collected["canonical_abs_rel"].append(
+            batch["canonical_abs_rel"].flatten().float()
+        )
+        collected["is_canonical_setting"].append(
+            (batch["candidate_exposure"].flatten() == batch["canonical_exposure"].flatten()[0])
+            & (batch["candidate_gain"].flatten() == batch["canonical_gain"].flatten()[0])
         )
         collected["group_id"].append(
             batch["group_index"].flatten().repeat_interleave(group_size)
@@ -589,6 +642,13 @@ def main(cfg: DictConfig) -> None:
     sweeps = {}
     csv_rows = []
     for split_name, split_mask in split_masks.items():
+        candidate_degradation = mean_candidate_degradation(
+            predictions["candidate_abs_rel"][split_mask],
+            predictions["canonical_abs_rel"][split_mask],
+            predictions["group_id"][split_mask],
+            predictions["is_canonical_setting"][split_mask],
+            cfg.evaluation.min_camera_settings,
+        )
         rows = compute_selection_alpha_sweep(
             predictions["camera_bias"][split_mask],
             predictions["camera_std"][split_mask],
@@ -609,6 +669,7 @@ def main(cfg: DictConfig) -> None:
                 predictions["group_id"][split_mask],
                 cfg.evaluation.min_camera_settings,
             )
+            row.update(candidate_degradation)
         sweeps[split_name] = rows
         csv_rows.extend(
             {"split": split_name, **row}
