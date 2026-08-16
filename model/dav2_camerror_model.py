@@ -1155,8 +1155,12 @@ class CameraInducedErrorMetricModelDAv3(nn.Module):
         max_log_variance: float = 10.0,
         initial_std: float = 0.5,
         variance_head_init_std: float = 1e-3,
+        canonical_group_size: int = 1,
     ) -> None:
         super().__init__()
+
+        if canonical_group_size < 1:
+            raise ValueError("canonical_group_size must be at least 1.")
 
         try:
             from depth_anything_3.api import DepthAnything3
@@ -1182,6 +1186,7 @@ class CameraInducedErrorMetricModelDAv3(nn.Module):
         self.max_log_variance = max_log_variance
         self.initial_std = initial_std
         self.variance_head_init_std = variance_head_init_std
+        self.canonical_group_size = int(canonical_group_size)
 
         # Freeze the complete foundation model.
         for parameter in self.depth_model.parameters():
@@ -1417,7 +1422,20 @@ class CameraInducedErrorMetricModelDAv3(nn.Module):
         target_size: Optional[tuple[int, int]] = None,
     ) -> Dict[str, torch.Tensor]:
         candidate_depth, frozen_feature = self._extract_frozen_outputs(candidate_img)
-        canonical_depth, _ = self._extract_frozen_outputs(canonical_img) 
+        if canonical_img.shape[0] != candidate_img.shape[0]:
+            raise ValueError("candidate_img and canonical_img must have the same batch size.")
+        if canonical_img.shape[0] % self.canonical_group_size != 0:
+            raise ValueError(
+                "canonical batch size must be divisible by canonical_group_size."
+            )
+
+        canonical_depth, _ = self._extract_frozen_outputs(
+            canonical_img[::self.canonical_group_size]
+        )
+        canonical_depth = canonical_depth.repeat_interleave(
+            self.canonical_group_size,
+            dim=0,
+        )
 
         shared_feature = self.feature_projection(
             frozen_feature

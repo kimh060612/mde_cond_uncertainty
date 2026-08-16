@@ -290,6 +290,7 @@ def main(cfg: DictConfig):
         max_log_variance=cfg.training.max_log_var,
         initial_std=cfg.training.initial_std,
         variance_head_init_std=cfg.training.variance_head_init_std,
+        **({"canonical_group_size": group_size} if is_dav3 else {}),
     ).to(device)
 
     # model = CameraInducedErrorModelRGBInput(
