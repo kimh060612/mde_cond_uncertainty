@@ -396,6 +396,8 @@ def ssi_independent_da3_meter_space_depth_loss(
     candidate_gt_depth: torch.Tensor,
     canonical_gt_depth: torch.Tensor,
     eps: float = 1e-6,
+    min_depth: float = 1e-3,
+    max_depth: float = 10.0,
 ) -> torch.Tensor:
     """Align DA3 depth predictions directly to metric depth before comparison."""
     predictions = torch.stack(
@@ -408,7 +410,8 @@ def ssi_independent_da3_meter_space_depth_loss(
         torch.isfinite(predictions)
         & torch.isfinite(targets)
         & (predictions > 0)
-        & (targets > 0)
+        & (targets > min_depth)
+        & (targets < max_depth)
     )
 
     values = torch.where(valid, predictions, torch.zeros_like(predictions))
@@ -433,13 +436,24 @@ def ssi_independent_da3_meter_space_depth_loss(
     aligned = (
         scale[:, :, None, None, None] * predictions
         + shift[:, :, None, None, None]
-    ).clamp_min(eps)
+    )
 
-    comparison_valid = valid[:, 0] & valid[:, 1]
+    aligned_valid = (
+        torch.isfinite(aligned)
+        & (aligned > min_depth)
+        & (aligned < max_depth)
+    )
+    comparison_valid = (
+        valid[:, 0]
+        & valid[:, 1]
+        & aligned_valid[:, 0]
+        & aligned_valid[:, 1]
+    )
     valid_counts = comparison_valid.flatten(1).sum(dim=1)
     difference = torch.where(
         comparison_valid,
-        (aligned[:, 0] - aligned[:, 1]).abs() / aligned[:, 1],
+        (aligned[:, 0] - aligned[:, 1]).abs()
+        / aligned[:, 1].clamp_min(min_depth),
         torch.zeros_like(aligned[:, 0]),
     )
     loss = difference.flatten(1).sum(dim=1) / valid_counts.clamp_min(1)
