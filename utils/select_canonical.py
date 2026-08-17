@@ -46,7 +46,7 @@ MODEL_IDS = {
 }
 MODEL_ID = MODEL_IDS["small"]
 DAV2_METRIC_SMALL_MODEL_ID = MODEL_IDS["metric-indoor-small"]
-DA3_SMALL_MODEL_ID = "depth-anything/da3-small"
+DA3_SMALL_MODEL_ID = "depth-anything/da3mono-large"
 HF_CACHE_DIR = os.environ.get("HF_HOME") or None
 LOCAL_FILES_ONLY = os.environ.get("DEPTH_ANYTHING_LOCAL_FILES_ONLY", "1") != "0"
 EVAL_BATCH_SIZE = int(os.environ.get("DEPTH_EVAL_BATCH_SIZE", "64"))

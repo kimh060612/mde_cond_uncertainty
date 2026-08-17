@@ -11,7 +11,9 @@ MODEL_IDS = {
     "metric-indoor-base": "depth-anything/Depth-Anything-V2-Metric-Indoor-Base-hf",
     "metric-outdoor-small": "depth-anything/Depth-Anything-V2-Metric-Outdoor-Small-hf",
     "metric-outdoor-base": "depth-anything/Depth-Anything-V2-Metric-Outdoor-Base-hf",
-    "da3small": "depth-anything/da3-small"
+    "da3small": "depth-anything/da3-small",
+    "da3large": "depth-anything/da3mono-large",
+    "da3mlarge": "depth-anything/da3metric-large"
 }
 
 

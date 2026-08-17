@@ -29,7 +29,7 @@ DEFAULT_OUTPUT_CSV = PROJECT_ROOT / "comparison_ae" / "ae_orbbec.csv"
 DEFAULT_DAV3_OUTPUT_CSV = PROJECT_ROOT / "comparison_ae" / "ae_orbbec_dav3_small.csv"
 MODEL_NAME = "small"
 MODEL_ID = MODEL_IDS[MODEL_NAME]
-DAV3_MODEL_ID = "depth-anything/da3-small"
+DAV3_MODEL_ID = "depth-anything/da3mono-large"
 
 
 @dataclass
