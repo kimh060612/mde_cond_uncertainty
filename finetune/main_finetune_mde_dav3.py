@@ -13,7 +13,7 @@ from finetune.finetune_dataset import MDEFineTuningDataset, split_dataset
 from finetune.utils import run_epoch, seed_everything
 
 
-MODEL_ID = "depth-anything/da3-small"
+MODEL_ID = "depth-anything/da3metric-large"
 
 
 class DA3ImageProcessor:
