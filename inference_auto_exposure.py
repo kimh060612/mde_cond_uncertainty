@@ -20,6 +20,7 @@ from dataset.ae_dataset import (
 )
 from evaluation_utils.eval_metrics import compute_comprehensive_depth_metrics
 from evaluation_utils.eval_utils import align_relative_prediction_to_depth_space
+from finetune.utils import align_affine_depth
 from model.dav2_model import MODEL_IDS
 
 
@@ -339,31 +340,6 @@ def evaluate(
     ]
 
 
-def align_depth_scale_only(
-    prediction: torch.Tensor,
-    target: torch.Tensor,
-    valid_mask: torch.Tensor,
-    eps: float = 1e-8,
-) -> torch.Tensor:
-    valid = (
-        valid_mask.bool()
-        & torch.isfinite(prediction)
-        & torch.isfinite(target)
-        & (prediction > 0)
-        & (target > 0)
-    )
-    pred = torch.where(valid, prediction, torch.zeros_like(prediction))
-    gt = torch.where(valid, target, torch.zeros_like(target))
-    numerator = (pred * gt).flatten(1).sum(dim=1)
-    denominator = pred.square().flatten(1).sum(dim=1)
-    scale = torch.where(
-        denominator > eps,
-        numerator / denominator.clamp_min(eps),
-        torch.ones_like(denominator),
-    )
-    return prediction * scale[:, None, None, None]
-
-
 @torch.inference_mode()
 def evaluate_dav3(
     model,
@@ -417,7 +393,7 @@ def evaluate_dav3(
             align_corners=False,
         )
 
-        aligned_depth = align_depth_scale_only(
+        aligned_depth = align_affine_depth(
             prediction,
             target_depth,
             valid_mask,
@@ -463,7 +439,7 @@ def evaluate_dav3(
         row.update(
             model_name="da3-small",
             model_id=model_id,
-            alignment="scale_only",
+            alignment="scale_shift",
         )
     return rows
 
@@ -535,7 +511,7 @@ def main() -> None:
         )
         print(
             f"Found {len(dataset):,} frames in {len(dataset.sequences):,} laps; "
-            "running per-frame direct-depth scale-only aligned evaluation."
+            "running per-frame direct-depth scale-shift aligned evaluation."
         )
         rows = evaluate_dav3(
             model=model,
