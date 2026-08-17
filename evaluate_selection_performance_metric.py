@@ -554,15 +554,34 @@ def main(cfg: DictConfig) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     amp = device.type == "cuda" and not cfg.training.no_amp
     checkpoint_path = resolve_checkpoint_path(cfg)
-    metric_checkpoint_value = cfg.training.get("metric_checkpoint")
+    is_dav3 = str(cfg.model.model_id).startswith("da3")
+    metric_checkpoint_value = (
+        cfg.evaluation.get("metric_checkpoint_path")
+        or cfg.training.get("metric_checkpoint")
+    )
     if not metric_checkpoint_value:
-        raise ValueError("training.metric_checkpoint must point to a checkpoint directory.")
+        raise ValueError(
+            "evaluation.metric_checkpoint_path must point to the fine-tuned "
+            "save_pretrained directory."
+        )
     metric_checkpoint = Path(
         to_absolute_path(str(metric_checkpoint_value))
     )
     if not metric_checkpoint.is_dir():
         raise FileNotFoundError(metric_checkpoint)
-    is_dav3 = str(cfg.model.model_id).startswith("da3")
+    if is_dav3:
+        required_files = [metric_checkpoint / "config.json"]
+        if not any(
+            (metric_checkpoint / name).is_file()
+            for name in ("model.safetensors", "pytorch_model.bin")
+        ):
+            required_files.append(metric_checkpoint / "model.safetensors")
+        missing_files = [path for path in required_files if not path.is_file()]
+        if missing_files:
+            raise FileNotFoundError(
+                "Invalid DAv3 save_pretrained directory; missing: "
+                + ", ".join(map(str, missing_files))
+            )
     model_id = str(metric_checkpoint)
 
     image_processor = (

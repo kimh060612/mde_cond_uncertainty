@@ -94,6 +94,7 @@ pairwise_policy:
 evaluation:
   csv_path: /home/kimh060612/ati_workspace/mde_cond_uncertainty/orbbec_canonical_parameter_frame_matches_by_scene_dav2_metric
   dataset_root: /datasets/ATI/MDE/orbbec_realworld_dataset
+  metric_checkpoint_path: null
   min_camera_settings: 10
   relative_regret_thresholds_percent: [5.0, 10.0, 15.0]
   alpha_sweep_values: [0.0, 0.1, 0.3, 0.5, 0.7, 1.0]
