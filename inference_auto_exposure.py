@@ -26,8 +26,10 @@ from model.dav2_model import MODEL_IDS
 PROJECT_ROOT = Path(__file__).resolve().parent
 DEFAULT_DATASET_ROOT = Path("/datasets/ATI/MDE/orbbec_realworld_dataset")
 DEFAULT_OUTPUT_CSV = PROJECT_ROOT / "comparison_ae" / "ae_orbbec.csv"
+DEFAULT_DAV3_OUTPUT_CSV = PROJECT_ROOT / "comparison_ae" / "ae_orbbec_dav3_small.csv"
 MODEL_NAME = "small"
 MODEL_ID = MODEL_IDS[MODEL_NAME]
+DAV3_MODEL_ID = "depth-anything/da3-small"
 
 
 @dataclass
@@ -90,13 +92,41 @@ class IndexedDataset(Dataset):
         return index, self.dataset[index]
 
 
+class DA3ImageProcessor:
+    def __init__(self, process_res: int) -> None:
+        from depth_anything_3.utils.io.input_processor import InputProcessor
+
+        self.process_res = process_res
+        self.processor = InputProcessor()
+
+    def __call__(self, images, return_tensors="pt"):
+        if return_tensors != "pt":
+            raise ValueError("DA3 processing only supports return_tensors='pt'.")
+        images = list(images) if isinstance(images, (list, tuple)) else [images]
+        pixel_values, _, _ = self.processor(
+            images,
+            process_res=self.process_res,
+            process_res_method="upper_bound_resize",
+            num_workers=1,
+            sequential=True,
+        )
+        return {"pixel_values": pixel_values}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Evaluate relative Depth Anything V2 Small on AutoExposureMotionDataset "
-            "with per-frame scale-shift alignment."
+            "Evaluate relative Depth Anything V2 or V3 Small on "
+            "AutoExposureMotionDataset."
         )
     )
+    parser.add_argument(
+        "--model-version",
+        choices=("dav2", "dav3"),
+        default="dav2",
+    )
+    parser.add_argument("--dav3-model-id", default=DAV3_MODEL_ID)
+    parser.add_argument("--dav3-process-res", type=int, default=504)
     parser.add_argument(
         "--dataset-root",
         type=Path,
@@ -150,21 +180,30 @@ def parse_args() -> argparse.Namespace:
         parser.error("--num-workers must be non-negative")
     if args.image_height <= 0 or args.image_width <= 0:
         parser.error("--image-height and --image-width must be positive")
+    if args.dav3_process_res <= 0:
+        parser.error("--dav3-process-res must be positive")
     if args.min_depth <= 0 or args.max_depth <= args.min_depth:
         parser.error("depth bounds must satisfy 0 < min-depth < max-depth")
     if not 0.0 <= args.min_valid_depth_ratio <= 1.0:
         parser.error("--min-valid-depth-ratio must be in [0, 1]")
+    if args.model_version == "dav3" and args.output_csv == DEFAULT_OUTPUT_CSV:
+        args.output_csv = DEFAULT_DAV3_OUTPUT_CSV
     return args
 
 
 def build_dataset_and_loader(
     args: argparse.Namespace,
     image_processor,
+    preserve_aspect_ratio: bool = False,
 ) -> tuple[AutoExposureMotionDataset, DataLoader]:
     dataset = AutoExposureMotionDataset(
         root_dir=str(args.dataset_root.expanduser().resolve()),
         image_processor=image_processor,
-        image_size=(args.image_height, args.image_width),
+        image_size=(
+            None
+            if preserve_aspect_ratio
+            else (args.image_height, args.image_width)
+        ),
         min_depth=args.min_depth,
         max_depth=args.max_depth,
         min_valid_depth_ratio=args.min_valid_depth_ratio,
@@ -300,6 +339,135 @@ def evaluate(
     ]
 
 
+def align_depth_scale_only(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    valid_mask: torch.Tensor,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    valid = (
+        valid_mask.bool()
+        & torch.isfinite(prediction)
+        & torch.isfinite(target)
+        & (prediction > 0)
+        & (target > 0)
+    )
+    pred = torch.where(valid, prediction, torch.zeros_like(prediction))
+    gt = torch.where(valid, target, torch.zeros_like(target))
+    numerator = (pred * gt).flatten(1).sum(dim=1)
+    denominator = pred.square().flatten(1).sum(dim=1)
+    scale = torch.where(
+        denominator > eps,
+        numerator / denominator.clamp_min(eps),
+        torch.ones_like(denominator),
+    )
+    return prediction * scale[:, None, None, None]
+
+
+@torch.inference_mode()
+def evaluate_dav3(
+    model,
+    model_id: str,
+    dataset: AutoExposureMotionDataset,
+    loader: DataLoader,
+    device: torch.device,
+    min_depth: float,
+    max_depth: float,
+    min_valid_depth_ratio: float,
+    use_amp: bool,
+) -> list[dict[str, object]]:
+    accumulators: dict[tuple[str, str], LapAccumulator] = {}
+
+    progress = tqdm(loader, desc="DAV3-small inference", dynamic_ncols=True)
+    for item_indices, sample in progress:
+        pixel_values, target_depth, valid_mask, _, _ = sample
+        pixel_values = pixel_values.to(device=device, non_blocking=True)
+        target_depth = target_depth.to(
+            device=device,
+            dtype=torch.float32,
+            non_blocking=True,
+        ).unsqueeze(1)
+        valid_mask = valid_mask.to(
+            device=device,
+            dtype=torch.bool,
+            non_blocking=True,
+        ).unsqueeze(1)
+
+        with torch.autocast(
+            device_type=device.type,
+            dtype=torch.float16,
+            enabled=use_amp,
+        ):
+            prediction = model.model(
+                pixel_values.unsqueeze(1),
+                export_feat_layers=[],
+            )["depth"]
+
+        if prediction.ndim == 4 and prediction.shape[1] == 1:
+            prediction = prediction[:, 0]
+        if prediction.ndim != 3:
+            raise ValueError(
+                "Expected DAv3 depth shaped [B,H,W] or [B,1,H,W], "
+                f"got {tuple(prediction.shape)}"
+            )
+        prediction = F.interpolate(
+            prediction.unsqueeze(1).float(),
+            size=target_depth.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+
+        aligned_depth = align_depth_scale_only(
+            prediction,
+            target_depth,
+            valid_mask,
+        )
+        metrics = compute_comprehensive_depth_metrics(
+            mu=aligned_depth,
+            target=target_depth,
+            valid_mask=valid_mask,
+            min_depth=min_depth,
+            max_depth=max_depth,
+        )
+        abs_rel_values = metrics["abs_rel"].detach().cpu()
+        a1_values = metrics["a1"].detach().cpu()
+        valid_ratios = valid_mask.float().flatten(1).mean(dim=1).detach().cpu()
+
+        for offset, dataset_index in enumerate(item_indices.tolist()):
+            item = dataset.items[dataset_index]
+            accumulator = get_accumulator(accumulators, item)
+            valid_ratio = float(valid_ratios[offset].item())
+            if valid_ratio == 0.0 or valid_ratio < min_valid_depth_ratio:
+                accumulator.skip()
+                continue
+            accumulator.update(
+                abs_rel=float(abs_rel_values[offset].item()),
+                a1=float(a1_values[offset].item()),
+            )
+
+        if item_indices.numel():
+            last_item = dataset.items[int(item_indices[-1].item())]
+            progress.set_postfix(scene=last_item.scene_name, lap=last_item.lap_id)
+
+    rows = [
+        accumulator.to_row()
+        for _, accumulator in sorted(
+            accumulators.items(),
+            key=lambda pair: (
+                natural_key(pair[1].scene_name),
+                natural_key(pair[1].lap_id),
+            ),
+        )
+    ]
+    for row in rows:
+        row.update(
+            model_name="da3-small",
+            model_id=model_id,
+            alignment="scale_only",
+        )
+    return rows
+
+
 def write_csv(rows: Sequence[dict[str, object]], output_csv: Path) -> Path:
     output_csv = output_csv.expanduser().resolve()
     output_csv.parent.mkdir(parents=True, exist_ok=True)
@@ -325,7 +493,8 @@ def write_csv(rows: Sequence[dict[str, object]], output_csv: Path) -> Path:
 
 
 def print_results(rows: Sequence[dict[str, object]]) -> None:
-    print("\nPer scene/lap mean metrics (scale-shift aligned)")
+    alignment = str(rows[0]["alignment"]).replace("_", "-") if rows else "unknown"
+    print(f"\nPer scene/lap mean metrics ({alignment} aligned)")
     print(f"{'scene':<48} {'lap':<32} {'frames':>8} {'AbsRel':>10} {'A1':>10}")
     print("-" * 114)
     for row in rows:
@@ -349,32 +518,63 @@ def main() -> None:
         if args.hf_cache_dir is not None
         else None
     )
-    print(f"Loading {MODEL_ID} on {device} ...")
-    image_processor = AutoImageProcessor.from_pretrained(
-        MODEL_ID,
-        cache_dir=cache_dir,
-    )
-    model = AutoModelForDepthEstimation.from_pretrained(
-        MODEL_ID,
-        cache_dir=cache_dir,
-    ).to(device)
-    model.eval()
+    if args.model_version == "dav3":
+        from depth_anything_3.api import DepthAnything3
 
-    dataset, loader = build_dataset_and_loader(args, image_processor)
-    print(
-        f"Found {len(dataset):,} frames in {len(dataset.sequences):,} laps; "
-        "running per-frame scale-shift aligned evaluation."
-    )
-    rows = evaluate(
-        model=model,
-        dataset=dataset,
-        loader=loader,
-        device=device,
-        min_depth=args.min_depth,
-        max_depth=args.max_depth,
-        min_valid_depth_ratio=args.min_valid_depth_ratio,
-        use_amp=device.type == "cuda" and not args.no_amp,
-    )
+        print(f"Loading {args.dav3_model_id} on {device} ...")
+        image_processor = DA3ImageProcessor(args.dav3_process_res)
+        model = DepthAnything3.from_pretrained(
+            args.dav3_model_id,
+            cache_dir=cache_dir,
+        ).to(device)
+        model.eval()
+        dataset, loader = build_dataset_and_loader(
+            args,
+            image_processor,
+            preserve_aspect_ratio=True,
+        )
+        print(
+            f"Found {len(dataset):,} frames in {len(dataset.sequences):,} laps; "
+            "running per-frame direct-depth scale-only aligned evaluation."
+        )
+        rows = evaluate_dav3(
+            model=model,
+            model_id=args.dav3_model_id,
+            dataset=dataset,
+            loader=loader,
+            device=device,
+            min_depth=args.min_depth,
+            max_depth=args.max_depth,
+            min_valid_depth_ratio=args.min_valid_depth_ratio,
+            use_amp=device.type == "cuda" and not args.no_amp,
+        )
+    else:
+        print(f"Loading {MODEL_ID} on {device} ...")
+        image_processor = AutoImageProcessor.from_pretrained(
+            MODEL_ID,
+            cache_dir=cache_dir,
+        )
+        model = AutoModelForDepthEstimation.from_pretrained(
+            MODEL_ID,
+            cache_dir=cache_dir,
+        ).to(device)
+        model.eval()
+
+        dataset, loader = build_dataset_and_loader(args, image_processor)
+        print(
+            f"Found {len(dataset):,} frames in {len(dataset.sequences):,} laps; "
+            "running per-frame scale-shift aligned evaluation."
+        )
+        rows = evaluate(
+            model=model,
+            dataset=dataset,
+            loader=loader,
+            device=device,
+            min_depth=args.min_depth,
+            max_depth=args.max_depth,
+            min_valid_depth_ratio=args.min_valid_depth_ratio,
+            use_amp=device.type == "cuda" and not args.no_amp,
+        )
     print_results(rows)
     output_csv = write_csv(rows, args.output_csv)
     print(f"\nSaved {len(rows)} scene/lap rows to {output_csv}")
