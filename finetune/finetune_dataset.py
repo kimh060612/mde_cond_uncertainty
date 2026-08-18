@@ -115,9 +115,15 @@ class MDEFineTuningDataset(Dataset):
                     np.array(rgb, dtype=np.float32).transpose(2, 0, 1) / 255.0
                 )
             else:
-                pixel_values = self.image_processor(
-                    images=rgb, return_tensors="pt"
-                )["pixel_values"][0]
+                processed = self.image_processor(
+                    images=rgb,
+                    return_tensors="pt",
+                )
+                pixel_values = processed["pixel_values"][0]
+                focal_length_px = processed.get("focal_length_px")
+                # pixel_values = self.image_processor(
+                #     images=rgb, return_tensors="pt"
+                # )["pixel_values"][0]
 
         depth = np.load(self._path(row["matched_depth_path"])).astype(np.float32)
         depth = np.squeeze(depth) / self.depth_scale
@@ -129,8 +135,11 @@ class MDEFineTuningDataset(Dataset):
         )
         depth = torch.where(valid_mask, depth, torch.zeros_like(depth))
 
-        return {
+        sample = {
             "pixel_values": pixel_values,
             "depth": depth,
             "valid_mask": valid_mask,
         }
+        if focal_length_px is not None:
+            sample["focal_length_px"] = focal_length_px
+        return sample

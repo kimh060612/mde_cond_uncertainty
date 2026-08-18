@@ -84,6 +84,102 @@ def run_epoch(
     return {name: value / pixels for name, value in totals.items()}
 
 
+def run_epoch_dav3(
+    model,
+    loader,
+    device,
+    optimizer=None,
+    scaler=None,
+    predict_depth=None,
+    description="train",
+    min_depth=1e-3,
+    max_depth=10.0,
+    grad_clip=None,
+    amp_enabled=None,
+    amp_dtype=None,
+) -> dict[str, float]:
+    training = optimizer is not None
+    model.train(training)
+    totals = {"loss": 0.0, "abs_rel": 0.0, "a1": 0.0, "pixels": 0}
+
+    progress = tqdm(loader, desc=description, dynamic_ncols=True, leave=False)
+    for batch in progress:
+        pixel_values = batch["pixel_values"].to(device, non_blocking=True)
+        depth = batch["depth"].to(device, non_blocking=True)
+        valid = batch["valid_mask"].to(device, non_blocking=True)
+        if not valid.any():
+            continue
+
+        if training:
+            optimizer.zero_grad(set_to_none=True)
+
+        if amp_enabled is None:
+            amp_enabled = device.type == "cuda"
+
+        autocast_kwargs = {
+            "device_type": device.type,
+            "enabled": amp_enabled,
+        }
+        if amp_dtype is not None:
+            autocast_kwargs["dtype"] = amp_dtype
+
+        with torch.set_grad_enabled(training), torch.autocast(
+            **autocast_kwargs
+        ):
+            focal_length_px = batch.get("focal_length_px")
+            if focal_length_px is None:
+                raise ValueError("DA3Metric training requires focal_length_px.")
+            prediction = predict_depth(
+                model,
+                pixel_values,
+                depth.shape[-2:],
+                focal_length_px=focal_length_px.to(
+                    device,
+                    non_blocking=True,
+                ),
+            )
+            prediction_fp32 = prediction.float()
+            depth_fp32 = depth.float()
+
+            loss = F.smooth_l1_loss(
+                torch.log(prediction_fp32[valid].clamp_min(min_depth)),
+                torch.log(depth_fp32[valid].clamp_min(min_depth)),
+            )
+
+        if training:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                max_norm=grad_clip if grad_clip is not None else 1.0,
+            )
+            scaler.step(optimizer)
+            scaler.update()
+
+        with torch.no_grad():
+            pred = prediction.float().clamp(min_depth, max_depth)
+            target = depth.float()
+            count = int(valid.sum())
+            ratio = torch.maximum(
+                pred[valid] / target[valid], target[valid] / pred[valid]
+            )
+            totals["loss"] += float(loss) * count
+            totals["abs_rel"] += float(
+                (pred[valid] - target[valid]).abs().div(target[valid]).sum()
+            )
+            totals["a1"] += float((ratio < 1.25).sum())
+            totals["pixels"] += count
+        progress.set_postfix(
+            loss=f"{totals['loss'] / totals['pixels']:.4f}",
+            abs_rel=f"{totals['abs_rel'] / totals['pixels']:.4f}",
+            a1=f"{totals['a1'] / totals['pixels']:.4f}",
+        )
+
+    pixels = totals.pop("pixels")
+    if pixels == 0:
+        raise ValueError(f"{description} contained no valid depth pixels.")
+    return {name: value / pixels for name, value in totals.items()}
+
 def predict_metric3d(
     model,
     rgb: torch.Tensor,
@@ -119,7 +215,6 @@ def predict_metric3d_decoder_only(
     prediction = depth_model.decoder(features)["prediction"]
     prediction = remove_padding(prediction, padding, output_size).squeeze(1)
     return prediction * (focal_length * resize_scale / 1000.0)
-
 
 def metric3d_input(rgb: torch.Tensor) -> tuple[torch.Tensor, tuple[int, ...], float]:
     """공식 Metric3D v2 ViT letterbox/normalization 전처리."""
