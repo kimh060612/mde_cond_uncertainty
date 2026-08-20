@@ -96,7 +96,7 @@ evaluation:
   dataset_root: /datasets/ATI/MDE/orbbec_realworld_dataset
   metric_checkpoint_path: null
   min_camera_settings: 10
-  relative_regret_thresholds_percent: [5.0, 10.0, 15.0]
+  relative_regret_thresholds_percent: [3.0, 5.0, 10.0]
   alpha_sweep_values: [0.0, 0.1, 0.3, 0.5, 0.7, 1.0]
   inference_batch_size: 8
   checkpoint_path: null
