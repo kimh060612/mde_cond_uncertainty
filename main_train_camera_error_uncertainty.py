@@ -117,8 +117,9 @@ def main(cfg: DictConfig):
             name=cfg.training.wandb_name,
             config=OmegaConf.to_container(cfg, resolve=True),
         )
-        
-    if cfg.model.model_id == "da3small":
+    
+    is_dav3 = str(cfg.model.model_id).startswith("da3")
+    if is_dav3:
         image_processor = _DAv3ImageProcessor()
     else:
         image_processor = AutoImageProcessor.from_pretrained(
