@@ -270,6 +270,8 @@ class AutoExposureMotionDataset(Dataset):
         item = self.items[idx]
 
         image = Image.open(item.rgb_path).convert("RGB")
+        r, g, b = image.split()
+        image = Image.merge("RGB", (b, g, r))
         depth = self._load_depth(item.depth_path) / 1000.0
 
         if self.image_size is not None:
