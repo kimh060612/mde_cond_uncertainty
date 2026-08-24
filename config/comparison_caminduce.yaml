@@ -31,7 +31,7 @@ dataset:
 
 model:
   model_id: "small"
-  method: "tta" # gradient
+  method: "iqa" # tta, gradient, iqa
   camera_model_name: "Orbbec-Gemini-336L"
   image_height: 518
   image_width: 518
@@ -51,7 +51,7 @@ evaluation:
   relative_regret_thresholds_percent: [5.0, 10.0, 15.0]
   alpha_sweep_values: [0.0, 0.1, 0.3, 0.5, 0.7, 1.0]
   inference_batch_size: 8
-  method: "tta" # gradient
+  method: "iqa" # tta, gradient, iqa
   output_dir: ./selection_evaluation_comparison
   pairwise_beta_sweep:
     min: 0.0

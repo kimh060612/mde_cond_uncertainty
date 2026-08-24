@@ -20,6 +20,7 @@ from comparison.gradient_base_unc import (
     transformed_reference_pixels,
 )
 from comparison.infer_noise import infer_noise_uncertainty, predict_depth
+from comparison.image_quality import noise_aware_iqa
 
 from dataset.ati_dataset_caminduce import (
     CameraParameterRange,
@@ -64,8 +65,8 @@ class _DA3ImageProcessor:
 
 def comparison_method(cfg: DictConfig) -> str:
     method = str(cfg.evaluation.get("method", cfg.model.get("method", "tta"))).lower()
-    if method not in {"tta", "gradient"}:
-        raise ValueError("evaluation.method must be either 'tta' or 'gradient'.")
+    if method not in {"tta", "gradient", "iqa"}:
+        raise ValueError("evaluation.method must be 'tta', 'gradient', or 'iqa'.")
     return method
 
 
@@ -576,7 +577,8 @@ def collect_predictions(
         "group_id": [],
         "topology": [],
     }
-    model.eval()
+    if model is not None:
+        model.eval()
     layer_names = (
         uncertainty_layer_names(
             model,
@@ -602,7 +604,7 @@ def collect_predictions(
             desc=f"Selection inference ({method})",
             dynamic_ncols=True,
         ):
-            candidate_images = batch["candidate_images"].squeeze(0)
+            candidate_images: torch.Tensor = batch["candidate_images"].squeeze(0)
             group_size = candidate_images.shape[0]
             uncertainty_chunks = []
             for start in range(0, group_size, inference_batch_size):
@@ -620,6 +622,15 @@ def collect_predictions(
                             noise_std=float(cfg.evaluation.get("tta_noise_std", 1.0)),
                         )
                     uncertainty = result["image_uncertainty"]
+                elif method == "iqa":
+                    image_batch = (
+                        images.detach().cpu().permute(0, 2, 3, 1)
+                        .mul(255).round().clamp(0, 255).byte().numpy()
+                    )
+                    uncertainty = torch.tensor(
+                        [-noise_aware_iqa(image[..., ::-1].copy()).score for image in image_batch],
+                        device=device,
+                    )
                 else:
                     uncertainty = gradient_uncertainty(
                         model,
@@ -684,10 +695,9 @@ def main(cfg: DictConfig) -> None:
     model_id = MODEL_IDS.get(model_key, model_key)
     is_dav3 = model_key.lower().startswith("da3") or "/da3" in model_key.lower()
 
-    image_processor = (
+    image_processor = None if method == "iqa" else (
         _DA3ImageProcessor(int(cfg.model.get("dav3_process_res", 504)))
-        if is_dav3
-        else AutoImageProcessor.from_pretrained(model_id, use_fast=False)
+        if is_dav3 else AutoImageProcessor.from_pretrained(model_id, use_fast=False)
     )
     dataset = build_validation_dataset(cfg, image_processor)
     loader = DataLoader(
@@ -698,15 +708,17 @@ def main(cfg: DictConfig) -> None:
         pin_memory=device.type == "cuda",
     )
 
-    if is_dav3:
-        from depth_anything_3.api import DepthAnything3
+    model = None
+    if method != "iqa":
+        if is_dav3:
+            from depth_anything_3.api import DepthAnything3
 
-        model = DepthAnything3.from_pretrained(model_id)
-    else:
-        model = AutoModelForDepthEstimation.from_pretrained(model_id)
-    model.to(device).eval()
-    for parameter in model.parameters():
-        parameter.requires_grad_(False)
+            model = DepthAnything3.from_pretrained(model_id)
+        else:
+            model = AutoModelForDepthEstimation.from_pretrained(model_id)
+        model.to(device).eval()
+        for parameter in model.parameters():
+            parameter.requires_grad_(False)
 
     predictions = collect_predictions(
         model,
