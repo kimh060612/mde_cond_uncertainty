@@ -300,7 +300,7 @@ def evaluate(
             valid_mask=valid_mask,
             align_mode="scale_shift",
             inv_depth_min=1e-3
-        )["depth"]
+        )
         aligned_depth = depth_result["depth"]
         scale = depth_result["scale"]
         if scale < 0.0: print("Invalid scale!")
