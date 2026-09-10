@@ -294,12 +294,16 @@ def evaluate(
 
         # DAV2 relative output is inverse-depth-like. Fit scale and shift to
         # inverse GT independently for every frame, then evaluate in depth space.
-        aligned_depth = align_relative_prediction_to_depth_space(
+        depth_result = align_relative_prediction_to_depth_space(
             pred=pred_relative,
             gt=target_depth,
             valid_mask=valid_mask,
             align_mode="scale_shift",
+            inv_depth_min=1e-3
         )["depth"]
+        aligned_depth = depth_result["depth"]
+        scale = depth_result["scale"]
+        if scale < 0.0: print("Invalid scale!")
         metrics = compute_comprehensive_depth_metrics(
             mu=aligned_depth,
             target=target_depth,
